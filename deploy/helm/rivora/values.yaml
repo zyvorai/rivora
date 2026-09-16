@@ -99,6 +99,24 @@ gatewayClass:
   create: false
   name: rivora
 
+# bgp enables rivorad's BGP+BFD speaker: active/active ECMP HA where every
+# node independently advertises a /32 route for each VIP it currently has
+# a healthy backend for. Unlike gatewayApi (which also touches
+# rivora-controller), this is rivorad-only — BGP doesn't need any
+# cluster-wide IPAM coordination, each node just tells its BGP peers the
+# truth about what it can currently serve. Off by default. See the
+# top-level README's BGP/BFD HA section for the full-NAT/ECMP
+# flow-affinity caveat before enabling this with mode: nat VIPs.
+bgp:
+  enabled: false
+  asn: 0
+  routerId: ""
+  # peers:
+  #   - address: 10.0.0.1
+  #     asn: 65000
+  #     bfd: true
+  peers: []
+
 # addressPools seeds AddressPool custom resources on install, e.g.:
 #   --set addressPools[0].name=default \
 #   --set addressPools[0].addresses={10.0.0.0/24}

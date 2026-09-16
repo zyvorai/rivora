@@ -16,6 +16,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 	"k8s.io/client-go/informers"
 
 	"github.com/zyvorai/rivora/internal/api"
+	"github.com/zyvorai/rivora/internal/bgp"
 	"github.com/zyvorai/rivora/internal/bpfmaps"
 	"github.com/zyvorai/rivora/internal/config"
 	"github.com/zyvorai/rivora/internal/controller"
@@ -62,6 +65,11 @@ func main() {
 		rateLimitOn    = flag.Bool("rate-limit", false, "enable per-source-IP SYN-flood rate limiting; only used with -kubernetes (static-YAML mode reads this from -config's rateLimit section instead)")
 		rateLimitPPS   = flag.Uint64("rate-limit-pps", 0, "per-source-IP new-connection (SYN) packets/sec allowed when -rate-limit is set; only used with -kubernetes")
 		rateLimitBurst = flag.Uint64("rate-limit-burst", 0, "per-source-IP token-bucket burst size when -rate-limit is set; only used with -kubernetes")
+
+		bgpOn       = flag.Bool("bgp", false, "advertise a BGP route for every VIP this node has a healthy backend for (active/active ECMP HA); only used with -kubernetes (static-YAML mode reads this from -config's bgp section instead)")
+		bgpASN      = flag.Uint("bgp-asn", 0, "this node's BGP AS number when -bgp is set; only used with -kubernetes")
+		bgpRouterID = flag.String("bgp-router-id", "", "this node's BGP router-id (an IPv4 address, need not be routable) when -bgp is set; only used with -kubernetes")
+		bgpPeers    = flag.String("bgp-peers", "", "comma-separated BGP peers when -bgp is set, each addr:asn or addr:asn:bfd (e.g. \"10.0.0.1:65000:bfd,10.0.0.2:65001\"); only used with -kubernetes")
 	)
 	flag.Parse()
 
@@ -99,6 +107,23 @@ func main() {
 		if *rateLimitOn && (*rateLimitPPS == 0 || *rateLimitBurst == 0) {
 			logger.Error("-rate-limit-pps and -rate-limit-burst must both be > 0 with -rate-limit")
 			os.Exit(1)
+		}
+		if *bgpOn {
+			peers, perr := parseBGPPeers(*bgpPeers)
+			if perr != nil {
+				logger.Error("parse -bgp-peers", "err", perr)
+				os.Exit(1)
+			}
+			cfg.BGP = config.BGP{
+				Enabled:  true,
+				ASN:      uint32(*bgpASN),
+				RouterID: *bgpRouterID,
+				Peers:    peers,
+			}
+			if err := cfg.BGP.Validate(); err != nil {
+				logger.Error("bgp flags", "err", err)
+				os.Exit(1)
+			}
 		}
 	} else {
 		var err error
@@ -152,6 +177,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	// bgpSpeaker is not Kubernetes-specific (unlike the ARP speaker, which
+	// needs a K8s Lease for its cluster-wide mutual exclusion) — a
+	// standalone static-YAML deployment across multiple nodes can equally
+	// want BGP+ECMP HA, so it's built here, before the -kubernetes branch,
+	// from whichever mode populated cfg.BGP (the YAML file's bgp: section,
+	// or the -bgp* flags above).
+	var bgpSpeaker *bgp.Speaker
+	if cfg.BGP.Enabled {
+		var err error
+		bgpSpeaker, err = bgp.New(cfg.BGP, plane, logger)
+		if err != nil {
+			logger.Error("start bgp speaker", "err", err)
+			os.Exit(1)
+		}
+		defer bgpSpeaker.Close()
+	}
+
 	checker := healthcheck.New(
 		cfg.HealthCheck.Interval, cfg.HealthCheck.Timeout,
 		cfg.HealthCheck.FailThreshold, cfg.HealthCheck.SuccessThreshold,
@@ -159,6 +201,13 @@ func main() {
 			logger.Info("backend health changed", "backend", backendID, "healthy", healthy)
 			if err := plane.SetBackendHealth(backendID, healthy); err != nil {
 				logger.Error("update backend health", "backend", backendID, "err", err)
+			}
+			// A backend flipping healthy/unhealthy on an already-installed
+			// VIP is exactly the signal BGP's health-gated advertise/
+			// withdraw model is built around — react immediately rather
+			// than waiting for the speaker's own periodic resync.
+			if bgpSpeaker != nil {
+				bgpSpeaker.AnnounceNow()
 			}
 		},
 	)
@@ -169,6 +218,15 @@ func main() {
 	checker.SetTargets(targets)
 	go checker.Run()
 	defer checker.Stop()
+
+	if bgpSpeaker != nil {
+		go func() {
+			if err := bgpSpeaker.Run(ctx); err != nil {
+				logger.Error("bgp speaker exited", "err", err)
+			}
+		}()
+		logger.Info("bgp speaker enabled", "asn", cfg.BGP.ASN, "router_id", cfg.BGP.RouterID, "peers", len(cfg.BGP.Peers))
+	}
 
 	if *kubeMode {
 		kcfg, err := k8s.BuildConfig(*kubeconfig)
@@ -213,6 +271,9 @@ func main() {
 			checker.SetTargets(targets)
 			if sp != nil {
 				sp.AnnounceNow()
+			}
+			if bgpSpeaker != nil {
+				bgpSpeaker.AnnounceNow()
 			}
 		}
 		reconciler.OnChange = onChange
@@ -300,4 +361,34 @@ func bpfDirPath(dir, prog string) string {
 		name = "tc_nat.o"
 	}
 	return dir + "/" + name
+}
+
+// parseBGPPeers parses -bgp-peers' comma-separated "addr:asn" or
+// "addr:asn:bfd" entries. An empty string yields no peers (letting
+// config.BGP.Validate's "at least one peer is required" check produce a
+// clear error rather than a confusing parse failure).
+func parseBGPPeers(s string) ([]config.BGPPeer, error) {
+	if s == "" {
+		return nil, nil
+	}
+	var peers []config.BGPPeer
+	for _, entry := range strings.Split(s, ",") {
+		parts := strings.Split(entry, ":")
+		if len(parts) < 2 || len(parts) > 3 {
+			return nil, fmt.Errorf("invalid -bgp-peers entry %q: want addr:asn or addr:asn:bfd", entry)
+		}
+		asn, err := strconv.ParseUint(parts[1], 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid -bgp-peers entry %q: asn: %w", entry, err)
+		}
+		peer := config.BGPPeer{Address: parts[0], ASN: uint32(asn)}
+		if len(parts) == 3 {
+			if parts[2] != "bfd" {
+				return nil, fmt.Errorf("invalid -bgp-peers entry %q: third field must be \"bfd\"", entry)
+			}
+			peer.BFD = true
+		}
+		peers = append(peers, peer)
+	}
+	return peers, nil
 }

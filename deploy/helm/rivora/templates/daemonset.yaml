@@ -1,3 +1,9 @@
+{{- $bgpPeers := list }}
+{{- range .Values.bgp.peers }}
+{{- $entry := printf "%s:%d" .address (.asn | int) }}
+{{- if .bfd }}{{ $entry = printf "%s:bfd" $entry }}{{ end }}
+{{- $bgpPeers = append $bgpPeers $entry }}
+{{- end }}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -33,6 +39,12 @@ spec:
             - -workers={{ .Values.rivorad.workers }}
             - -speaker={{ .Values.rivorad.speaker }}
             - -gateway-api={{ .Values.gatewayApi.enabled }}
+            - -bgp={{ .Values.bgp.enabled }}
+            {{- if .Values.bgp.enabled }}
+            - -bgp-asn={{ .Values.bgp.asn }}
+            - -bgp-router-id={{ .Values.bgp.routerId }}
+            - -bgp-peers={{ $bgpPeers | join "," }}
+            {{- end }}
           env:
             - name: POD_NAMESPACE
               valueFrom:

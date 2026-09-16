@@ -19,8 +19,9 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
 > independently reconciled and Maglev-partitioned — either from static
 > YAML, or (v0.2, new) from Kubernetes `Service`/`EndpointSlice` objects
 > via `rivorad -kubernetes`, with `rivora-controller` handling `AddressPool`
-> IPAM and an in-`rivorad` L2/ARP speaker announcing assigned VIPs. No
-> BGP/BFD HA yet — see [Roadmap](#roadmap).
+> IPAM and an in-`rivorad` L2/ARP speaker announcing assigned VIPs. BGP/BFD
+> HA is implemented (opt-in, active/active ECMP) but not yet live-verified
+> against a real router peer — see [Roadmap](#roadmap).
 
 ## Contents
 
@@ -32,6 +33,7 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
 - [Kubernetes (v0.2)](#kubernetes-v02)
   - [Backends beyond Pods: KubeVirt VMs and external/physical IPs](#backends-beyond-pods-kubevirt-vms-and-externalphysical-ips)
   - [Gateway API (v0.3)](#gateway-api-v03)
+  - [BGP/BFD HA (v0.3)](#bgpbfd-ha-v03)
 - [Building on the remote host](#building-on-the-remote-host)
 - [Roadmap](#roadmap)
 - [License](#license)
@@ -288,6 +290,59 @@ test cluster, confirmed unrelated to Rivora (a plain `curl` debug pod
 with zero Rivora involvement failed identically). Retry once that
 cluster-level issue is resolved.
 
+### BGP/BFD HA (v0.3)
+
+`rivorad`'s BGP+BFD speaker is opt-in active/active ECMP HA: unlike the L2
+ARP speaker above (which answers for a VIP from exactly one node at a
+time, behind a cluster-wide Lease), every node with `-bgp`/`bgp.enabled`
+on **independently** advertises a `/32` host route for each VIP it
+currently has at least one healthy backend for, and withdraws it the
+instant that stops being true — no leader election, since BGP+ECMP's
+whole point is multiple nodes advertising the same VIP simultaneously,
+with upstream routers hashing traffic across next-hops. BFD is wired
+per-peer (not a separate component) for sub-second peer-down detection,
+feeding the same health-gated withdraw path. Unlike the Gateway API
+feature above, this is entirely local to `rivorad` — `rivora-controller`
+isn't involved, since BGP doesn't need cluster-wide IPAM coordination.
+
+Static-YAML mode reads a `bgp:` section (see
+[`config/examples/bgp-ha.yaml`](config/examples/bgp-ha.yaml)); Kubernetes
+mode uses flags:
+
+```sh
+rivorad -kubernetes -interface eth0 \
+  -bgp -bgp-asn 65001 -bgp-router-id 10.0.0.11 \
+  -bgp-peers "10.0.0.1:65000:bfd,10.0.0.2:65000"
+```
+
+`-bgp-peers` is a comma-separated list of `addr:asn` or `addr:asn:bfd`
+entries. The [Helm chart](deploy/helm/rivora) wires the equivalent
+`bgp.*` values — see
+[`deploy/helm/rivora/README.md#bgpbfd-ha`](deploy/helm/rivora/README.md#bgpbfd-ha).
+
+**A real caveat, not hidden:** in full-NAT mode — which is the **only**
+mode K8s-managed VIPs currently run in (see [Kubernetes (v0.2)](#kubernetes-v02))
+— a flow's connection state lives only on the node that first received
+it. If the router's ECMP hash rebalances (a peer flaps, a node's
+advertised route flaps, a node joins or leaves the ECMP set), in-flight
+NAT'd connections on a node that's rebalanced away from can be disrupted,
+since there's no cluster-shared connection table. DSR mode (available in
+static-YAML deployments) doesn't have this problem — the backend itself
+owns the reply path, so the load balancer is only ever in the forward
+path. This is the same tradeoff MetalLB's BGP mode documents; it's an
+inherent property of stateful NAT + ECMP, not a Rivora-specific gap.
+
+**Verification status:** the health-gated advertise/withdraw/re-advertise
+cycle is verified end-to-end against a real BGP session — an integration
+test peers rivorad's gobgp-backed speaker with a second, independent
+in-process gobgp server over loopback, flips a fake backend's health, and
+confirms the peer's own RIB actually gains and loses the route (see
+`internal/bgp`). Not yet done: live verification against a real/
+containerized BGP peer (FRRouting or BIRD) and BFD timing on the remote
+test cluster — this needs an actual second router-like peer, which the
+loopback integration test deliberately substitutes for correctness
+coverage without needing one.
+
 ## Building on the remote host
 
 `scripts/deploy-remote.sh` (same shape as the sibling `guestkit` repo's
@@ -332,10 +387,14 @@ a live cluster; turned out to need zero dataplane/reconciler changes).
 Gateway API is implemented — see [Gateway API](#gateway-api-v03) — with
 reconciler startup/informer-sync/object-creation confirmed live twice;
 the traffic-path scenarios are still pending a retry once an unrelated
-cluster networking issue on the test host clears. BGP/BFD HA and IPv6 are
-still ahead — IPv6 in particular is a full parallel dataplane (new BPF
-maps/structs, checksum path, IPAM redesign, an NDP speaker), not a small
-extension, and will land last.
+cluster networking issue on the test host clears. BGP/BFD HA is
+implemented and locally verified — see [BGP/BFD HA](#bgpbfd-ha-v03) — with
+the health-gated advertise/withdraw cycle proven against a real BGP
+session (a loopback-peered gobgp integration test); live verification
+against a real/containerized router peer on the remote test cluster is a
+separate follow-up, not yet done. IPv6 is still ahead and will land last
+— it's a full parallel dataplane (new BPF maps/structs, checksum path,
+IPAM redesign, an NDP speaker), not a small extension.
 
 ## License
 

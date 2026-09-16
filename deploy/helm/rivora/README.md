@@ -71,6 +71,33 @@ an `AddressPool` the same way a `type: LoadBalancer` Service does;
 supply the backends (`backendRefs[].weight` maps onto Rivora's existing
 weighted-Maglev backend selection).
 
+## BGP/BFD HA
+
+Setting `bgp.enabled=true` turns on rivorad's BGP+BFD speaker: active/
+active ECMP HA where every node independently advertises a `/32` route
+for each VIP it currently has a healthy backend for, and withdraws it the
+instant that stops being true. Unlike Gateway API, this is `rivorad`-only
+— `rivora-controller` isn't involved, since BGP doesn't need cluster-wide
+IPAM coordination.
+
+```sh
+helm upgrade rivora deploy/helm/rivora \
+  --namespace rivora-system --reuse-values \
+  --set bgp.enabled=true \
+  --set bgp.asn=65001 \
+  --set bgp.routerId=10.0.0.11 \
+  --set "bgp.peers[0].address=10.0.0.1" \
+  --set "bgp.peers[0].asn=65000" \
+  --set "bgp.peers[0].bfd=true"
+```
+
+Read the top-level README's BGP/BFD HA section before enabling this —
+it covers the health-gated advertise/withdraw model and a real caveat:
+in full-NAT mode (the **only** mode K8s-managed VIPs currently run in,
+per the note below), a router-side ECMP rehash can disrupt in-flight
+connections on a node that's rebalanced away from, since connection
+state isn't shared across nodes.
+
 ## Notes
 
 - `rivorad.loadBalancerClass` and `controller.loadBalancerClass` must

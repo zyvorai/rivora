@@ -65,11 +65,76 @@ type RateLimit struct {
 	Burst                     uint64 `yaml:"burst"`
 }
 
+// BGP is an opt-in BGP+BFD speaker for active/active ECMP HA across
+// multiple Rivora nodes: each node independently advertises a /32 host
+// route for every VIP it currently has at least one healthy backend for,
+// and withdraws it the instant that stops being true. This health-gating
+// substitutes for the ARP speaker's Lease-based mutual exclusion — unlike
+// ARP, BGP+ECMP's whole point is multiple nodes advertising the *same*
+// VIP simultaneously, with upstream routers hashing traffic across
+// next-hops (active/active, not active/passive), so there's no leader
+// election here. BFD is wired per-peer (not a separate component) for
+// fast peer-down detection feeding the same health-gated withdraw path.
+//
+// Caveat, not hidden: in full-NAT mode a flow's connection state lives
+// only on the node that first received it — if the router's ECMP hash
+// rebalances (a peer flaps, a node joins/leaves), in-flight NAT'd
+// connections on the rebalanced-away node can be disrupted, since there's
+// no cluster-shared connection table. DSR mode doesn't have this problem
+// (the backend itself owns the reply path). Same tradeoff MetalLB's BGP
+// mode documents. Off by default.
+type BGP struct {
+	Enabled  bool      `yaml:"enabled"`
+	ASN      uint32    `yaml:"asn"`
+	RouterID string    `yaml:"routerId"`
+	Peers    []BGPPeer `yaml:"peers"`
+}
+
+type BGPPeer struct {
+	Address string `yaml:"address"`
+	ASN     uint32 `yaml:"asn"`
+	// BFD enables Bidirectional Forwarding Detection on this peer session
+	// for sub-second down detection, instead of relying solely on BGP's
+	// own (much slower) hold-timer expiry.
+	BFD bool `yaml:"bfd,omitempty"`
+}
+
+// Validate checks b in isolation — reused both by Config.Validate() for
+// static-YAML mode and directly by rivorad's -kubernetes flag parsing,
+// since kube mode's cfg.VIPs is always empty (VIPs come from the
+// Kubernetes reconcilers, not -config) and so can't go through the full
+// Config.Validate() without tripping its unrelated "at least one VIP is
+// required" check.
+func (b BGP) Validate() error {
+	if !b.Enabled {
+		return nil
+	}
+	if b.ASN == 0 {
+		return fmt.Errorf("bgp: asn must be > 0 when enabled")
+	}
+	if net.ParseIP(b.RouterID) == nil {
+		return fmt.Errorf("bgp: routerId must be a valid IP address")
+	}
+	if len(b.Peers) == 0 {
+		return fmt.Errorf("bgp: at least one peer is required when enabled")
+	}
+	for _, p := range b.Peers {
+		if net.ParseIP(p.Address) == nil {
+			return fmt.Errorf("bgp peer %q: invalid address", p.Address)
+		}
+		if p.ASN == 0 {
+			return fmt.Errorf("bgp peer %s: asn must be > 0", p.Address)
+		}
+	}
+	return nil
+}
+
 type Config struct {
 	Interface   string      `yaml:"interface"`
 	APIListen   string      `yaml:"apiListen"`
 	HealthCheck HealthCheck `yaml:"healthCheck"`
 	RateLimit   RateLimit   `yaml:"rateLimit"`
+	BGP         BGP         `yaml:"bgp"`
 	VIPs        []VIP       `yaml:"vips"`
 }
 
@@ -106,6 +171,9 @@ func (c Config) Validate() error {
 	}
 	if c.RateLimit.Enabled && (c.RateLimit.PerSourcePacketsPerSecond == 0 || c.RateLimit.Burst == 0) {
 		return fmt.Errorf("rateLimit: perSourcePacketsPerSecond and burst must both be > 0 when enabled")
+	}
+	if err := c.BGP.Validate(); err != nil {
+		return err
 	}
 	if len(c.VIPs) == 0 {
 		return fmt.Errorf("at least one VIP is required")

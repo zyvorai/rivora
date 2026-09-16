@@ -49,3 +49,63 @@ func TestValidateRejectsRateLimitEnabledWithZeroBurst(t *testing.T) {
 		t.Fatal("expected an error for rateLimit.enabled with burst == 0")
 	}
 }
+
+func TestValidateAcceptsBGPDisabled(t *testing.T) {
+	cfg := validConfig() // BGP left at its zero value: Enabled == false
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected disabled BGP (the default) to be valid, got: %v", err)
+	}
+}
+
+func TestValidateAcceptsBGPEnabledWithPeers(t *testing.T) {
+	cfg := validConfig()
+	cfg.BGP = BGP{
+		Enabled:  true,
+		ASN:      65001,
+		RouterID: "10.0.0.1",
+		Peers:    []BGPPeer{{Address: "10.0.0.2", ASN: 65000, BFD: true}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected a fully-specified enabled BGP to be valid, got: %v", err)
+	}
+}
+
+func TestValidateRejectsBGPEnabledWithZeroASN(t *testing.T) {
+	cfg := validConfig()
+	cfg.BGP = BGP{Enabled: true, ASN: 0, RouterID: "10.0.0.1", Peers: []BGPPeer{{Address: "10.0.0.2", ASN: 65000}}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected an error for bgp.enabled with asn == 0")
+	}
+}
+
+func TestValidateRejectsBGPEnabledWithInvalidRouterID(t *testing.T) {
+	cfg := validConfig()
+	cfg.BGP = BGP{Enabled: true, ASN: 65001, RouterID: "not-an-ip", Peers: []BGPPeer{{Address: "10.0.0.2", ASN: 65000}}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected an error for bgp.enabled with an invalid routerId")
+	}
+}
+
+func TestValidateRejectsBGPEnabledWithNoPeers(t *testing.T) {
+	cfg := validConfig()
+	cfg.BGP = BGP{Enabled: true, ASN: 65001, RouterID: "10.0.0.1"}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected an error for bgp.enabled with no peers")
+	}
+}
+
+func TestValidateRejectsBGPPeerWithInvalidAddress(t *testing.T) {
+	cfg := validConfig()
+	cfg.BGP = BGP{Enabled: true, ASN: 65001, RouterID: "10.0.0.1", Peers: []BGPPeer{{Address: "not-an-ip", ASN: 65000}}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected an error for a bgp peer with an invalid address")
+	}
+}
+
+func TestValidateRejectsBGPPeerWithZeroASN(t *testing.T) {
+	cfg := validConfig()
+	cfg.BGP = BGP{Enabled: true, ASN: 65001, RouterID: "10.0.0.1", Peers: []BGPPeer{{Address: "10.0.0.2", ASN: 0}}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected an error for a bgp peer with asn == 0")
+	}
+}

@@ -1,0 +1,45 @@
+# Opt-in BGP+BFD speaker: active/active ECMP HA across multiple Rivora
+# nodes. Each node independently advertises a /32 host route for every
+# VIP it currently has at least one healthy backend for, and withdraws it
+# the instant that stops being true — there's no leader election here,
+# unlike DSR/NAT's local forwarding state, since BGP+ECMP's whole point is
+# multiple nodes advertising the same VIP at once, with upstream routers
+# hashing traffic across next-hops. See README.md's "BGP/BFD HA" section
+# for the full-NAT/ECMP flow-affinity caveat before running this with
+# mode: nat VIPs at real scale.
+#
+# routerId only needs to be a syntactically valid IPv4 address — it's an
+# opaque 32-bit BGP identifier, not necessarily a real routable/bindable
+# address (though using this node's own address, as below, is the normal
+# convention and keeps troubleshooting simple).
+
+interface: eth0
+apiListen: 127.0.0.1:9870
+
+bgp:
+  enabled: true
+  asn: 65001
+  routerId: 10.0.0.11
+  peers:
+    - address: 10.0.0.1  # top-of-rack router, BFD enabled for sub-second down detection
+      asn: 65000
+      bfd: true
+    - address: 10.0.0.2  # a second router for redundancy, BFD not required here
+      asn: 65000
+
+healthCheck:
+  interval: 3s
+  timeout: 1s
+  failThreshold: 2
+  successThreshold: 2
+
+vips:
+  - address: 10.0.0.100
+    port: 80
+    protocol: tcp
+    mode: nat
+    backends:
+      - address: 10.0.1.11
+        port: 8080
+      - address: 10.0.1.12
+        port: 8080
