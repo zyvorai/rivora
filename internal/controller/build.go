@@ -44,7 +44,7 @@ func buildDesiredVIPs(svc *corev1.Service, slices []*discoveryv1.EndpointSlice) 
 			continue // SCTP or other unsupported protocol: skip this port, not the whole Service
 		}
 
-		backends, draining := endpointsForPort(slices, p.Name)
+		backends, draining := EndpointsForPort(slices, p.Name)
 		if len(backends) == 0 {
 			continue
 		}
@@ -89,7 +89,7 @@ func protocolFor(p corev1.Protocol) (config.Protocol, bool) {
 	}
 }
 
-// endpointsForPort collects every serving backend, across every
+// EndpointsForPort collects every serving backend, across every
 // EndpointSlice sharding this Service's endpoints, whose slice-local port
 // entry matches portName (Kubernetes matches Service ports to EndpointPort
 // entries by name; an unnamed single-port Service has portName == "" and
@@ -97,11 +97,13 @@ func protocolFor(p corev1.Protocol) (config.Protocol, bool) {
 // endpoint (fully torn down, not just terminating) is skipped entirely; a
 // serving-but-not-ready one is included so its established connections
 // keep flowing, and reported back in the draining slice so the caller
-// excludes it from new-flow selection.
-func endpointsForPort(slices []*discoveryv1.EndpointSlice, portName string) (backends, draining []config.Backend) {
+// excludes it from new-flow selection. Exported: workload- and
+// Service-agnostic (never reads a Pod), reused by internal/gatewayapi for
+// TCPRoute/UDPRoute backendRefs.
+func EndpointsForPort(slices []*discoveryv1.EndpointSlice, portName string) (backends, draining []config.Backend) {
 	seen := map[string]bool{} // "addr:port" — dedupe across slices, defensive against overlap
 	for _, slice := range slices {
-		targetPort, ok := portForName(slice.Ports, portName)
+		targetPort, ok := PortForName(slice.Ports, portName)
 		if !ok {
 			continue
 		}
@@ -131,7 +133,8 @@ func endpointsForPort(slices []*discoveryv1.EndpointSlice, portName string) (bac
 	return backends, draining
 }
 
-func portForName(ports []discoveryv1.EndpointPort, name string) (uint16, bool) {
+// PortForName is exported alongside EndpointsForPort for the same reason.
+func PortForName(ports []discoveryv1.EndpointPort, name string) (uint16, bool) {
 	for _, p := range ports {
 		if p.Port == nil {
 			continue
@@ -149,7 +152,7 @@ func portForName(ports []discoveryv1.EndpointPort, name string) (uint16, bool) {
 
 // endpointServing reports whether ep should be programmed into the
 // dataplane at all (as opposed to draining: still programmed, just
-// excluded from new-flow selection — see endpointsForPort). Conditions
+// excluded from new-flow selection — see EndpointsForPort). Conditions
 // default to true when unset per the EndpointSlice API's documented
 // zero-value semantics.
 func endpointServing(ep discoveryv1.Endpoint) bool {

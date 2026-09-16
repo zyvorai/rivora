@@ -205,7 +205,7 @@ func TestBuildDesiredVIPsIgnoresIPv6Endpoints(t *testing.T) {
 // TestBuildDesiredVIPsKubeVirtVM captures the exact EndpointSlice shape a
 // live KubeVirt VirtualMachineInstance produces once its virt-launcher Pod
 // is scheduled and ready (verified against a real VMI on the v0.3 test
-// cluster) — endpointsForPort never reads TargetRef, so it's
+// cluster) — EndpointsForPort never reads TargetRef, so it's
 // indistinguishable from a plain Pod-backed Service; this pins that down
 // as a regression test rather than relying only on that read of the code.
 func TestBuildDesiredVIPsKubeVirtVM(t *testing.T) {
@@ -237,7 +237,7 @@ func TestBuildDesiredVIPsKubeVirtVM(t *testing.T) {
 // standard, zero-new-code Kubernetes mechanism for a "physical/external
 // backend" (verified live: Kubernetes' EndpointSlice controller leaves a
 // manually-created slice alone as long as the owning Service has no
-// selector). endpointsForPort doesn't require TargetRef, so this works
+// selector). EndpointsForPort doesn't require TargetRef, so this works
 // identically to any other backend.
 func TestBuildDesiredVIPsManualEndpointSliceExternalBackend(t *testing.T) {
 	svc := lbService(corev1.ServicePort{Port: 80}) // no Spec.Selector — matches a hand-authored Service+EndpointSlice pair

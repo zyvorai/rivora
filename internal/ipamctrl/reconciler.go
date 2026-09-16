@@ -33,6 +33,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
+	gwapi "github.com/zyvorai/rivora/api/gatewayapi"
 	"github.com/zyvorai/rivora/api/v1alpha1"
 	"github.com/zyvorai/rivora/internal/ipam"
 )
@@ -59,12 +60,31 @@ type Reconciler struct {
 
 	queue      workqueue.TypedRateLimitingInterface[string]
 	poolsQueue workqueue.TypedRateLimitingInterface[string]
+
+	// gatewayAPI is nil unless enableGatewayAPI (cmd/rivora-controller's
+	// -gateway-api flag) was set — a cluster without the Gateway API CRDs
+	// installed must not get informer errors from an unrequested watch,
+	// same reasoning internal/gatewayapi's own opt-in flag uses.
+	gatewayAPI *gatewayIPAM
+}
+
+// gatewayIPAM holds the Gateway-watching pieces, split out so the zero
+// value of Reconciler (gatewayAPI == nil) cleanly means "not enabled" —
+// every method touching these fields is guarded by that nil check.
+type gatewayIPAM struct {
+	classLister   cache.GenericLister
+	gatewayLister cache.GenericLister
+	queue         workqueue.TypedRateLimitingInterface[string]
 }
 
 // New builds a Reconciler. lbClass must match internal/controller's (the
 // per-node reconciler) — both need to agree on which Services either side
-// owns.
-func New(clientset kubernetes.Interface, dyn dynamic.Interface, lbClass string, logger *slog.Logger) (*Reconciler, informers.SharedInformerFactory, dynamicinformer.DynamicSharedInformerFactory) {
+// owns. enableGatewayAPI adds GatewayClass/Gateway informers and IPAM for
+// Gateway API's Gateway resource, sharing the same *ipam.Allocator
+// Services already use (pool capacity accounting has to see both kinds
+// of consumer) — leave false on a cluster without the Gateway API CRDs
+// installed, or the informers below error on an unknown resource.
+func New(clientset kubernetes.Interface, dyn dynamic.Interface, lbClass string, enableGatewayAPI bool, logger *slog.Logger) (*Reconciler, informers.SharedInformerFactory, dynamicinformer.DynamicSharedInformerFactory) {
 	factory := informers.NewSharedInformerFactory(clientset, resyncPeriod)
 	dynFactory := dynamicinformer.NewDynamicSharedInformerFactory(dyn, resyncPeriod)
 
@@ -97,6 +117,10 @@ func New(clientset kubernetes.Interface, dyn dynamic.Interface, lbClass string, 
 		DeleteFunc: func(interface{}) { r.poolsQueue.Add("pools") },
 	})
 
+	if enableGatewayAPI {
+		r.initGatewayAPI(dynFactory)
+	}
+
 	return r, factory, dynFactory
 }
 
@@ -119,10 +143,17 @@ func (r *Reconciler) Run(ctx context.Context, factory informers.SharedInformerFa
 
 	factory.Start(ctx.Done())
 	dynFactory.Start(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(),
+	syncFuncs := []cache.InformerSynced{
 		factory.Core().V1().Services().Informer().HasSynced,
 		dynFactory.ForResource(v1alpha1.AddressPoolResource).Informer().HasSynced,
-	) {
+	}
+	if r.gatewayAPI != nil {
+		syncFuncs = append(syncFuncs,
+			dynFactory.ForResource(gwapi.GatewayClassResource).Informer().HasSynced,
+			dynFactory.ForResource(gwapi.GatewayResource).Informer().HasSynced,
+		)
+	}
+	if !cache.WaitForCacheSync(ctx.Done(), syncFuncs...) {
 		return fmt.Errorf("timed out waiting for informer caches to sync")
 	}
 	r.logger.Info("ipam controller caches synced")
@@ -138,6 +169,16 @@ func (r *Reconciler) Run(ctx context.Context, factory informers.SharedInformerFa
 	for i := 0; i < workers; i++ {
 		go r.serviceWorker(ctx)
 	}
+
+	if r.gatewayAPI != nil {
+		if err := r.rebuildFromExistingGateways(ctx); err != nil {
+			return fmt.Errorf("rebuild allocator state from gateways: %w", err)
+		}
+		for i := 0; i < workers; i++ {
+			go r.gatewayWorker(ctx)
+		}
+	}
+
 	<-ctx.Done()
 	return nil
 }

@@ -19,11 +19,15 @@ import (
 	"syscall"
 	"time"
 
+	"k8s.io/client-go/dynamic/dynamicinformer"
+	"k8s.io/client-go/informers"
+
 	"github.com/zyvorai/rivora/internal/api"
 	"github.com/zyvorai/rivora/internal/bpfmaps"
 	"github.com/zyvorai/rivora/internal/config"
 	"github.com/zyvorai/rivora/internal/controller"
 	"github.com/zyvorai/rivora/internal/dataplane"
+	"github.com/zyvorai/rivora/internal/gatewayapi"
 	"github.com/zyvorai/rivora/internal/healthcheck"
 	"github.com/zyvorai/rivora/internal/k8s"
 	"github.com/zyvorai/rivora/internal/loader"
@@ -47,6 +51,8 @@ func main() {
 		namespace  = flag.String("namespace", envOr("POD_NAMESPACE", "rivora-system"), "namespace the ARP speaker's leader-election Lease lives in; only used with -kubernetes")
 		workers    = flag.Int("workers", 2, "number of concurrent Service reconcile workers; only used with -kubernetes")
 		speakerOn  = flag.Bool("speaker", true, "run the L2/ARP speaker (requires CAP_NET_RAW); only used with -kubernetes")
+
+		gatewayAPIOn = flag.Bool("gateway-api", false, "also watch GatewayClass/Gateway/TCPRoute/UDPRoute and program their VIPs; only used with -kubernetes; requires the Gateway API CRDs to be installed")
 
 		healthInterval = flag.Duration("health-interval", 3*time.Second, "active health check interval; only used with -kubernetes")
 		healthTimeout  = flag.Duration("health-timeout", time.Second, "active health check timeout; only used with -kubernetes")
@@ -178,6 +184,13 @@ func main() {
 
 		reconciler, factory := controller.New(clients.Clientset, plane, *lbClass, logger)
 
+		var gwReconciler *gatewayapi.Reconciler
+		var gwFactory informers.SharedInformerFactory
+		var gwDynFactory dynamicinformer.DynamicSharedInformerFactory
+		if *gatewayAPIOn {
+			gwReconciler, gwFactory, gwDynFactory = gatewayapi.New(clients.Clientset, clients.Dynamic, plane, logger)
+		}
+
 		var sp *speaker.Speaker
 		if *speakerOn {
 			identity, herr := os.Hostname()
@@ -192,7 +205,7 @@ func main() {
 			defer sp.Close()
 		}
 
-		reconciler.OnChange = func() {
+		onChange := func() {
 			var targets []healthcheck.Target
 			for _, t := range plane.Targets() {
 				targets = append(targets, healthcheck.Target{BackendID: t.ID, Address: t.Address, Port: t.Port})
@@ -202,12 +215,23 @@ func main() {
 				sp.AnnounceNow()
 			}
 		}
+		reconciler.OnChange = onChange
+		if gwReconciler != nil {
+			gwReconciler.OnChange = onChange
+		}
 
 		go func() {
 			if err := reconciler.Run(ctx, factory, *workers); err != nil {
 				logger.Error("k8s reconciler exited", "err", err)
 			}
 		}()
+		if gwReconciler != nil {
+			go func() {
+				if err := gwReconciler.Run(ctx, gwFactory, gwDynFactory, *workers); err != nil {
+					logger.Error("gateway api reconciler exited", "err", err)
+				}
+			}()
+		}
 		if sp != nil {
 			go func() {
 				if err := sp.Run(ctx); err != nil {
@@ -215,7 +239,7 @@ func main() {
 				}
 			}()
 		}
-		logger.Info("kubernetes mode enabled", "lb_class", *lbClass, "speaker", *speakerOn)
+		logger.Info("kubernetes mode enabled", "lb_class", *lbClass, "speaker", *speakerOn, "gateway_api", *gatewayAPIOn)
 	}
 
 	apiKey := os.Getenv("RIVORA_API_KEY")

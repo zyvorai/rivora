@@ -39,6 +39,38 @@ kubectl delete addresspools.rivora.zyvor.dev --all
 kubectl delete -f deploy/helm/rivora/crds/addresspool-crd.yaml
 ```
 
+## Gateway API
+
+Setting `gatewayApi.enabled=true` turns on a second control loop, on both
+`rivorad` and `rivora-controller`, that watches `Gateway`/`TCPRoute`/
+`UDPRoute` (the Gateway API's L4 "experimental channel" resources) instead
+of `Service`. `HTTPRoute` is deliberately out of scope — Rivora's XDP
+dataplane has no L7 visibility, so it can't enforce HTTPRoute's path/header
+matching rules.
+
+This chart does **not** bundle the Gateway API CRDs — like any other
+vendor's CRDs, install them yourself first:
+
+```sh
+kubectl kustomize "https://github.com/kubernetes-sigs/gateway-api/config/crd/experimental?ref=v1.1.0" | kubectl apply -f -
+```
+
+Then enable the feature, optionally letting the chart create a
+`GatewayClass` for you:
+
+```sh
+helm upgrade rivora deploy/helm/rivora \
+  --namespace rivora-system --reuse-values \
+  --set gatewayApi.enabled=true \
+  --set gatewayClass.create=true
+```
+
+A `Gateway` referencing this `GatewayClass` gets an address assigned from
+an `AddressPool` the same way a `type: LoadBalancer` Service does;
+`TCPRoute`/`UDPRoute` objects with `parentRefs` pointing at that `Gateway`
+supply the backends (`backendRefs[].weight` maps onto Rivora's existing
+weighted-Maglev backend selection).
+
 ## Notes
 
 - `rivorad.loadBalancerClass` and `controller.loadBalancerClass` must

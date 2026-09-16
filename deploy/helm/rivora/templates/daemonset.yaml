@@ -32,6 +32,7 @@ spec:
             - -loadbalancer-class={{ .Values.rivorad.loadBalancerClass }}
             - -workers={{ .Values.rivorad.workers }}
             - -speaker={{ .Values.rivorad.speaker }}
+            - -gateway-api={{ .Values.gatewayApi.enabled }}
           env:
             - name: POD_NAMESPACE
               valueFrom:

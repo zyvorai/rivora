@@ -31,6 +31,7 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
 - [Quickstart](#quickstart)
 - [Kubernetes (v0.2)](#kubernetes-v02)
   - [Backends beyond Pods: KubeVirt VMs and external/physical IPs](#backends-beyond-pods-kubevirt-vms-and-externalphysical-ips)
+  - [Gateway API (v0.3)](#gateway-api-v03)
 - [Building on the remote host](#building-on-the-remote-host)
 - [Roadmap](#roadmap)
 - [License](#license)
@@ -240,6 +241,53 @@ Not yet supported: routing to a KubeVirt VM's *secondary* (Multus)
 network interface specifically — only the primary interface IP that
 Service/EndpointSlice already expose.
 
+### Gateway API (v0.3)
+
+`rivorad -kubernetes -gateway-api` runs a second, parallel reconciler
+alongside the `Service`/`EndpointSlice` one: it watches `GatewayClass`,
+`Gateway`, and the Gateway API's L4 "experimental channel" `TCPRoute`/
+`UDPRoute` resources (group `gateway.networking.k8s.io`). `HTTPRoute` is
+deliberately out of scope — Rivora's XDP dataplane has no L7 visibility,
+so it can't enforce HTTPRoute's path/header matching rules; pretending to
+would be a correctness hazard, not a feature. A node can run Service- and
+Gateway-sourced VIPs side by side, both funneling into the same dataplane.
+
+```sh
+rivorad -kubernetes -interface eth0 -gateway-api [-speaker=true]
+rivora-controller -gateway-api   # also needs the matching flag, for IPAM
+```
+
+Address assignment works exactly like a `Service`: `rivora-controller`
+allocates from the same `AddressPool`s and patches `Gateway.status.addresses`
+instead of `Service.Status.LoadBalancer.Ingress[].IP`. A `TCPRoute`/
+`UDPRoute`'s `spec.rules[].backendRefs` resolve to a Service's
+`EndpointSlice`s the same way the Service reconciler does; `backendRef.weight`
+(Gateway API's native traffic-split field) maps onto the existing weighted-
+Maglev backend selection, divided evenly across that backend's ready
+endpoints. Same-namespace `backendRefs` only in this version — cross-
+namespace references (which Gateway API gates behind a `ReferenceGrant`)
+aren't implemented yet.
+
+The [Helm chart](deploy/helm/rivora) wires both flags behind a
+`gatewayApi.enabled` value and can optionally create a matching
+`GatewayClass` — see
+[`deploy/helm/rivora/README.md#gateway-api`](deploy/helm/rivora/README.md#gateway-api)
+for the install command (the Gateway API CRDs themselves aren't bundled;
+install them separately, same as any other vendor's CRDs) and full
+reference.
+
+**Verification status:** confirmed twice against a live cluster that both
+reconcilers (`rivorad`'s and `rivora-controller`'s) start cleanly with
+`-gateway-api` on, sync their informer caches, and that a `GatewayClass`
+gets created with the correct `controllerName` — no crashes across two
+independent fresh-image builds. The actual traffic path (address
+assignment, real packets through the VIP, and the weighted-split
+scenario) is **not yet verified live**: both attempts were blocked by a
+pre-existing, intermittent new-pod-to-ClusterIP networking issue on the
+test cluster, confirmed unrelated to Rivora (a plain `curl` debug pod
+with zero Rivora involvement failed identically). Retry once that
+cluster-level issue is resolved.
+
 ## Building on the remote host
 
 `scripts/deploy-remote.sh` (same shape as the sibling `guestkit` repo's
@@ -281,9 +329,13 @@ v0.3 is underway. KubeVirt VMs and external/physical backends are done —
 see [Backends beyond Pods](#backends-beyond-pods-kubevirt-vms-and-externalphysical-ips)
 (verified against real KubeVirt VMIs and hand-authored EndpointSlices on
 a live cluster; turned out to need zero dataplane/reconciler changes).
-Gateway API, BGP/BFD HA, and IPv6 are still ahead — IPv6 in particular is
-a full parallel dataplane (new BPF maps/structs, checksum path, IPAM
-redesign, an NDP speaker), not a small extension, and will land last.
+Gateway API is implemented — see [Gateway API](#gateway-api-v03) — with
+reconciler startup/informer-sync/object-creation confirmed live twice;
+the traffic-path scenarios are still pending a retry once an unrelated
+cluster networking issue on the test host clears. BGP/BFD HA and IPv6 are
+still ahead — IPv6 in particular is a full parallel dataplane (new BPF
+maps/structs, checksum path, IPAM redesign, an NDP speaker), not a small
+extension, and will land last.
 
 ## License
 

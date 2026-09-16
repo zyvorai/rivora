@@ -83,6 +83,22 @@ controller:
   tolerations: []
   affinity: {}
 
+# gatewayApi enables the Gateway API (Gateway + TCPRoute/UDPRoute) control
+# loop on both rivorad and rivora-controller. Requires the Gateway API CRDs
+# (experimental channel) to already be installed on the cluster — this
+# chart does not bundle them, the same way it doesn't bundle any other
+# vendor's CRDs. See README.md#gateway-api for the install command.
+gatewayApi:
+  enabled: false
+
+# gatewayClass optionally creates a GatewayClass pointing at Rivora's
+# controllerName, so Gateways can reference it without the cluster
+# operator hand-authoring one. Only rendered when both gatewayApi.enabled
+# and gatewayClass.create are true.
+gatewayClass:
+  create: false
+  name: rivora
+
 # addressPools seeds AddressPool custom resources on install, e.g.:
 #   --set addressPools[0].name=default \
 #   --set addressPools[0].addresses={10.0.0.0/24}

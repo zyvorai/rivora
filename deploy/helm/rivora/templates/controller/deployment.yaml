@@ -32,6 +32,7 @@ spec:
           args:
             - -loadbalancer-class={{ .Values.controller.loadBalancerClass }}
             - -workers={{ .Values.controller.workers }}
+            - -gateway-api={{ .Values.gatewayApi.enabled }}
           env:
             - name: POD_NAMESPACE
               valueFrom:

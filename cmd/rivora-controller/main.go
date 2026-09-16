@@ -36,6 +36,7 @@ func main() {
 		namespace  = flag.String("namespace", envOr("POD_NAMESPACE", "rivora-system"), "namespace the leader-election Lease lives in")
 		lbClass    = flag.String("loadbalancer-class", "", "only manage Services whose spec.loadBalancerClass matches this value (default: services with no class set)")
 		workers    = flag.Int("workers", 2, "number of concurrent Service reconcile workers")
+		gatewayAPI = flag.Bool("gateway-api", false, "also watch GatewayClass/Gateway and assign addresses to managed Gateways; requires the Gateway API CRDs to be installed")
 		showVer    = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
@@ -66,7 +67,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	reconciler, factory, dynFactory := ipamctrl.New(clients.Clientset, clients.Dynamic, *lbClass, logger)
+	reconciler, factory, dynFactory := ipamctrl.New(clients.Clientset, clients.Dynamic, *lbClass, *gatewayAPI, logger)
 
 	lock := &resourcelock.LeaseLock{
 		LeaseMeta: metav1.ObjectMeta{Name: "rivora-controller", Namespace: *namespace},
@@ -104,7 +105,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger.Info("rivora-controller starting", "identity", identity, "namespace", *namespace, "lb_class", *lbClass)
+	logger.Info("rivora-controller starting", "identity", identity, "namespace", *namespace, "lb_class", *lbClass, "gateway_api", *gatewayAPI)
 	elector.Run(ctx)
 	logger.Info("shut down")
 }

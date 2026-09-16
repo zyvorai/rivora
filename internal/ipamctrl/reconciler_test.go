@@ -69,7 +69,7 @@ func lbService(name string) *corev1.Service {
 func startSynced(t *testing.T, dyn *dynamicfake.FakeDynamicClient, objs ...runtime.Object) (*Reconciler, informers.SharedInformerFactory, dynamicinformer.DynamicSharedInformerFactory, context.CancelFunc) {
 	t.Helper()
 	clientset := fake.NewSimpleClientset(objs...)
-	r, factory, dynFactory := New(clientset, dyn, "", testLogger())
+	r, factory, dynFactory := New(clientset, dyn, "", false, testLogger())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	factory.Start(ctx.Done())
