@@ -1,0 +1,40 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
+      with: {go-version: '1.27.1', cache: true}
+    - run: go mod tidy && git diff --exit-code go.mod go.sum
+    - run: go vet ./...
+    - run: go build ./cmd/rivorad ./cmd/rivoractl ./cmd/rivora-doctor
+    - run: go test ./...
+    - run: gofmt -l . | tee /tmp/fmt.out && [ ! -s /tmp/fmt.out ]
+  bpf:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - run: sudo apt-get update -qq && sudo apt-get install -y -qq clang llvm libelf-dev linux-tools-common "linux-tools-$(uname -r)"
+    - run: make bpf
+    - uses: actions/upload-artifact@v4
+      with:
+        name: bpf-objects
+        path: bpf/*.o
+  integration:
+    needs: [go, bpf]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
+      with: {go-version: '1.27.1', cache: true}
+    - run: sudo apt-get update -qq && sudo apt-get install -y -qq clang llvm libelf-dev linux-tools-common "linux-tools-$(uname -r)"
+    - run: make bpf build
+    - name: Functional selftest (veth/netns, DSR + full-NAT)
+      run: sudo bash scripts/selftest.sh

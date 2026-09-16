@@ -1,0 +1,16 @@
+[Unit]
+Description=Rivora load balancer daemon
+Documentation=https://zyvor.dev/rivora
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rivorad -config /etc/rivora/config.yaml -bpf-dir /usr/local/share/rivora/bpf
+Restart=on-failure
+RestartSec=2
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+User=root
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,27 @@
+# Rivora v0.1 config: exactly one VIP per node, static backend list.
+# See README.md for how "mode" affects backend requirements.
+
+interface: eth0
+apiListen: 127.0.0.1:9870
+
+healthCheck:
+  interval: 3s
+  timeout: 1s
+  failThreshold: 2   # consecutive failed probes before a backend is pulled
+  successThreshold: 2 # consecutive successful probes before it's restored
+
+vips:
+  - address: 10.0.0.100
+    port: 80
+    protocol: tcp
+    mode: dsr # dsr | nat
+    backends:
+      # DSR requires each backend's MAC (same L2 segment) and the backend
+      # must have 10.0.0.100 bound locally (loopback/dummy) so it accepts
+      # traffic still addressed to the VIP.
+      - address: 10.0.0.11
+        port: 80
+        mac: "aa:bb:cc:dd:ee:01"
+      - address: 10.0.0.12
+        port: 80
+        mac: "aa:bb:cc:dd:ee:02"

@@ -1,0 +1,24 @@
+# Full-NAT variant: no backend MAC needed, but backends must route back
+# through this node (rivorad's host as their default gateway, or a static
+# route for the client subnet) so tc_nat's TCX egress program can un-NAT
+# their replies before they leave.
+
+interface: eth0
+apiListen: 127.0.0.1:9870
+
+healthCheck:
+  interval: 3s
+  timeout: 1s
+  failThreshold: 2
+  successThreshold: 2
+
+vips:
+  - address: 10.0.0.100
+    port: 80
+    protocol: tcp
+    mode: nat
+    backends:
+      - address: 10.0.1.11
+        port: 8080
+      - address: 10.0.1.12
+        port: 8080

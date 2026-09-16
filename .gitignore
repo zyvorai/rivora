@@ -1,0 +1,9 @@
+/target
+**/target/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Deploy state (no secrets)
+.deploy-last
