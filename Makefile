@@ -1,7 +1,7 @@
 # Copyright 2026 Zyvor AI Labs · https://zyvor.dev
 # SPDX-License-Identifier: Apache-2.0
 
-.PHONY: build bpf test fmt vet selftest selftest-multivip selftest-weighted \
+.PHONY: build bpf test fmt vet selftest selftest-multivip selftest-weighted selftest-ratelimit \
 	deploy deploy-remote deploy-remote-quick deploy-remote-preflight deploy-remote-verify deploy-remote-uninstall deploy-remote-fleet
 
 CLANG ?= clang
@@ -39,6 +39,9 @@ selftest-multivip:
 
 selftest-weighted:
 	bash scripts/selftest-weighted.sh
+
+selftest-ratelimit:
+	bash scripts/selftest-ratelimit.sh
 
 deploy: deploy-remote ## Alias for deploy-remote
 

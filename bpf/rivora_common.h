@@ -100,6 +100,32 @@ struct lb_stats {
 };
 _Static_assert(sizeof(struct lb_stats) == 24, "lb_stats ABI");
 
+/* rl_config_map is a single-entry array: an opt-in on/off switch plus the
+ * per-source-IP SYN token-bucket's rate/burst, written once at startup by
+ * internal/dataplane. rate_per_sec/burst are already pre-divided by
+ * runtime.NumCPU() on the Go side — see rl_bucket's doc comment for why. */
+struct rl_config {
+    __u64 rate_per_sec;
+    __u64 burst;
+    __u8  enabled;
+    __u8  pad[7];
+};
+_Static_assert(sizeof(struct rl_config) == 24, "rl_config ABI");
+
+/* rl_buckets_map is BPF_MAP_TYPE_LRU_PERCPU_HASH keyed by source IP: each
+ * CPU keeps an independent bucket for the same source, so there's no
+ * cross-CPU contention/locking (same non-atomic, lock-free style
+ * bump_stats already uses for stats_map) at the cost of the *effective*
+ * global rate being roughly rate_per_sec times however many CPUs are
+ * processing that source's traffic — rl_config's rate_per_sec/burst are
+ * pre-divided by runtime.NumCPU() to compensate, so the configured value
+ * in rivorad's YAML means what it says despite per-CPU enforcement. */
+struct rl_bucket {
+    __u64 tokens;
+    __u64 last_refill_ns;
+};
+_Static_assert(sizeof(struct rl_bucket) == 16, "rl_bucket ABI");
+
 #define RIVORA_MODE_DSR 0
 #define RIVORA_MODE_NAT 1
 

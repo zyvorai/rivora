@@ -20,6 +20,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"runtime"
 	"sort"
 	"sync"
 	"time"
@@ -118,6 +119,10 @@ func (d *Dataplane) Apply(iface *net.Interface) error {
 		}
 	}
 
+	if err := d.applyRateLimit(); err != nil {
+		return err
+	}
+
 	for _, vip := range d.cfg.VIPs {
 		if err := d.UpsertVIP(vip); err != nil {
 			return fmt.Errorf("vip %s:%d: %w", vip.Address, vip.Port, err)
@@ -132,6 +137,47 @@ func (d *Dataplane) writeIfaceMAC(iface *net.Interface) error {
 	ifidx := uint32(iface.Index)
 	if err := d.dp.Maps[bpfmaps.MapIfaceMAC].Update(&ifidx, &mac, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update iface_mac_map: %w", err)
+	}
+	return nil
+}
+
+// applyRateLimit writes rl_config_map[0] from d.cfg.RateLimit. Runs
+// unconditionally (both the static-YAML and Kubernetes-mode startup
+// paths call Apply()) — a zero-value RateLimit (Enabled: false, the
+// default) writes an all-zero, disabled entry, matching the "opt-in,
+// zero-cost-when-off" contract rate_limit_exceeded() in bpf/xdp_ingress.c
+// documents (it returns immediately on !enabled, before ever touching
+// rl_buckets_map).
+//
+// rate_limit_exceeded() runs once per CPU independently (rl_buckets_map
+// is BPF_MAP_TYPE_LRU_PERCPU_HASH, avoiding cross-CPU lock/atomic
+// contention exactly where a real flood would create the most of it) —
+// so the *effective* global rate is roughly configured-rate times
+// however many CPUs end up processing a given source's traffic. Dividing
+// by runtime.NumCPU() here is a best-effort approximation of that CPU
+// count (XDP's actual RX-queue-to-CPU spread isn't introspected), so the
+// value in rivorad's config means what it says despite per-CPU
+// enforcement underneath.
+func (d *Dataplane) applyRateLimit() error {
+	rl := bpfmaps.RLConfig{}
+	if d.cfg.RateLimit.Enabled {
+		cpus := uint64(runtime.NumCPU())
+		if cpus == 0 {
+			cpus = 1
+		}
+		rate := d.cfg.RateLimit.PerSourcePacketsPerSecond / cpus
+		burst := d.cfg.RateLimit.Burst / cpus
+		if rate == 0 {
+			rate = 1
+		}
+		if burst == 0 {
+			burst = 1
+		}
+		rl = bpfmaps.RLConfig{RatePerSec: rate, Burst: burst, Enabled: 1}
+	}
+	var zero uint32
+	if err := d.dp.Maps[bpfmaps.MapRateLimitConfig].Update(&zero, &rl, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("update rl_config_map: %w", err)
 	}
 	return nil
 }

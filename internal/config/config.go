@@ -54,10 +54,22 @@ type HealthCheck struct {
 	SuccessThreshold int           `yaml:"successThreshold"`
 }
 
+// RateLimit is an opt-in, per-source-IP token bucket applied to new TCP
+// connections (SYN packets only) across every VIP this node owns —
+// established connections' data packets and all UDP traffic are
+// unaffected. Off by default, matching this project's other security
+// knobs (TLS/auth): a zero-value RateLimit changes nothing.
+type RateLimit struct {
+	Enabled                   bool   `yaml:"enabled"`
+	PerSourcePacketsPerSecond uint64 `yaml:"perSourcePacketsPerSecond"`
+	Burst                     uint64 `yaml:"burst"`
+}
+
 type Config struct {
 	Interface   string      `yaml:"interface"`
 	APIListen   string      `yaml:"apiListen"`
 	HealthCheck HealthCheck `yaml:"healthCheck"`
+	RateLimit   RateLimit   `yaml:"rateLimit"`
 	VIPs        []VIP       `yaml:"vips"`
 }
 
@@ -91,6 +103,9 @@ func Load(path string) (Config, error) {
 func (c Config) Validate() error {
 	if c.Interface == "" {
 		return fmt.Errorf("interface is required")
+	}
+	if c.RateLimit.Enabled && (c.RateLimit.PerSourcePacketsPerSecond == 0 || c.RateLimit.Burst == 0) {
+		return fmt.Errorf("rateLimit: perSourcePacketsPerSecond and burst must both be > 0 when enabled")
 	}
 	if len(c.VIPs) == 0 {
 		return fmt.Errorf("at least one VIP is required")

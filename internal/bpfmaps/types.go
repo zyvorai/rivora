@@ -17,6 +17,8 @@ const (
 	MapNATReverse         = "nat_reverse_map"
 	MapIfaceMAC           = "iface_mac_map"
 	MapStats              = "stats_map"
+	MapRateLimitConfig    = "rl_config_map"
+	MapRateLimitBuckets   = "rl_buckets_map"
 
 	ProgXDPIngress  = "rivora_xdp_ingress"
 	ProgTCNATEgress = "rivora_tc_nat_egress"
@@ -100,4 +102,23 @@ type LBStats struct {
 	Packets uint64
 	Bytes   uint64
 	Dropped uint64
+}
+
+// RLConfig — struct rl_config. 24 bytes. RatePerSec/Burst are already
+// pre-divided by runtime.NumCPU() before being written — see
+// internal/dataplane's applyRateLimit and rl_bucket's doc comment in
+// bpf/rivora_common.h for why.
+type RLConfig struct {
+	RatePerSec uint64
+	Burst      uint64
+	Enabled    uint8
+	Pad        [7]uint8
+}
+
+// RLBucket — struct rl_bucket. 16 bytes. Read/written per-CPU (the map is
+// BPF_MAP_TYPE_LRU_PERCPU_HASH) — not meant to be read from Go today, but
+// mirrored here for ABI completeness/future observability.
+type RLBucket struct {
+	Tokens       uint64
+	LastRefillNs uint64
 }

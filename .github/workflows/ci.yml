@@ -74,3 +74,5 @@ jobs:
       run: sudo bash scripts/selftest-multivip.sh
     - name: Weighted Maglev selftest (veth/netns)
       run: sudo bash scripts/selftest-weighted.sh
+    - name: Rate limit selftest (veth/netns)
+      run: sudo bash scripts/selftest-ratelimit.sh

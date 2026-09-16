@@ -52,6 +52,10 @@ func main() {
 		healthTimeout  = flag.Duration("health-timeout", time.Second, "active health check timeout; only used with -kubernetes")
 		healthFail     = flag.Int("health-fail-threshold", 2, "consecutive failures before marking a backend down; only used with -kubernetes")
 		healthSuccess  = flag.Int("health-success-threshold", 2, "consecutive successes before marking a backend healthy; only used with -kubernetes")
+
+		rateLimitOn    = flag.Bool("rate-limit", false, "enable per-source-IP SYN-flood rate limiting; only used with -kubernetes (static-YAML mode reads this from -config's rateLimit section instead)")
+		rateLimitPPS   = flag.Uint64("rate-limit-pps", 0, "per-source-IP new-connection (SYN) packets/sec allowed when -rate-limit is set; only used with -kubernetes")
+		rateLimitBurst = flag.Uint64("rate-limit-burst", 0, "per-source-IP token-bucket burst size when -rate-limit is set; only used with -kubernetes")
 	)
 	flag.Parse()
 
@@ -80,6 +84,15 @@ func main() {
 				FailThreshold:    *healthFail,
 				SuccessThreshold: *healthSuccess,
 			},
+			RateLimit: config.RateLimit{
+				Enabled:                   *rateLimitOn,
+				PerSourcePacketsPerSecond: *rateLimitPPS,
+				Burst:                     *rateLimitBurst,
+			},
+		}
+		if *rateLimitOn && (*rateLimitPPS == 0 || *rateLimitBurst == 0) {
+			logger.Error("-rate-limit-pps and -rate-limit-burst must both be > 0 with -rate-limit")
+			os.Exit(1)
 		}
 	} else {
 		var err error
