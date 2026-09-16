@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-label="Rivora — eBPF-native load balancer">
+  <defs>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#2563eb"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#2dd4ff" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#2dd4ff" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="dots" width="26" height="26" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.1" fill="#ffffff" opacity="0.07"/>
+    </pattern>
+  </defs>
+
+  <rect width="1200" height="630" fill="#0a0d10"/>
+  <rect width="1200" height="630" fill="url(#dots)"/>
+  <rect x="0" y="0" width="6" height="630" fill="url(#accent)"/>
+
+  <!-- Left column: wordmark, tagline, badges -->
+  <text x="64" y="108" font-family="Consolas, Menlo, Monaco, monospace" font-size="15" font-weight="700" letter-spacing="3" fill="url(#accent)">EBPF-NATIVE LOAD BALANCER</text>
+
+  <text x="60" y="232" font-family="Arial, Helvetica, sans-serif" font-size="108" font-weight="800" fill="#ffffff">Rivora</text>
+
+  <text x="64" y="270" font-family="Arial, Helvetica, sans-serif" font-size="23" fill="#c7d0d6">eBPF-native load balancer — DSR and full-NAT, Maglev</text>
+  <text x="64" y="302" font-family="Arial, Helvetica, sans-serif" font-size="23" fill="#c7d0d6">backend selection, Kubernetes-native IPAM. No CNI required.</text>
+
+  <!-- Badge pills -->
+  <g font-family="Consolas, Menlo, Monaco, monospace" font-size="13" font-weight="700" letter-spacing="1.5" fill="url(#accent)">
+    <rect x="64" y="350" width="145" height="34" rx="17" fill="none" stroke="url(#accent)" stroke-width="1.5"/>
+    <text x="136.5" y="372" text-anchor="middle">EBPF-NATIVE</text>
+
+    <rect x="223" y="350" width="100" height="34" rx="17" fill="none" stroke="url(#accent)" stroke-width="1.5"/>
+    <text x="273" y="372" text-anchor="middle">MAGLEV</text>
+
+    <rect x="337" y="350" width="210" height="34" rx="17" fill="none" stroke="url(#accent)" stroke-width="1.5"/>
+    <text x="442" y="372" text-anchor="middle">KUBERNETES-READY</text>
+
+    <rect x="64" y="398" width="140" height="34" rx="17" fill="none" stroke="url(#accent)" stroke-width="1.5"/>
+    <text x="134" y="420" text-anchor="middle">APACHE 2.0</text>
+  </g>
+
+  <text x="64" y="555" font-family="Consolas, Menlo, Monaco, monospace" font-size="15" fill="#6b7680">github.com/zyvorai/rivora</text>
+
+  <!-- Right column: VIP hub + spokes -->
+  <circle cx="900" cy="295" r="220" fill="url(#glow)"/>
+
+  <g stroke="#38bdf8" stroke-width="1.5" opacity="0.65">
+    <line x1="900" y1="195" x2="900" y2="113"/>
+    <line x1="986.6" y1="245" x2="1057.6" y2="204"/>
+    <line x1="986.6" y1="345" x2="1057.6" y2="386"/>
+    <line x1="900" y1="395" x2="900" y2="477"/>
+    <line x1="813.4" y1="345" x2="742.4" y2="386"/>
+    <line x1="813.4" y1="245" x2="742.4" y2="204"/>
+  </g>
+
+  <g fill="url(#accent)">
+    <circle cx="900" cy="113" r="5"/>
+    <circle cx="1057.6" cy="204" r="5"/>
+    <circle cx="1057.6" cy="386" r="5"/>
+    <circle cx="900" cy="477" r="5"/>
+    <circle cx="742.4" cy="386" r="5"/>
+    <circle cx="742.4" cy="204" r="5"/>
+  </g>
+
+  <circle cx="900" cy="295" r="100" fill="none" stroke="url(#accent)" stroke-width="2.5" opacity="0.55"/>
+  <circle cx="900" cy="295" r="62" fill="none" stroke="url(#accent)" stroke-width="1.5" stroke-dasharray="3 6" opacity="0.4"/>
+  <circle cx="900" cy="295" r="34" fill="#05070a" stroke="url(#accent)" stroke-width="3"/>
+  <circle cx="900" cy="295" r="10" fill="url(#accent)"/>
+
+  <g font-family="Consolas, Menlo, Monaco, monospace" font-size="15" font-weight="700" letter-spacing="1.5" fill="#e4ecf2">
+    <text x="900" y="100" text-anchor="middle">XDP</text>
+    <text x="1073" y="200" text-anchor="start">MAGLEV</text>
+    <text x="1073" y="390" text-anchor="start">NAT</text>
+    <text x="900" y="500" text-anchor="middle">K8S</text>
+    <text x="727" y="390" text-anchor="end">DSR</text>
+    <text x="727" y="200" text-anchor="end">TCX</text>
+  </g>
+</svg>
