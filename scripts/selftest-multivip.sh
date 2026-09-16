@@ -161,36 +161,32 @@ sys.exit(1)
 "
 }
 
-# map_id <name> -> that map's kernel-wide ID via `bpftool map show -j`.
-# Kernel IDs (unlike bpffs pin paths) are visible from any mount
-# namespace, which matters here: rivorad runs via `ip netns exec ... bash
-# -c "mount -t bpf bpf /sys/fs/bpf; exec rivorad"`, and that mount is a
-# private, ephemeral bpffs instance scoped to that one invocation — a
-# *different* `ip netns exec` (or this script's own shell) mounting or
-# reading /sys/fs/bpf/rivora-lb again would not see those pins at all.
-# `sed -n '/^\[/,$p'` drops this bpftool build's "not found for kernel X"
-# notice — a multi-line block (blank lines and indented package-name
-# suggestions, not just a single "WARNING:"-prefixed line) that prints to
-# stdout ahead of the JSON on CI's runner even though the tool itself is
-# fully functional for what we need here — by keeping only from the
-# JSON array's opening `[` onward, regardless of what precedes it.
-map_id() {
-    local name="$1"
-    bpftool map show -j 2>/dev/null | sed -n '/^\[/,$p' | python3 -c "
-import json, sys
-for m in json.load(sys.stdin):
-    if m.get('name', '').startswith('$name'):
-        print(m['id']); break
-"
-}
-
+# set_health writes backend_health_map directly via its bpffs pin —
+# `bpftool map update pinned /sys/fs/bpf/rivora-lb/backend_health_map`.
+# Two things make that path work reliably here, where a naive call from
+# this script's own shell would not:
+#
+# 1. Mount namespace: rivorad runs via `ip netns exec ... bash -c "mount
+#    -t bpf bpf /sys/fs/bpf; exec rivorad"` — that mount is private and
+#    ephemeral, scoped to that one invocation. A *different* shell (this
+#    script's own, or a fresh `ip netns exec`) sees a *different*
+#    /sys/fs/bpf with none of rivorad's pins in it. `nsenter --mount
+#    /proc/$RIVORAD_PID/ns/mnt` joins that exact same mount namespace
+#    instead of creating another new one, so the pin path resolves.
+#
+# 2. `bpftool map show`'s global enumeration (the alternative,
+#    kernel-ID-based approach this test used before) turned out to be
+#    unreliable on CI's runner regardless of namespace or output
+#    filtering — it returns no usable output there at all, on a kernel
+#    with no matching bpftool package. Going straight to the pin path
+#    sidesteps enumeration entirely, so that limitation doesn't apply.
 set_health() {
     # backend_id is a little-endian __u32 key; this test only ever has a
     # handful of backends so it always fits in the first byte.
-    local backend_id="$1" value="$2" mapid
-    mapid=$(map_id backend_health_)
-    [ -z "$mapid" ] && { echo "backend_health_map not found" >&2; return 1; }
-    bpftool map update id "$mapid" key "$backend_id" 0 0 0 value "$value" >/dev/null
+    local backend_id="$1" value="$2"
+    nsenter --mount="/proc/${RIVORAD_PID}/ns/mnt" \
+        bpftool map update pinned /sys/fs/bpf/rivora-lb/backend_health_map \
+        key "$backend_id" 0 0 0 value "$value" >/dev/null
 }
 
 wait_for_api() {
