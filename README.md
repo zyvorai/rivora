@@ -35,6 +35,22 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
   checker: bpffs mounted, kernel new enough for TCX, build tools present.
   `--json`, `--strict`, exit 0/2 — same shape as netra's doctor tool.
 
+## Securing the API
+
+`rivorad`'s local API (`127.0.0.1:9870` by default) is plain HTTP and
+unauthenticated out of the box — fine for a loopback-only listener, but both
+are opt-in to lock down, same env-var-driven shape as netra's `netrad`:
+
+| Env var                    | Effect                                              |
+| --------------------------- | ---------------------------------------------------- |
+| `RIVORA_API_KEY`            | Require this bearer token on every request           |
+| `RIVORA_TLS_CERT` / `_KEY`  | Serve HTTPS with this certificate                     |
+| `RIVORA_TLS_SELF_SIGNED`    | Serve HTTPS with an auto-generated self-signed cert (no cert files needed) |
+
+`rivoractl` picks up `RIVORA_API_KEY` and `RIVORA_TLS_INSECURE` (accept a
+self-signed cert) from its own environment, or via `--api-key`/
+`--tls-insecure`. `rivora-doctor` reports which of these are set.
+
 ## Quickstart
 
 Rivora needs a real Linux kernel (XDP/eBPF) — see

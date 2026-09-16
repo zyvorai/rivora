@@ -7,6 +7,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -22,6 +23,7 @@ import (
 	"github.com/zyvorai/rivora/internal/dataplane"
 	"github.com/zyvorai/rivora/internal/healthcheck"
 	"github.com/zyvorai/rivora/internal/loader"
+	"github.com/zyvorai/rivora/internal/tlsutil"
 )
 
 var version = "dev"
@@ -101,10 +103,42 @@ func main() {
 	go checker.Run()
 	defer checker.Stop()
 
-	srv := &http.Server{Addr: cfg.APIListen, Handler: api.New(plane).Handler()}
+	apiKey := os.Getenv("RIVORA_API_KEY")
+	tlsCert := os.Getenv("RIVORA_TLS_CERT")
+	tlsKey := os.Getenv("RIVORA_TLS_KEY")
+	selfSigned := os.Getenv("RIVORA_TLS_SELF_SIGNED") != ""
+
+	srv := &http.Server{Addr: cfg.APIListen, Handler: api.New(plane, apiKey).Handler()}
+	tlsMode := "off"
+	switch {
+	case tlsCert != "" && tlsKey != "":
+		tlsMode = "file"
+	case selfSigned:
+		tlsMode = "self-signed"
+	}
+	authMode := "off"
+	if apiKey != "" {
+		authMode = "on"
+	}
+	logger.Info("api listening", "addr", cfg.APIListen, "tls", tlsMode, "auth", authMode)
+
 	go func() {
-		logger.Info("api listening", "addr", cfg.APIListen)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		var err error
+		switch tlsMode {
+		case "file":
+			err = srv.ListenAndServeTLS(tlsCert, tlsKey)
+		case "self-signed":
+			cert, cerr := tlsutil.GenerateSelfSigned()
+			if cerr != nil {
+				logger.Error("generate self-signed cert", "err", cerr)
+				os.Exit(1)
+			}
+			srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+			err = srv.ListenAndServeTLS("", "")
+		default:
+			err = srv.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
 			logger.Error("api server", "err", err)
 		}
 	}()

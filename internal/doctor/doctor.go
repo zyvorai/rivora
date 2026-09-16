@@ -76,6 +76,7 @@ func Run(opts Options) Report {
 	r.add(checkBTF(root))
 	r.add(checkTool("clang", "compile bpf/*.c into bpf/*.o (make bpf)"))
 	r.add(checkTool("bpftool", "install linux-tools-$(uname -r) — used for map/prog troubleshooting"))
+	r.add(checkAPISecurity())
 	if opts.Interface != "" {
 		r.add(checkInterfaceXDP(opts.Interface))
 	}
@@ -174,6 +175,31 @@ func checkBPFFSMounted(root string) Check {
 		Detail:      "no bpf filesystem mounted",
 		Remediation: "mount -t bpf bpf /sys/fs/bpf",
 	}
+}
+
+// checkAPISecurity is informational only: whether to secure rivorad's local
+// API is the operator's call (v0.1 defaults to loopback-only), not
+// something to gate readiness on — same spirit as netra-doctor reporting
+// environment facts rather than opinions where there's no single right
+// answer.
+func checkAPISecurity() Check {
+	apiKey := os.Getenv("RIVORA_API_KEY") != ""
+	tlsFile := os.Getenv("RIVORA_TLS_CERT") != "" && os.Getenv("RIVORA_TLS_KEY") != ""
+	selfSigned := os.Getenv("RIVORA_TLS_SELF_SIGNED") != ""
+
+	authDetail := "RIVORA_API_KEY not set — API is unauthenticated"
+	if apiKey {
+		authDetail = "RIVORA_API_KEY set — API requires a bearer token"
+	}
+	tlsDetail := "no TLS env vars set — API serves plain HTTP"
+	switch {
+	case tlsFile:
+		tlsDetail = "RIVORA_TLS_CERT/RIVORA_TLS_KEY set — API serves HTTPS with that certificate"
+	case selfSigned:
+		tlsDetail = "RIVORA_TLS_SELF_SIGNED set — API serves HTTPS with an auto-generated self-signed certificate"
+	}
+
+	return Check{Status: StatusInfo, Title: "API security", Detail: authDetail + "; " + tlsDetail}
 }
 
 func checkBTF(root string) Check {

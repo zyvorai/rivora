@@ -17,11 +17,15 @@ import (
 
 var version = "dev"
 
-const usage = `rivoractl: status | vips | backends [--format json] [--api HOST:PORT]
+const usage = `rivoractl: status | vips | backends [--format json] [--api HOST:PORT|URL]
   status              Overview: VIP, mode, healthy/total backends, packet counters
   vips                VIP configuration and live counters
   backends            Per-backend health and packet counters
   version             Print rivoractl version
+
+Options:
+  --api-key KEY       Bearer token (default: $RIVORA_API_KEY)
+  --tls-insecure      Accept rivorad's self-signed cert (default: $RIVORA_TLS_INSECURE)
 `
 
 func main() {
@@ -33,7 +37,10 @@ func main() {
 	cmd := os.Args[1]
 	args := os.Args[2:]
 
-	var apiAddr, format string
+	apiAddr := ""
+	format := ""
+	apiKey := os.Getenv("RIVORA_API_KEY")
+	tlsInsecure := os.Getenv("RIVORA_TLS_INSECURE") != ""
 	rest := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -47,6 +54,13 @@ func main() {
 			if i < len(args) {
 				format = args[i]
 			}
+		case "--api-key":
+			i++
+			if i < len(args) {
+				apiKey = args[i]
+			}
+		case "--tls-insecure":
+			tlsInsecure = true
 		default:
 			rest = append(rest, args[i])
 		}
@@ -54,7 +68,7 @@ func main() {
 	if apiAddr == "" {
 		apiAddr = "127.0.0.1:9870"
 	}
-	client := apiclient.New(apiAddr)
+	client := apiclient.New(apiAddr, apiclient.Options{APIKey: apiKey, TLSInsecure: tlsInsecure})
 
 	var err error
 	switch cmd {

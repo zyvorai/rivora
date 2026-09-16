@@ -7,24 +7,49 @@
 package apiclient
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/zyvorai/rivora/internal/dataplane"
 )
 
-type Client struct {
-	base string
-	hc   *http.Client
+// Options configures the client. APIKey, when set, is sent as a bearer
+// token on every request — matching rivorad requiring RIVORA_API_KEY.
+// TLSInsecure skips certificate verification, for rivorad's self-signed
+// cert (RIVORA_TLS_SELF_SIGNED) — matching netractl's NETRA_TLS_INSECURE.
+type Options struct {
+	APIKey      string
+	TLSInsecure bool
 }
 
-func New(addr string) *Client {
+type Client struct {
+	base   string
+	apiKey string
+	hc     *http.Client
+}
+
+// New creates a client for addr, which may be a bare host:port (defaults to
+// http://) or a full http://.../https://... URL.
+func New(addr string, opts Options) *Client {
+	base := addr
+	if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
+		base = "http://" + base
+	}
+
+	transport := http.DefaultTransport
+	if opts.TLSInsecure {
+		transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} //nolint:gosec // explicit opt-in for rivorad's self-signed cert
+	}
+
 	return &Client{
-		base: "http://" + addr,
-		hc:   &http.Client{Timeout: 5 * time.Second},
+		base:   base,
+		apiKey: opts.APIKey,
+		hc:     &http.Client{Timeout: 5 * time.Second, Transport: transport},
 	}
 }
 
@@ -41,7 +66,15 @@ func (c *Client) Backends() ([]dataplane.BackendStatus, error) {
 }
 
 func (c *Client) get(path string, out any) error {
-	resp, err := c.hc.Get(c.base + path)
+	req, err := http.NewRequest(http.MethodGet, c.base+path, nil)
+	if err != nil {
+		return err
+	}
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := c.hc.Do(req)
 	if err != nil {
 		if _, ok := err.(*net.OpError); ok {
 			return fmt.Errorf("cannot reach rivorad at %s (is it running?): %w", c.base, err)
@@ -49,6 +82,10 @@ func (c *Client) get(path string, out any) error {
 		return err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("rivorad: unauthorized — set RIVORA_API_KEY or pass --api-key")
+	}
 	if resp.StatusCode != http.StatusOK {
 		var e struct {
 			Error string `json:"error"`
