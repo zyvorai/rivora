@@ -36,6 +36,7 @@ type BackendStatus struct {
 	ID      uint32 `json:"id"`
 	Address string `json:"address"`
 	Port    uint16 `json:"port"`
+	Weight  uint32 `json:"weight"`
 	Healthy bool   `json:"healthy"`
 	Packets uint64 `json:"packets"`
 	Bytes   uint64 `json:"bytes"`
@@ -185,8 +186,20 @@ func (d *Dataplane) UpsertVIP(vip config.VIP) error {
 		backendSetChanged = true
 	}
 
-	if backendSetChanged || !existed {
-		if err := d.rebuildMaglevLocked(entry); err != nil {
+	oldWeights := make(map[string]uint32, len(entry.vip.Backends))
+	for _, b := range entry.vip.Backends {
+		oldWeights[backendName(b)] = maglev.NormalizeWeight(b.Weight)
+	}
+	weightsChanged := false
+	for name, b := range desired {
+		if oldWeights[name] != maglev.NormalizeWeight(b.Weight) {
+			weightsChanged = true
+			break
+		}
+	}
+
+	if backendSetChanged || weightsChanged || !existed {
+		if err := d.rebuildMaglevLocked(entry, desired); err != nil {
 			return fmt.Errorf("vip %s: %w", key, err)
 		}
 	}
@@ -218,17 +231,26 @@ func (d *Dataplane) UpsertVIP(vip config.VIP) error {
 }
 
 // rebuildMaglevLocked rebuilds entry's slice of maglev_table for its
-// current backend set, reusing its existing extent if the backend count
-// still fits that extent's size class, otherwise allocating a new extent,
-// writing the new table into it, and only then (the atomic cutover) and
-// only after that succeeds freeing the old one — so a lookup mid-rebuild
-// either sees the fully-old or fully-new (offset, table) pair, never a mix.
-func (d *Dataplane) rebuildMaglevLocked(entry *serviceEntry) error {
+// current backend set and weights, reusing its existing extent if the
+// backend count still fits that extent's size class, otherwise allocating
+// a new extent, writing the new table into it, and only then (the atomic
+// cutover) and only after that succeeds freeing the old one — so a lookup
+// mid-rebuild either sees the fully-old or fully-new (offset, table)
+// pair, never a mix. desired is this call's freshly-computed "addr:port"
+// -> config.Backend map (built by UpsertVIP) — weight is read from it
+// rather than from any shared/global state, since the same backend can
+// carry a different weight in a different VIP's table.
+func (d *Dataplane) rebuildMaglevLocked(entry *serviceEntry, desired map[string]config.Backend) error {
 	names := make([]string, 0, len(entry.backendIDs))
 	for name := range entry.backendIDs {
 		names = append(names, name)
 	}
 	sort.Strings(names) // deterministic BuildTable input across reconciles
+
+	backends := make([]maglev.Backend, len(names))
+	for i, name := range names {
+		backends[i] = maglev.Backend{Name: name, Weight: desired[name].Weight}
+	}
 
 	size := maglevClassFor(len(names))
 	needNewExtent := entry.extent.size == 0 || size > entry.extent.size
@@ -241,7 +263,7 @@ func (d *Dataplane) rebuildMaglevLocked(entry *serviceEntry) error {
 		target = ext
 	}
 
-	table, err := maglev.BuildTable(int(target.size), names)
+	table, err := maglev.BuildTable(int(target.size), backends)
 	if err != nil {
 		if needNewExtent {
 			d.maglevAlloc.Free(target)
@@ -487,10 +509,14 @@ func (d *Dataplane) Statuses() ([]Status, error) {
 			StartedAt:  d.startedAt,
 			Dropped:    globalDropped,
 		}
-		for _, id := range entry.backendIDs {
+		weightByName := make(map[string]uint32, len(vip.Backends))
+		for _, b := range vip.Backends {
+			weightByName[backendName(b)] = maglev.NormalizeWeight(b.Weight)
+		}
+		for name, id := range entry.backendIDs {
 			var healthy uint8
 			_ = healthMap.Lookup(&id, &healthy)
-			bs := BackendStatus{ID: id, Healthy: healthy == bpfmaps.HealthHealthy}
+			bs := BackendStatus{ID: id, Weight: weightByName[name], Healthy: healthy == bpfmaps.HealthHealthy}
 			if bst := d.backendStates[id]; bst != nil {
 				bs.Address, bs.Port = bst.address, bst.port
 			}

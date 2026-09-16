@@ -38,9 +38,11 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
 
 - **`bpf/xdp_ingress.c`** — XDP program: match the VIP, pick a backend
   (sticky per-flow via `connection_affinity_map`, otherwise Maglev
-  consistent hashing over `maglev_table`), then either rewrite the
-  destination MAC and `XDP_TX` (**DSR**) or rewrite the destination IP/port
-  and `XDP_PASS` to normal routing (**full NAT**).
+  consistent hashing over `maglev_table`, optionally **weighted** —
+  backends can carry unequal traffic shares for canary/capacity-based
+  balancing, see `config/examples/weighted-backends.yaml`), then either
+  rewrite the destination MAC and `XDP_TX` (**DSR**) or rewrite the
+  destination IP/port and `XDP_PASS` to normal routing (**full NAT**).
 - **`bpf/tc_nat.c`** — TCX egress program, full-NAT mode only: un-NATs a
   backend's reply (source IP/port back to VIP:port) before it leaves, using
   the reverse mapping `xdp_ingress` wrote to `nat_reverse_map`.
@@ -160,7 +162,8 @@ sudo ./bin/rivorad -config config/examples/single-vip.yaml -bpf-dir bpf
 ```
 
 See `config/examples/single-vip.yaml` (DSR), `single-vip-nat.yaml` (full
-NAT), and `multi-vip.yaml` (several VIPs on one node, mixing modes) for what
+NAT), `multi-vip.yaml` (several VIPs on one node, mixing modes), and
+`weighted-backends.yaml` (unequal traffic shares within one VIP) for what
 each forwarding mode requires from your backends:
 
 - **DSR** — backends need the VIP bound locally (loopback/dummy interface)
@@ -212,16 +215,19 @@ script) rsyncs the source, installs build deps, builds, and installs:
 ```sh
 make deploy-remote H=<host> U=<user>          # full deploy
 make deploy-remote-quick H=<host> U=<user>    # skip dependency install
-make deploy-remote-verify H=<host> U=<user>   # re-run both selftest scripts
+make deploy-remote-verify H=<host> U=<user>   # re-run all selftest scripts
 ```
 
-`scripts/selftest.sh` and `scripts/selftest-multivip.sh` each build an
-isolated network-namespace/veth/bridge topology (never touching a host's
-real interfaces) and run `rivorad` against it: the former checks Maglev
-spread and health-check-driven failover for a single VIP in both DSR and
-NAT mode; the latter checks that two independent VIPs on one node don't
-interfere with each other and that a draining backend is excluded from new
-connections without disrupting its established ones.
+`scripts/selftest.sh`, `scripts/selftest-multivip.sh`, and
+`scripts/selftest-weighted.sh` each build an isolated network-namespace/
+veth/bridge topology (never touching a host's real interfaces) and run
+`rivorad` against it: the first checks Maglev spread and
+health-check-driven failover for a single VIP in both DSR and NAT mode;
+the second checks that two independent VIPs on one node don't interfere
+with each other and that a draining backend is excluded from new
+connections without disrupting its established ones; the third checks
+that a 9:1-weighted VIP decisively skews traffic toward the
+heavier-weighted backend.
 
 ## Roadmap
 

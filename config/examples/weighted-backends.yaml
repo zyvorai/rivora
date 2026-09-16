@@ -1,0 +1,30 @@
+# Weighted backend selection: unequal traffic shares within one VIP, e.g.
+# for a canary rollout (send 10% of traffic to the new version) or
+# capacity-proportional balancing across differently-sized backends.
+# Weight is relative, not a percentage — two backends with weight 1 each
+# split evenly regardless of the number; a backend with no weight field
+# (or weight: 0) defaults to weight 1, matching pre-weighting behavior.
+# Weight only affects which backend a *new* flow's hash lands on — see
+# README.md's "How it works" for the Maglev table this builds.
+
+interface: eth0
+apiListen: 127.0.0.1:9870
+
+healthCheck:
+  interval: 3s
+  timeout: 1s
+  failThreshold: 2
+  successThreshold: 2
+
+vips:
+  - address: 10.0.0.100
+    port: 80
+    protocol: tcp
+    mode: nat
+    backends:
+      - address: 10.0.1.11 # stable: ~90% of traffic
+        port: 8080
+        weight: 9
+      - address: 10.0.1.12 # canary: ~10% of traffic
+        port: 8080
+        weight: 1

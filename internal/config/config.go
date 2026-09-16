@@ -32,6 +32,11 @@ type Backend struct {
 	Address string `yaml:"address"`
 	Port    uint16 `yaml:"port"`
 	MAC     string `yaml:"mac,omitempty"`
+	// Weight is this backend's relative share of Maglev table slots
+	// within its VIP. 0 (the zero value, i.e. unset) is treated as 1 by
+	// internal/maglev.BuildTable — equal weighting, matching pre-weighting
+	// behavior exactly.
+	Weight uint32 `yaml:"weight,omitempty"`
 }
 
 type VIP struct {

@@ -72,3 +72,5 @@ jobs:
       run: sudo bash scripts/selftest.sh
     - name: Multi-VIP + draining selftest (veth/netns)
       run: sudo bash scripts/selftest-multivip.sh
+    - name: Weighted Maglev selftest (veth/netns)
+      run: sudo bash scripts/selftest-weighted.sh

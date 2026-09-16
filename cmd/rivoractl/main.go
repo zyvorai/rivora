@@ -140,9 +140,9 @@ func cmdBackends(c *apiclient.Client, format string) error {
 		return printJSON(bs)
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tADDRESS\tPORT\tHEALTHY\tPACKETS\tBYTES")
+	fmt.Fprintln(w, "ID\tADDRESS\tPORT\tWEIGHT\tHEALTHY\tPACKETS\tBYTES")
 	for _, b := range bs {
-		fmt.Fprintf(w, "%d\t%s\t%d\t%t\t%d\t%d\n", b.ID, b.Address, b.Port, b.Healthy, b.Packets, b.Bytes)
+		fmt.Fprintf(w, "%d\t%s\t%d\t%d\t%t\t%d\t%d\n", b.ID, b.Address, b.Port, b.Weight, b.Healthy, b.Packets, b.Bytes)
 	}
 	return w.Flush()
 }
