@@ -52,7 +52,7 @@ type BackendInfo struct {
 	Mac  [6]byte
 }
 
-// ConnKey — struct conn_key. 20 bytes.
+// ConnKey — struct conn_key. 16 bytes.
 type ConnKey struct {
 	Saddr uint32
 	Daddr uint32
@@ -62,7 +62,7 @@ type ConnKey struct {
 	Pad   [3]uint8
 }
 
-// NATReverseKey — struct nat_reverse_key. 20 bytes.
+// NATReverseKey — struct nat_reverse_key. 16 bytes.
 type NATReverseKey struct {
 	BackendAddr uint32
 	ClientAddr  uint32

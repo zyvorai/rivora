@@ -47,25 +47,20 @@ int rivora_tc_nat_egress(struct __sk_buff *skb)
         return TC_ACT_OK;
 
     void *l4 = (void *)iph + (iph->ihl * 4);
-    struct tcphdr *tcph = NULL;
-    struct udphdr *udph = NULL;
     __u16 sport, dport;
-    __u16 *l4_csum;
 
     if (iph->protocol == IPPROTO_TCP_) {
-        tcph = l4;
+        struct tcphdr *tcph = l4;
         if ((void *)(tcph + 1) > data_end)
             return TC_ACT_OK;
         sport = tcph->source;
         dport = tcph->dest;
-        l4_csum = &tcph->check;
     } else {
-        udph = l4;
+        struct udphdr *udph = l4;
         if ((void *)(udph + 1) > data_end)
             return TC_ACT_OK;
         sport = udph->source;
         dport = udph->dest;
-        l4_csum = &udph->check;
     }
 
     /* This is the backend->client leg: src = backend, dst = client. */
@@ -82,16 +77,30 @@ int rivora_tc_nat_egress(struct __sk_buff *skb)
     __u16 old_sport = sport;
     __u16 new_sport = rv->vip_port;
 
-    csum_replace(&iph->check, &old_saddr, &new_saddr, 4);
-    if (*l4_csum != 0) {
-        csum_replace(l4_csum, &old_saddr, &new_saddr, 4);
-        csum_replace(l4_csum, &old_sport, &new_sport, 2);
+    /* Re-derive the L4 pointer fresh here too — see xdp_ingress.c's NAT
+     * block for why reusing tcph/udph from much earlier doesn't reliably
+     * satisfy the verifier this far into the function. */
+    void *l4b = (void *)iph + (iph->ihl * 4);
+    if (iph->protocol == IPPROTO_TCP_) {
+        struct tcphdr *t = l4b;
+        if ((void *)(t + 1) > data_end)
+            return TC_ACT_OK;
+        csum_replace(&iph->check, &old_saddr, &new_saddr, 4);
+        csum_replace(&t->check, &old_saddr, &new_saddr, 4);
+        csum_replace(&t->check, &old_sport, &new_sport, 2);
+        t->source = new_sport;
+    } else {
+        struct udphdr *u = l4b;
+        if ((void *)(u + 1) > data_end)
+            return TC_ACT_OK;
+        csum_replace(&iph->check, &old_saddr, &new_saddr, 4);
+        if (u->check != 0) {
+            csum_replace(&u->check, &old_saddr, &new_saddr, 4);
+            csum_replace(&u->check, &old_sport, &new_sport, 2);
+        }
+        u->source = new_sport;
     }
     iph->saddr = new_saddr;
-    if (tcph)
-        tcph->source = new_sport;
-    else
-        udph->source = new_sport;
 
     return TC_ACT_OK;
 }

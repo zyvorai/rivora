@@ -11,6 +11,10 @@
 #include <linux/bpf.h>
 #include <linux/types.h>
 
+#ifndef NULL
+#define NULL ((void *)0)
+#endif
+
 #define SEC(NAME) __attribute__((section(NAME), used))
 #define __uint(name, val) int (*name)[val]
 #define __type(name, val) val *name
@@ -61,7 +65,7 @@ struct conn_key {
     __u8  proto;
     __u8  pad[3];
 };
-_Static_assert(sizeof(struct conn_key) == 20, "conn_key ABI");
+_Static_assert(sizeof(struct conn_key) == 16, "conn_key ABI");
 
 struct nat_reverse_key {
     __u32 backend_addr;
@@ -71,7 +75,7 @@ struct nat_reverse_key {
     __u8  proto;
     __u8  pad[3];
 };
-_Static_assert(sizeof(struct nat_reverse_key) == 20, "nat_reverse_key ABI");
+_Static_assert(sizeof(struct nat_reverse_key) == 16, "nat_reverse_key ABI");
 
 struct nat_reverse_val {
     __u32 vip_addr;
@@ -79,6 +83,11 @@ struct nat_reverse_val {
     __u8  pad[2];
 };
 _Static_assert(sizeof(struct nat_reverse_val) == 8, "nat_reverse_val ABI");
+
+struct mac_addr {
+    __u8 addr[6];
+};
+_Static_assert(sizeof(struct mac_addr) == 6, "mac_addr ABI");
 
 struct lb_stats {
     __u64 packets;
@@ -96,21 +105,24 @@ _Static_assert(sizeof(struct lb_stats) == 24, "lb_stats ABI");
 /* Stats slots: index 0 = global totals, 1..N = per-backend (backend_id+1). */
 #define RIVORA_STATS_GLOBAL 0
 
-static __always_inline __u16 csum_fold(__u32 sum)
-{
-    sum = (sum & 0xffff) + (sum >> 16);
-    sum = (sum & 0xffff) + (sum >> 16);
-    return (__u16)~sum;
-}
-
-/* RFC1624-style incremental checksum update for an arbitrary changed field. */
+/* RFC1624-style incremental checksum update for an arbitrary changed field.
+ *
+ * The fold-carry loop is a fixed 4-iteration unroll, not a `while`: 4
+ * iterations is more than enough to fully fold any __s64 sum down to 16
+ * bits (each pass can only shrink the high bits), but more importantly the
+ * verifier can't prove a `while (sum >> 16)` terminates — its range
+ * tracking doesn't reason about convergence, so it reports "infinite loop
+ * detected" even though this converges in 2-3 passes in practice. */
 static __always_inline void csum_replace(__u16 *csum_be, void *old_val, void *new_val, __u32 size)
 {
     __s64 diff = bpf_csum_diff((__be32 *)old_val, size, (__be32 *)new_val, size, 0);
     __u32 c = (~(__u32)(*csum_be)) & 0xffff;
     __s64 sum = (__s64)c + diff;
-    while (sum >> 16)
-        sum = (sum & 0xffff) + (sum >> 16);
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        if (sum >> 16)
+            sum = (sum & 0xffff) + (sum >> 16);
+    }
     if (sum < 0)
         sum += 0xffff; /* keep the fold in range if diff underflowed */
     *csum_be = (__u16)(~sum & 0xffff);

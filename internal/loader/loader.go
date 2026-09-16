@@ -63,12 +63,15 @@ func loadPinned(objPath string, sharedMaps map[string]*ebpf.Map) (*ebpf.Collecti
 		return nil, err
 	}
 
+	// Only pass replacements for maps this specific object actually
+	// declares — cilium/ebpf errors ("replacement map X not found in
+	// CollectionSpec") if handed a map the spec doesn't reference, which
+	// xdp_ingress.o and tc_nat.o mostly don't share (only nat_reverse_map is
+	// common between them).
 	repl := map[string]*ebpf.Map{}
-	for name := range sharedMaps {
-		repl[name] = sharedMaps[name]
-	}
 	for name := range spec.Maps {
-		if _, already := repl[name]; already {
+		if m, ok := sharedMaps[name]; ok {
+			repl[name] = m
 			continue
 		}
 		if m, err := ebpf.LoadPinnedMap(filepath.Join(PinDir, name), nil); err == nil {
@@ -98,13 +101,28 @@ func loadPinned(objPath string, sharedMaps map[string]*ebpf.Map) (*ebpf.Collecti
 	return coll, nil
 }
 
-// AttachXDP attaches the ingress program to iface.
+// AttachXDP attaches the ingress program to iface in generic (SKB) mode.
+//
+// veth's "native" XDP mode accepts the attach cleanly but its XDP_TX
+// hairpin-to-peer delivery does not reliably cross a bridge the peer is
+// attached to (verified experimentally: the rewritten frame never reaches
+// the peer even though driver TX counters report zero drops) — a real,
+// reproducible gap in this environment, not a program-logic bug. Generic
+// mode runs XDP_TX through the normal dev_queue_xmit() path instead of
+// veth's special-cased hairpin, which does deliver correctly across a
+// bridge. TODO(v0.2): make this configurable and default to native mode on
+// interfaces with real driver support (physical NICs, SR-IOV, etc.), where
+// XDP_TX re-queues on the same wire and this gap doesn't apply.
 func (d *Datapath) AttachXDP(iface *net.Interface) error {
 	prog, ok := d.ingressColl.Programs["rivora_xdp_ingress"]
 	if !ok {
 		return fmt.Errorf("program rivora_xdp_ingress not found in object")
 	}
-	lnk, err := link.AttachXDP(link.XDPOptions{Program: prog, Interface: iface.Index})
+	lnk, err := link.AttachXDP(link.XDPOptions{
+		Program:   prog,
+		Interface: iface.Index,
+		Flags:     link.XDPGenericMode,
+	})
 	if err != nil {
 		return fmt.Errorf("attach xdp to %s: %w", iface.Name, err)
 	}

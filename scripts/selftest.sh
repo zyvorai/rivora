@@ -89,6 +89,15 @@ cleanup() {
 trap cleanup EXIT
 
 setup_topology() {
+    # Defensive clean slate: an interrupted previous run (e.g. a killed SSH
+    # session) can leave orphaned veth halves behind even though their
+    # namespace is long gone — these are plain, fixed device names shared
+    # by any run, not suffixed, so a stale one would collide with ours.
+    for role in lb client be1 be2; do
+        ip link del "veth-${role}" 2>/dev/null || true
+        ip link del "veth-${role}-br" 2>/dev/null || true
+    done
+
     ip link add "$BR" type bridge
     ip link set "$BR" up
 
@@ -160,8 +169,21 @@ test_mode() {
     be2_mac=$(ip netns exec "$NS_BE2" cat /sys/class/net/veth-be2/address)
 
     if [ "$mode" = "dsr" ]; then
+        # Classic DSR/LVS-DR setup: the VIP lives on lo (so the backend
+        # accepts traffic addressed to it) but the backend must NOT answer
+        # ARP for it on its real interface — otherwise, on a flat L2
+        # segment like this test's bridge, the client would resolve the
+        # VIP straight to a backend's MAC and traffic would bypass the LB
+        # entirely, whether or not rivorad's forwarding is even correct.
+        for ns in "$NS_BE1" "$NS_BE2"; do
+            ip netns exec "$ns" sysctl -qw net.ipv4.conf.all.arp_ignore=1
+            ip netns exec "$ns" sysctl -qw net.ipv4.conf.all.arp_announce=2
+        done
         ip netns exec "$NS_BE1" ip addr add "${VIP}/32" dev lo
         ip netns exec "$NS_BE2" ip addr add "${VIP}/32" dev lo
+        # The LB is the VIP's real owner on the wire (answers ARP, receives
+        # the client's frames first) — same as a real DSR director node.
+        ip netns exec "$NS_LB" ip addr add "${VIP}/32" dev veth-lb
         cat > "$CONFIG" <<EOF
 interface: veth-lb
 apiListen: 127.0.0.1:9870
@@ -171,12 +193,18 @@ vips:
       {address: 10.77.0.11, port: ${PORT}, mac: "${be1_mac}"},
       {address: 10.77.0.12, port: ${PORT}, mac: "${be2_mac}"}]}
 EOF
-        ip netns exec "$NS_BE1" python3 -c "$(backend_server)" "$VIP" "$PORT" "BACKEND-1" &
+        ip netns exec "$NS_BE1" python3 -c "$(backend_server)" "0.0.0.0" "$PORT" "BACKEND-1" >/dev/null 2>&1 &
         BE1_PID=$!
-        ip netns exec "$NS_BE2" python3 -c "$(backend_server)" "$VIP" "$PORT" "BACKEND-2" &
+        ip netns exec "$NS_BE2" python3 -c "$(backend_server)" "0.0.0.0" "$PORT" "BACKEND-2" >/dev/null 2>&1 &
         BE2_PID=$!
     else
         ip netns exec "$NS_LB" ip addr add "${VIP}/32" dev veth-lb
+        # Force backend->client return traffic through the LB (its TCX
+        # egress program un-NATs it there) even though client and backends
+        # share this test's single L2 segment and could otherwise reach
+        # each other directly, bypassing the LB entirely.
+        ip netns exec "$NS_BE1" ip route add 10.77.0.2/32 via 10.77.0.1 dev veth-be1
+        ip netns exec "$NS_BE2" ip route add 10.77.0.2/32 via 10.77.0.1 dev veth-be2
         cat > "$CONFIG" <<EOF
 interface: veth-lb
 apiListen: 127.0.0.1:9870
@@ -186,20 +214,30 @@ vips:
       {address: 10.77.0.11, port: ${PORT}},
       {address: 10.77.0.12, port: ${PORT}}]}
 EOF
-        ip netns exec "$NS_BE1" python3 -c "$(backend_server)" "10.77.0.11" "$PORT" "BACKEND-1" &
+        ip netns exec "$NS_BE1" python3 -c "$(backend_server)" "10.77.0.11" "$PORT" "BACKEND-1" >/dev/null 2>&1 &
         BE1_PID=$!
-        ip netns exec "$NS_BE2" python3 -c "$(backend_server)" "10.77.0.12" "$PORT" "BACKEND-2" &
+        ip netns exec "$NS_BE2" python3 -c "$(backend_server)" "10.77.0.12" "$PORT" "BACKEND-2" >/dev/null 2>&1 &
         BE2_PID=$!
     fi
     sleep 0.3
 
-    ip netns exec "$NS_LB" env "$RIVORAD" -config "$CONFIG" -bpf-dir "$BPF_DIR" >"$RIVORAD_LOG" 2>&1 &
+    # `ip netns exec` gives each invocation its own private, ephemeral mount
+    # namespace with /sys freshly remounted — the host's bpffs mount at
+    # /sys/fs/bpf isn't visible there. Mount it in the *same* invocation
+    # that execs rivorad (a separate `ip netns exec ... mount` beforehand
+    # wouldn't persist: each call gets its own throwaway mount namespace).
+    ip netns exec "$NS_LB" bash -c \
+        "mount -t bpf bpf /sys/fs/bpf 2>/dev/null; exec '$RIVORAD' -config '$CONFIG' -bpf-dir '$BPF_DIR'" \
+        >"$RIVORAD_LOG" 2>&1 &
     RIVORAD_PID=$!
     sleep 1
 
     if ! kill -0 "$RIVORAD_PID" 2>/dev/null; then
         fail "${mode}: rivorad exited immediately — see ${RIVORAD_LOG}"
         tail -n 40 "$RIVORAD_LOG" || true
+        RIVORAD_PID=""
+        ip netns exec "$NS_BE1" kill "$BE1_PID" 2>/dev/null; BE1_PID=""
+        ip netns exec "$NS_BE2" kill "$BE2_PID" 2>/dev/null; BE2_PID=""
         return
     fi
 

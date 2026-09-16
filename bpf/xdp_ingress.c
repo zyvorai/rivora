@@ -70,7 +70,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 16);
     __type(key, __u32); /* ifindex */
-    __type(value, __u8[6]); /* MAC of that interface, for DSR src rewrite */
+    __type(value, struct mac_addr); /* MAC of that interface, for DSR src rewrite */
 } iface_mac_map SEC(".maps");
 
 struct {
@@ -137,24 +137,19 @@ int rivora_xdp_ingress(struct xdp_md *ctx)
 
     __u16 sport, dport;
     void *l4 = (void *)iph + (iph->ihl * 4);
-    __u16 *l4_csum = NULL;
-    struct tcphdr *tcph = NULL;
-    struct udphdr *udph = NULL;
 
     if (iph->protocol == IPPROTO_TCP_) {
-        tcph = l4;
+        struct tcphdr *tcph = l4;
         if ((void *)(tcph + 1) > data_end)
             return XDP_PASS;
         sport = tcph->source;
         dport = tcph->dest;
-        l4_csum = &tcph->check;
     } else {
-        udph = l4;
+        struct udphdr *udph = l4;
         if ((void *)(udph + 1) > data_end)
             return XDP_PASS;
         sport = udph->source;
         dport = udph->dest;
-        l4_csum = &udph->check;
     }
 
     struct vip_key vk = {.addr = iph->daddr, .port = dport, .proto = iph->protocol};
@@ -202,9 +197,9 @@ int rivora_xdp_ingress(struct xdp_md *ctx)
 
     if (cfg->mode == RIVORA_MODE_DSR) {
         __u32 ifindex = ctx->ingress_ifindex;
-        __u8 (*self_mac)[6] = bpf_map_lookup_elem(&iface_mac_map, &ifindex);
+        struct mac_addr *self_mac = bpf_map_lookup_elem(&iface_mac_map, &ifindex);
         if (self_mac)
-            __builtin_memcpy(eth->h_source, *self_mac, 6);
+            __builtin_memcpy(eth->h_source, self_mac->addr, 6);
         __builtin_memcpy(eth->h_dest, be->mac, 6);
         /* DSR: VIP stays the destination IP — the backend must have the VIP
          * bound locally (loopback/dummy) so it accepts and replies directly. */
@@ -212,23 +207,41 @@ int rivora_xdp_ingress(struct xdp_md *ctx)
     }
 
     /* Full NAT: rewrite destination IP/port to the backend; record the
-     * reverse mapping so the TCX egress program (tc_nat) can un-NAT the
-     * backend's reply back to VIP:port before it reaches the client. */
+     * reverse mapping so tc_nat's TCX egress program can un-NAT the
+     * backend's reply back to VIP:port before it reaches the client.
+     *
+     * Re-derive the L4 header pointer fresh from iph right here, with its
+     * own bounds check immediately adjacent to the write. Reusing tcph/udph
+     * captured much earlier — before several intervening map lookups and
+     * branches — doesn't reliably keep its verified-safe-pointer status
+     * that far into the function, so each branch gets its own tight
+     * check-then-use with nothing unrelated in between. */
     __u32 old_daddr = iph->daddr;
     __u32 new_daddr = be->addr;
     __u16 old_dport = dport;
     __u16 new_dport = be->port;
+    void *l4b = (void *)iph + (iph->ihl * 4);
 
-    csum_replace(&iph->check, &old_daddr, &new_daddr, 4);
-    if (*l4_csum != 0) { /* UDP checksum 0 means "unset", leave it */
-        csum_replace(l4_csum, &old_daddr, &new_daddr, 4);
-        csum_replace(l4_csum, &old_dport, &new_dport, 2);
+    if (iph->protocol == IPPROTO_TCP_) {
+        struct tcphdr *t = l4b;
+        if ((void *)(t + 1) > data_end)
+            return XDP_PASS;
+        csum_replace(&iph->check, &old_daddr, &new_daddr, 4);
+        csum_replace(&t->check, &old_daddr, &new_daddr, 4);
+        csum_replace(&t->check, &old_dport, &new_dport, 2);
+        t->dest = new_dport;
+    } else {
+        struct udphdr *u = l4b;
+        if ((void *)(u + 1) > data_end)
+            return XDP_PASS;
+        csum_replace(&iph->check, &old_daddr, &new_daddr, 4);
+        if (u->check != 0) { /* UDP checksum 0 means "unset", leave it */
+            csum_replace(&u->check, &old_daddr, &new_daddr, 4);
+            csum_replace(&u->check, &old_dport, &new_dport, 2);
+        }
+        u->dest = new_dport;
     }
     iph->daddr = new_daddr;
-    if (tcph)
-        tcph->dest = new_dport;
-    else
-        udph->dest = new_dport;
 
     struct nat_reverse_key rk = {
         .backend_addr = be->addr, .client_addr = iph->saddr,
