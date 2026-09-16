@@ -53,6 +53,14 @@ rivorad:
     key: ""
 
   securityContext:
+    # eBPF programs pin their maps under /sys/fs/bpf, which the kernel
+    # mounts mode 0700 — a hand-picked capability list (BPF/NET_ADMIN/
+    # NET_RAW/SYS_ADMIN) isn't reliably sufficient to create pin
+    # directories there across every containerd/CRI configuration (the
+    # default capability baseline a runtime grants on top of an explicit
+    # `add` list isn't standardized), so rivorad runs privileged — the
+    # same posture real eBPF DaemonSets like Cilium's agent use.
+    privileged: true
     capabilities:
       add: ["BPF", "NET_ADMIN", "NET_RAW", "SYS_ADMIN"]
 

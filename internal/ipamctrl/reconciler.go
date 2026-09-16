@@ -194,7 +194,33 @@ func (r *Reconciler) reconcilePools(ctx context.Context, dynFactory dynamicinfor
 	}
 	r.allocator.SetPools(pools)
 	r.logger.Info("address pools synced", "pools", len(pools))
+
+	for name := range pools {
+		if err := r.patchPoolStatus(ctx, name); err != nil {
+			r.logger.Error("patch addresspool status", "pool", name, "err", err)
+		}
+	}
 	return nil
+}
+
+// patchPoolStatus writes name's current Allocator.Counts into its
+// AddressPool.Status — coarse counts only (not per-allocation state, which
+// would make Service churn contend on this object's status subresource;
+// Service objects remain the allocation source of truth, see
+// rebuildFromExistingServices).
+func (r *Reconciler) patchPoolStatus(ctx context.Context, name string) error {
+	available, assigned := r.allocator.Counts(name)
+	patch, err := json.Marshal(map[string]interface{}{
+		"status": map[string]interface{}{
+			"availableIPs": available,
+			"assignedIPs":  assigned,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = r.dynamic.Resource(v1alpha1.AddressPoolResource).Patch(ctx, name, types.MergePatchType, patch, metav1.PatchOptions{}, "status")
+	return err
 }
 
 // rebuildFromExistingServices calls Allocator.Reserve for every managed
@@ -254,6 +280,7 @@ func (r *Reconciler) reconcileService(ctx context.Context, key string) error {
 		// before Kubernetes let the delete complete; Release is idempotent
 		// if that already happened, and a safety net if it somehow didn't.
 		r.allocator.Release(key)
+		r.refreshPoolStatuses(ctx)
 		return nil
 	}
 	if err != nil {
@@ -266,6 +293,7 @@ func (r *Reconciler) reconcileService(ctx context.Context, key string) error {
 	if !r.managed(svc) || deleting {
 		if hasFinalizer {
 			r.allocator.Release(key)
+			r.refreshPoolStatuses(ctx)
 			return r.patchFinalizers(ctx, svc, removeString(svc.Finalizers, Finalizer))
 		}
 		return nil
@@ -279,10 +307,24 @@ func (r *Reconciler) reconcileService(ctx context.Context, key string) error {
 	if err != nil {
 		return fmt.Errorf("allocate address: %w", err)
 	}
+	r.refreshPoolStatuses(ctx)
 	if ingressIPv4(svc) == ip {
 		return nil
 	}
 	return r.patchIngress(ctx, svc, ip)
+}
+
+// refreshPoolStatuses re-patches every known pool's status counts. Called
+// after an allocation or release so AddressPool.Status reflects the change
+// promptly rather than waiting for the next periodic pool resync; errors
+// are logged, not returned — a stale status count is a display nit, not
+// worth failing (and requeuing) the Service reconcile over.
+func (r *Reconciler) refreshPoolStatuses(ctx context.Context) {
+	for _, name := range r.allocator.PoolNames() {
+		if err := r.patchPoolStatus(ctx, name); err != nil {
+			r.logger.Error("patch addresspool status", "pool", name, "err", err)
+		}
+	}
 }
 
 func (r *Reconciler) managed(svc *corev1.Service) bool {

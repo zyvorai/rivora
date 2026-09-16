@@ -124,6 +124,20 @@ func (a *Allocator) Release(key string) {
 	delete(a.addrPool, ip)
 }
 
+// PoolNames returns every pool name currently known to the allocator (from
+// the most recent SetPools call), for callers that need to refresh derived
+// state (e.g. a status subresource) per pool without duplicating SetPools'
+// input.
+func (a *Allocator) PoolNames() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	names := make([]string, 0, len(a.pools))
+	for name := range a.pools {
+		names = append(names, name)
+	}
+	return names
+}
+
 // Counts returns (available, assigned) for a named pool.
 func (a *Allocator) Counts(pool string) (available, assigned int64) {
 	a.mu.Lock()

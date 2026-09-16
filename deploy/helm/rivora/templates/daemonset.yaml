@@ -41,6 +41,7 @@ spec:
             - secretRef:
                 name: {{ include "rivora.fullname" . }}-rivorad
           securityContext:
+            privileged: {{ .Values.rivorad.securityContext.privileged }}
             capabilities:
               {{- toYaml .Values.rivorad.securityContext.capabilities | nindent 14 }}
           volumeMounts:

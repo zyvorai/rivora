@@ -168,6 +168,56 @@ func TestReconcileServiceDeletionReleasesAndRemovesFinalizer(t *testing.T) {
 	}
 }
 
+func TestReconcilePoolsWritesStatusCounts(t *testing.T) {
+	dyn := newDynamicClient(addressPoolObj("default", []string{"10.0.0.0/30"}, true))
+	r, _, dynFactory, cancel := startSynced(t, dyn)
+	defer cancel()
+	ctx := context.Background()
+
+	if err := r.reconcilePools(ctx, dynFactory); err != nil {
+		t.Fatal(err)
+	}
+
+	obj, err := r.dynamic.Resource(v1alpha1.AddressPoolResource).Get(ctx, "default", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, ok := obj.Object["status"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected a status field written, got %+v", obj.Object)
+	}
+	if avail, _ := status["availableIPs"].(int64); avail != 4 {
+		t.Errorf("status.availableIPs = %v, want 4", status["availableIPs"])
+	}
+}
+
+func TestReconcileServiceRefreshesPoolStatusOnAllocate(t *testing.T) {
+	dyn := newDynamicClient(addressPoolObj("default", []string{"10.0.0.0/30"}, true))
+	svc := lbService("svc")
+	r, _, dynFactory, cancel := startSynced(t, dyn, svc)
+	defer cancel()
+	ctx := context.Background()
+
+	if err := r.reconcilePools(ctx, dynFactory); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.reconcileService(ctx, "ns/svc"); err != nil { // adds finalizer
+		t.Fatal(err)
+	}
+	if err := r.reconcileService(ctx, "ns/svc"); err != nil { // allocates
+		t.Fatal(err)
+	}
+
+	obj, err := r.dynamic.Resource(v1alpha1.AddressPoolResource).Get(ctx, "default", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := obj.Object["status"].(map[string]interface{})
+	if assigned, _ := status["assignedIPs"].(int64); assigned != 1 {
+		t.Errorf("status.assignedIPs after one allocation = %v, want 1", status["assignedIPs"])
+	}
+}
+
 func TestReconcileServiceNonManagedIsNoop(t *testing.T) {
 	dyn := newDynamicClient()
 	svc := lbService("svc")

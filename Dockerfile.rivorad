@@ -1,0 +1,24 @@
+# Copyright 2026 Zyvor AI Labs · https://zyvor.dev
+# SPDX-License-Identifier: Apache-2.0
+
+FROM debian:bookworm-slim AS bpf-builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang llvm libelf-dev libc6-dev linux-libc-dev make \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY Makefile .
+COPY bpf/ bpf/
+RUN make bpf
+
+FROM golang:1.27-bookworm AS go-builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/rivorad ./cmd/rivorad
+
+FROM gcr.io/distroless/static-debian12
+COPY --from=go-builder /out/rivorad /usr/local/bin/rivorad
+COPY --from=bpf-builder /src/bpf/xdp_ingress.o /usr/local/share/rivora/bpf/xdp_ingress.o
+COPY --from=bpf-builder /src/bpf/tc_nat.o /usr/local/share/rivora/bpf/tc_nat.o
+ENTRYPOINT ["/usr/local/bin/rivorad"]
