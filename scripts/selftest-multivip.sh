@@ -168,12 +168,15 @@ sys.exit(1)
 # private, ephemeral bpffs instance scoped to that one invocation — a
 # *different* `ip netns exec` (or this script's own shell) mounting or
 # reading /sys/fs/bpf/rivora-lb again would not see those pins at all.
-# `grep -v WARNING` strips this bpftool build's "not found for kernel X"
-# noise, which (confirmed on CI) prints to stdout ahead of the JSON even
-# though the tool itself is fully functional for what we need here.
+# `sed -n '/^\[/,$p'` drops this bpftool build's "not found for kernel X"
+# notice — a multi-line block (blank lines and indented package-name
+# suggestions, not just a single "WARNING:"-prefixed line) that prints to
+# stdout ahead of the JSON on CI's runner even though the tool itself is
+# fully functional for what we need here — by keeping only from the
+# JSON array's opening `[` onward, regardless of what precedes it.
 map_id() {
     local name="$1"
-    bpftool map show -j 2>/dev/null | grep -v '^WARNING' | python3 -c "
+    bpftool map show -j 2>/dev/null | sed -n '/^\[/,$p' | python3 -c "
 import json, sys
 for m in json.load(sys.stdin):
     if m.get('name', '').startswith('$name'):
