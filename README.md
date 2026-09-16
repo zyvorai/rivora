@@ -30,6 +30,7 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
 - [Securing the API](#securing-the-api)
 - [Quickstart](#quickstart)
 - [Kubernetes (v0.2)](#kubernetes-v02)
+  - [Backends beyond Pods: KubeVirt VMs and external/physical IPs](#backends-beyond-pods-kubevirt-vms-and-externalphysical-ips)
 - [Building on the remote host](#building-on-the-remote-host)
 - [Roadmap](#roadmap)
 - [License](#license)
@@ -212,6 +213,33 @@ helm install rivora deploy/helm/rivora \
 See [`deploy/helm/rivora/README.md`](deploy/helm/rivora/README.md) for the
 full chart reference, including the CRD's manual-upgrade caveat.
 
+### Backends beyond Pods: KubeVirt VMs and external/physical IPs
+
+The Kubernetes reconciler (`internal/controller`) only ever reads
+`EndpointSlice` addresses/conditions/ports — it never looks at what kind
+of object backs an endpoint, so two cases work today with **no Rivora
+code path treating them specially**, each verified against a live
+cluster:
+
+- **KubeVirt VMs** — a `VirtualMachineInstance` fronted by a normal
+  `Service` (matching labels on the VMI, which KubeVirt propagates to its
+  virt-launcher Pod) produces a completely ordinary `EndpointSlice` —
+  same `addresses`/`conditions` shape as any Pod-backed Service. Nothing
+  to configure beyond a normal Service selector.
+- **External / physical / bare-metal IPs** — a `Service` with no
+  `spec.selector`, paired with a hand-authored `EndpointSlice` (labeled
+  `kubernetes.io/service-name: <service-name>`) pointing at any IP —
+  Kubernetes' own EndpointSlice controller leaves manually-created slices
+  alone as long as the owning Service has no selector, and Rivora's
+  reconciler needs no `TargetRef`/Pod reference at all. This is the same
+  mechanism `rivora-controller`'s `AddressPool` IPAM/`rivorad`'s VIP
+  assignment already work with — the Service still needs
+  `type: LoadBalancer` to get a VIP the normal way.
+
+Not yet supported: routing to a KubeVirt VM's *secondary* (Multus)
+network interface specifically — only the primary interface IP that
+Service/EndpointSlice already expose.
+
 ## Building on the remote host
 
 `scripts/deploy-remote.sh` (same shape as the sibling `guestkit` repo's
@@ -249,8 +277,13 @@ ahead: publishing the container images the Helm chart's
 `image.rivorad`/`image.controller` values reference (verification so far
 used locally-built images, not a published registry).
 
-BGP/BFD HA, IPv6, KubeVirt/physical backends, and Gateway API come in later
-milestones.
+v0.3 is underway. KubeVirt VMs and external/physical backends are done —
+see [Backends beyond Pods](#backends-beyond-pods-kubevirt-vms-and-externalphysical-ips)
+(verified against real KubeVirt VMIs and hand-authored EndpointSlices on
+a live cluster; turned out to need zero dataplane/reconciler changes).
+Gateway API, BGP/BFD HA, and IPv6 are still ahead — IPv6 in particular is
+a full parallel dataplane (new BPF maps/structs, checksum path, IPAM
+redesign, an NDP speaker), not a small extension, and will land last.
 
 ## License
 
