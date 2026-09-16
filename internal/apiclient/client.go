@@ -65,6 +65,14 @@ func (c *Client) Backends() ([]dataplane.BackendStatus, error) {
 	return bs, err
 }
 
+// VIPs returns every VIP rivorad owns, unlike Status() which only succeeds
+// when exactly one is configured.
+func (c *Client) VIPs() ([]dataplane.Status, error) {
+	var vips []dataplane.Status
+	err := c.get("/api/v1/vips", &vips)
+	return vips, err
+}
+
 func (c *Client) get(path string, out any) error {
 	req, err := http.NewRequest(http.MethodGet, c.base+path, nil)
 	if err != nil {

@@ -44,11 +44,15 @@ _Static_assert(sizeof(struct vip_key) == 8, "vip_key ABI");
 
 struct service_config {
     __u32 backend_count;
-    __u32 maglev_offset; /* reserved for multi-VIP tables; always 0 in v0.1 */
+    __u32 maglev_offset; /* this VIP's slice of the shared maglev_table starts here */
+    __u32 maglev_size;   /* ...and is this many slots wide — hash must be
+                           * reduced mod *this*, not mod the full table, or
+                           * it lands outside the VIP's populated range and
+                           * reads zero-initialized (backend_id=0) slots */
     __u8  mode;           /* 0 = DSR, 1 = full NAT */
     __u8  pad[3];
 };
-_Static_assert(sizeof(struct service_config) == 12, "service_config ABI");
+_Static_assert(sizeof(struct service_config) == 16, "service_config ABI");
 
 struct backend_info {
     __u32 addr;   /* network byte order */
@@ -98,6 +102,14 @@ _Static_assert(sizeof(struct lb_stats) == 24, "lb_stats ABI");
 
 #define RIVORA_MODE_DSR 0
 #define RIVORA_MODE_NAT 1
+
+/* backend_health_map values — mirrors bpfmaps.Health{Down,Healthy,Draining}
+ * on the Go side. Draining excludes a backend from pick_backend()'s *new*
+ * flow selection but not from connection_affinity_map's fast path (any
+ * nonzero value is truthy there), so established flows keep flowing. */
+#define RIVORA_HEALTH_DOWN 0
+#define RIVORA_HEALTH_HEALTHY 1
+#define RIVORA_HEALTH_DRAINING 2
 
 #define RIVORA_MAGLEV_M 65537u
 #define RIVORA_MAGLEV_PROBES 8

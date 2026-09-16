@@ -38,3 +38,5 @@ jobs:
     - run: make bpf build
     - name: Functional selftest (veth/netns, DSR + full-NAT)
       run: sudo bash scripts/selftest.sh
+    - name: Multi-VIP + draining selftest (veth/netns)
+      run: sudo bash scripts/selftest-multivip.sh

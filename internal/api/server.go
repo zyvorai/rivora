@@ -72,12 +72,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleVIPs(w http.ResponseWriter, r *http.Request) {
-	st, err := s.dp.Status()
+	sts, err := s.dp.Statuses()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, []dataplane.Status{st})
+	writeJSON(w, sts)
 }
 
 func (s *Server) handleBackends(w http.ResponseWriter, r *http.Request) {

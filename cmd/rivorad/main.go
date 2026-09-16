@@ -56,8 +56,11 @@ func main() {
 	}
 
 	natObj := ""
-	if cfg.VIPs[0].Mode == config.ModeNAT {
-		natObj = bpfDirPath(*bpfDir, bpfmaps.ProgTCNATEgress)
+	for _, vip := range cfg.VIPs {
+		if vip.Mode == config.ModeNAT {
+			natObj = bpfDirPath(*bpfDir, bpfmaps.ProgTCNATEgress)
+			break
+		}
 	}
 
 	dp, err := loader.Load(bpfDirPath(*bpfDir, bpfmaps.ProgXDPIngress), natObj)
@@ -77,7 +80,7 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	logger.Info("attached", "interface", cfg.Interface, "mode", cfg.VIPs[0].Mode)
+	logger.Info("attached", "interface", cfg.Interface, "vips", len(cfg.VIPs), "nat_egress", natObj != "")
 
 	plane := dataplane.New(cfg, dp)
 	if err := plane.Apply(iface); err != nil {

@@ -10,9 +10,11 @@ traffic-delivery layer the Zyvor platform doesn't yet have. It's
 CNI-independent and doesn't require Cilium: it attaches its own XDP/TCX
 programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
 
-> **Status: v0.1.** Single node, one VIP, IPv4 TCP/UDP, static YAML config,
-> DSR and full-NAT forwarding, Maglev backend selection, active TCP health
-> checks. No Kubernetes controller, BGP, or multi-VIP yet — see
+> **Status: v0.1 shipped, v0.2 (Kubernetes) underway.** Single node, IPv4
+> TCP/UDP, static YAML config, DSR and full-NAT forwarding, Maglev backend
+> selection with graceful draining, active TCP health checks. A node can
+> run multiple VIPs, each independently reconciled and Maglev-partitioned.
+> No Kubernetes controller, IPAM, L2 speaker, or BGP/BFD HA yet — see
 > [Roadmap](#roadmap).
 
 ## How it works
@@ -64,15 +66,19 @@ sudo ./bin/rivorad -config config/examples/single-vip.yaml -bpf-dir bpf
 ./bin/rivoractl status
 ```
 
-See `config/examples/single-vip.yaml` (DSR) and
-`config/examples/single-vip-nat.yaml` (full NAT) for the two forwarding
-modes and what each requires from your backends:
+See `config/examples/single-vip.yaml` (DSR), `single-vip-nat.yaml` (full
+NAT), and `multi-vip.yaml` (several VIPs on one node, mixing modes) for what
+each forwarding mode requires from your backends:
 
 - **DSR** — backends need the VIP bound locally (loopback/dummy interface)
   and must be L2-reachable from the Rivora node; no backend MAC = no DSR.
 - **Full NAT** — no backend changes needed, but backends must route return
   traffic back through the Rivora node (default gateway, or a static route
   for the client subnet).
+
+With more than one VIP configured, `rivoractl status`/`/api/v1/status`
+return an error pointing you at `rivoractl vips`/`/api/v1/vips` instead,
+which lists every VIP.
 
 ## Building on the remote host
 
@@ -82,20 +88,26 @@ script) rsyncs the source, installs build deps, builds, and installs:
 ```sh
 make deploy-remote H=<host> U=<user>          # full deploy
 make deploy-remote-quick H=<host> U=<user>    # skip dependency install
-make deploy-remote-verify H=<host> U=<user>   # just re-run scripts/selftest.sh
+make deploy-remote-verify H=<host> U=<user>   # re-run both selftest scripts
 ```
 
-`scripts/selftest.sh` builds an isolated network-namespace/veth/bridge
-topology (never touches a host's real interfaces), runs `rivorad` against
-it, and checks that Maglev spreads traffic across backends and that killing
-a backend takes it out of rotation within the health-check interval.
+`scripts/selftest.sh` and `scripts/selftest-multivip.sh` each build an
+isolated network-namespace/veth/bridge topology (never touching a host's
+real interfaces) and run `rivorad` against it: the former checks Maglev
+spread and health-check-driven failover for a single VIP in both DSR and
+NAT mode; the latter checks that two independent VIPs on one node don't
+interfere with each other and that a draining backend is excluded from new
+connections without disrupting its established ones.
 
 ## Roadmap
 
-v0.1 is deliberately narrow: single VIP, single node, IPv4 only, static
-config. Kubernetes `LoadBalancer` Services, multi-VIP, BGP/BFD HA, IPv6,
-KubeVirt/physical backends, and Gateway API come in later milestones — see
-the design notes for the full v0.2–v0.4 plan.
+v0.1 was deliberately narrow: single VIP, single node, IPv4 only, static
+config. v0.2 (Kubernetes integration) is underway — the dataplane/BPF
+foundation for multiple VIPs and graceful draining is done (this is what
+`scripts/selftest-multivip.sh` verifies); a `Service`/`EndpointSlice`
+reconciler, an `AddressPool` CRD for VIP IPAM, an L2/ARP speaker, and a Helm
+chart are still ahead. BGP/BFD HA, IPv6, KubeVirt/physical backends, and
+Gateway API come in later milestones.
 
 ## License
 

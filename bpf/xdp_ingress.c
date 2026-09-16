@@ -5,9 +5,15 @@
 // selection -> DSR (MAC rewrite, XDP_TX) or full-NAT (IP/port rewrite,
 // XDP_PASS to normal routing) forwarding. IPv4 TCP/UDP only in v0.1.
 //
-// Scope limitations tracked for v0.2+: IPv6, IP options, encapsulated
-// (Geneve/IPIP) backends, and a real Maglev "add backend" rebalance — v0.1
-// serves a single VIP with one flat maglev_table.
+// Multiple VIPs share the one flat maglev_table via non-overlapping
+// (offset, size) ranges the Go-side extent allocator hands out — see
+// service_config.maglev_offset/maglev_size below and
+// internal/dataplane/maglevalloc.go. The hash is reduced modulo *this
+// VIP's* maglev_size, not the whole table, then added to its offset — see
+// pick_backend()'s doc comment for why that distinction matters.
+//
+// Scope limitations tracked for later milestones: IPv6, IP options, and
+// encapsulated (Geneve/IPIP) backends.
 
 #include <linux/if_ether.h>
 #include <linux/ip.h>
@@ -19,14 +25,14 @@
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 256);
+    __uint(max_entries, 4096); /* bpfmaps.MaxVIPs — cluster-wide VIP ceiling, v0.2 */
     __type(key, struct vip_key);
     __type(value, __u32); /* service_id */
 } vip_map SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 256);
+    __uint(max_entries, 4096); /* bpfmaps.MaxVIPs */
     __type(key, __u32); /* service_id */
     __type(value, struct service_config);
 } service_config_map SEC(".maps");
@@ -40,16 +46,16 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 256);
+    __uint(max_entries, 8192); /* bpfmaps.MaxBackends — cluster-wide backend ceiling, v0.2 */
     __type(key, __u32); /* backend_id */
     __type(value, struct backend_info);
 } backend_map SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 256);
+    __uint(max_entries, 8192); /* bpfmaps.MaxBackends */
     __type(key, __u32); /* backend_id */
-    __type(value, __u8); /* 1 = healthy, 0 = down */
+    __type(value, __u8); /* RIVORA_HEALTH_{DOWN,HEALTHY,DRAINING} */
 } backend_health_map SEC(".maps");
 
 struct {
@@ -75,7 +81,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 256);
+    __uint(max_entries, 8193); /* 1 (global) + bpfmaps.MaxBackends */
     __type(key, __u32); /* 0 = global, 1+backend_id = per backend */
     __type(value, struct lb_stats);
 } stats_map SEC(".maps");
@@ -97,17 +103,27 @@ static __always_inline void bump_stats(__u32 idx, __u32 bytes, __u8 dropped)
  * Approximates Maglev's degraded lookup (which recomputes the whole
  * permutation on membership change) by walking forward a few slots — good
  * enough to route around a handful of simultaneously-down backends without
- * an unbounded loop in the verifier. */
-static __always_inline int pick_backend(__u32 slot, __u32 *out_backend_id)
+ * an unbounded loop in the verifier.
+ *
+ * local_slot/offset/size confine every probed slot to *this VIP's own*
+ * extent of the shared maglev_table (wrapping within it, not past it) —
+ * without that, probing forward from a slot near the end of a small extent
+ * would walk into a different VIP's slots, or unpopulated (zero-valued,
+ * i.e. backend_id 0) ones. */
+static __always_inline int pick_backend(__u32 offset, __u32 size, __u32 local_slot, __u32 *out_backend_id)
 {
 #pragma unroll
     for (int i = 0; i < RIVORA_MAGLEV_PROBES; i++) {
-        __u32 s = (slot + i) % RIVORA_MAGLEV_M;
+        __u32 s = offset + ((local_slot + i) % size);
         __u32 *bid = bpf_map_lookup_elem(&maglev_table, &s);
         if (!bid)
             continue;
+        /* Draining backends are excluded from *new* flow selection here,
+         * but connection_affinity_map's fast path (any nonzero value is
+         * truthy) still honors them for already-established flows — see
+         * RIVORA_HEALTH_* in rivora_common.h. */
         __u8 *healthy = bpf_map_lookup_elem(&backend_health_map, bid);
-        if (healthy && *healthy) {
+        if (healthy && *healthy == RIVORA_HEALTH_HEALTHY) {
             *out_backend_id = *bid;
             return 0;
         }
@@ -158,7 +174,7 @@ int rivora_xdp_ingress(struct xdp_md *ctx)
         return XDP_PASS; /* not a VIP we own */
 
     struct service_config *cfg = bpf_map_lookup_elem(&service_config_map, service_id);
-    if (!cfg || cfg->backend_count == 0)
+    if (!cfg || cfg->backend_count == 0 || cfg->maglev_size == 0)
         return XDP_PASS;
 
     struct conn_key ck = {
@@ -179,8 +195,8 @@ int rivora_xdp_ingress(struct xdp_md *ctx)
 
     if (!use_affinity) {
         __u32 hash = rivora_hash5(iph->saddr, iph->daddr, sport, dport, iph->protocol);
-        __u32 slot = (cfg->maglev_offset + (hash % RIVORA_MAGLEV_M)) % RIVORA_MAGLEV_M;
-        if (pick_backend(slot, &backend_id) < 0) {
+        __u32 local_slot = hash % cfg->maglev_size;
+        if (pick_backend(cfg->maglev_offset, cfg->maglev_size, local_slot, &backend_id) < 0) {
             bump_stats(RIVORA_STATS_GLOBAL, 0, 1);
             return XDP_DROP; /* no healthy backend within probe window */
         }

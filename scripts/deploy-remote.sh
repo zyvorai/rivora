@@ -311,15 +311,22 @@ REMOTE
 verify_remote() {
     info "Running selftest on ${TARGET_HOST}..."
     if [ "$DRY_RUN" = true ]; then
-        dry "would run: bash ${REMOTE_DIR}/scripts/selftest.sh"
+        dry "would run: bash ${REMOTE_DIR}/scripts/selftest.sh && bash ${REMOTE_DIR}/scripts/selftest-multivip.sh"
         return 0
     fi
+    # Selftest failures are warnings, not fatal to the deploy — matches the
+    # original single-script behavior; rivora is installed either way.
     if _ssh_once "cd '${REMOTE_DIR}' && sudo bash scripts/selftest.sh"; then
-        ok "selftest passed"
+        ok "single-VIP selftest passed"
     else
-        warn "selftest reported failures (rivora is installed; see above)"
-        return 0
+        warn "single-VIP selftest reported failures (see above)"
     fi
+    if _ssh_once "cd '${REMOTE_DIR}' && sudo bash scripts/selftest-multivip.sh"; then
+        ok "multi-VIP selftest passed"
+    else
+        warn "multi-VIP selftest reported failures (see above)"
+    fi
+    return 0
 }
 
 do_uninstall() {

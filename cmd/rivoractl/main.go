@@ -116,16 +116,18 @@ func cmdStatus(c *apiclient.Client, format string) error {
 }
 
 func cmdVIPs(c *apiclient.Client, format string) error {
-	st, err := c.Status()
+	vips, err := c.VIPs()
 	if err != nil {
 		return err
 	}
 	if format == "json" {
-		return printJSON(st)
+		return printJSON(vips)
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 	fmt.Fprintln(w, "VIP\tPORT\tPROTO\tMODE\tBACKENDS\tPACKETS")
-	fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%d\t%d\n", st.VIPAddress, st.VIPPort, st.Protocol, st.Mode, len(st.Backends), st.Packets)
+	for _, st := range vips {
+		fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%d\t%d\n", st.VIPAddress, st.VIPPort, st.Protocol, st.Mode, len(st.Backends), st.Packets)
+	}
 	return w.Flush()
 }
 

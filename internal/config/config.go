@@ -90,8 +90,13 @@ func (c Config) Validate() error {
 	if len(c.VIPs) == 0 {
 		return fmt.Errorf("at least one VIP is required")
 	}
-	if len(c.VIPs) > 1 {
-		return fmt.Errorf("v0.1 supports exactly one VIP per node (got %d)", len(c.VIPs))
+	seen := make(map[string]bool, len(c.VIPs))
+	for _, v := range c.VIPs {
+		key := fmt.Sprintf("%s:%d:%s", v.Address, v.Port, v.Protocol)
+		if seen[key] {
+			return fmt.Errorf("vip %s:%d/%s: duplicate VIP", v.Address, v.Port, v.Protocol)
+		}
+		seen[key] = true
 	}
 	for _, v := range c.VIPs {
 		if net.ParseIP(v.Address) == nil {

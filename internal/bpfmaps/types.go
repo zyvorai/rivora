@@ -24,7 +24,22 @@ const (
 	ModeDSR = 0
 	ModeNAT = 1
 
+	// backend_health_map values. Draining excludes a backend from *new*
+	// Maglev flow selection (pick_backend() in bpf/xdp_ingress.c checks
+	// `== HealthHealthy`) while leaving already-established flows alone —
+	// connection_affinity_map's fast path only checks non-zero, so both
+	// Healthy and Draining keep existing connections flowing.
+	HealthDown     = 0
+	HealthHealthy  = 1
+	HealthDraining = 2
+
 	MaglevM = 65537
+
+	// Map capacities compiled into bpf/xdp_ingress.c — mirrored here so Go
+	// code (the ID allocators) can enforce the same ceiling before ever
+	// attempting a map write that the kernel would reject.
+	MaxVIPs     = 4096 // vip_map / service_config_map max_entries
+	MaxBackends = 8192 // backend_map / backend_health_map / stats_map max_entries
 
 	StatsGlobalIdx = 0
 )
@@ -37,10 +52,11 @@ type VipKey struct {
 	Pad   uint8
 }
 
-// ServiceConfig — struct service_config. 12 bytes.
+// ServiceConfig — struct service_config. 16 bytes.
 type ServiceConfig struct {
 	BackendCount uint32
 	MaglevOffset uint32
+	MaglevSize   uint32 // must be nonzero and match the extent actually written into maglev_table
 	Mode         uint8
 	Pad          [3]uint8
 }
