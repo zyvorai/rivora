@@ -1,0 +1,88 @@
+# Default values for the rivora chart.
+
+image:
+  rivorad:
+    repository: ghcr.io/zyvorai/rivora-rivorad
+    tag: ""  # defaults to .Chart.AppVersion
+    pullPolicy: IfNotPresent
+  controller:
+    repository: ghcr.io/zyvorai/rivora-controller
+    tag: ""  # defaults to .Chart.AppVersion
+    pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  annotations: {}
+
+rbac:
+  # If false, ClusterRole/ClusterRoleBinding objects are not created — set
+  # this only if you're managing them yourself outside the chart.
+  create: true
+
+# rivorad is the per-node DaemonSet: XDP/TCX dataplane, the Service/
+# EndpointSlice reconciler, and (optionally) the L2/ARP speaker.
+rivorad:
+  # interface is the host network interface XDP/TCX attach to. Required —
+  # every node the DaemonSet schedules onto must have an interface of this
+  # name (a hybrid environment with differently-named interfaces per node
+  # isn't supported in v0.2; pin the DaemonSet to matching nodes via
+  # nodeSelector if needed).
+  interface: ""
+  bpfDir: /usr/local/share/rivora/bpf
+  # loadBalancerClass must match controller.loadBalancerClass — both sides
+  # need to agree on which Services they manage. "" manages every
+  # LoadBalancer Service with no explicit spec.loadBalancerClass set.
+  loadBalancerClass: ""
+  workers: 2
+  # speaker runs the L2/ARP responder for K8s-managed VIPs. Requires
+  # CAP_NET_RAW (already granted below); disable only if something else on
+  # the cluster already owns ARP for these VIPs.
+  speaker: true
+
+  # apiKey/tls configure rivorad's local HTTP API the same way the
+  # standalone systemd deployment does (see README.md#securing-the-api) —
+  # wired into a Secret rather than inlined directly into the DaemonSet
+  # spec. The API listens on 127.0.0.1 only, so these mostly matter if
+  # something in-Pod besides rivoractl needs to reach it.
+  apiKey: ""
+  tls:
+    selfSigned: false
+    cert: ""
+    key: ""
+
+  securityContext:
+    capabilities:
+      add: ["BPF", "NET_ADMIN", "NET_RAW", "SYS_ADMIN"]
+
+  resources: {}
+  nodeSelector: {}
+  tolerations:
+    - operator: Exists
+  affinity: {}
+
+# controller is rivora-controller: the cluster-scoped IPAM Deployment.
+# Unprivileged — no BPF, no hostNetwork. Safe to run more than one replica
+# since it leader-elects via a Lease; extras are hot standbys, not scaled
+# capacity (only the leader does any work).
+controller:
+  replicaCount: 2
+  loadBalancerClass: ""
+  workers: 2
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# addressPools seeds AddressPool custom resources on install, e.g.:
+#   --set addressPools[0].name=default \
+#   --set addressPools[0].addresses={10.0.0.0/24}
+# Equivalent values-file form:
+# addressPools:
+#   - name: default
+#     addresses:
+#       - 10.0.0.0/24
+#     autoAssign: true
+#     avoidBuggyIPs: false
+addressPools: []

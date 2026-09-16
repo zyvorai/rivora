@@ -410,6 +410,32 @@ func (d *Dataplane) SetBackendDraining(backendID uint32, draining bool) error {
 	return d.writeHealthLocked(backendID)
 }
 
+// SetBackendDrainingByKey is internal/controller's EndpointSlice-driven
+// hook: it resolves backendKey (BackendKey(b)) within vipKey's current
+// backend set to a backend_id and applies the same draining transition as
+// SetBackendDraining. A miss (VIP or backend not currently owned by this
+// node — an event arriving after the corresponding RemoveVIP/backend
+// removal already processed) is a silent no-op, not an error: reconcile
+// order between Service and EndpointSlice events isn't guaranteed.
+func (d *Dataplane) SetBackendDrainingByKey(vipKey, backendKey string, draining bool) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	entry, ok := d.services[vipKey]
+	if !ok {
+		return nil
+	}
+	id, ok := entry.backendIDs[backendKey]
+	if !ok {
+		return nil
+	}
+	st := d.backendStates[id]
+	if st == nil {
+		return nil
+	}
+	st.draining = draining
+	return d.writeHealthLocked(id)
+}
+
 // Targets returns every backend across every VIP this node owns, deduped
 // by ID (a backend shared by two VIPs is probed once, not twice) — the
 // health checker's target set.
@@ -528,6 +554,13 @@ func vipKeyString(vip config.VIP) string {
 func backendName(b config.Backend) string {
 	return fmt.Sprintf("%s:%d", b.Address, b.Port)
 }
+
+// VIPKey and BackendKey are vipKeyString/backendName exported for callers
+// outside this package (internal/controller's reconciler) that need to
+// derive the same key RemoveVIP/SetBackendDrainingByKey expect, without
+// duplicating the "addr:port[:proto]" format here and there.
+func VIPKey(vip config.VIP) string       { return vipKeyString(vip) }
+func BackendKey(b config.Backend) string { return backendName(b) }
 
 func vipKeyBPF(vip config.VIP) (bpfmaps.VipKey, error) {
 	vipIP := net.ParseIP(vip.Address).To4()

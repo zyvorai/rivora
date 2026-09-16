@@ -1,0 +1,14 @@
+{{- range .Values.addressPools }}
+---
+apiVersion: rivora.zyvor.dev/v1alpha1
+kind: AddressPool
+metadata:
+  name: {{ .name | required "each addressPools[] entry needs a name" }}
+  labels:
+    {{- include "rivora.labels" $ | nindent 4 }}
+spec:
+  addresses:
+    {{- toYaml (.addresses | required "each addressPools[] entry needs addresses") | nindent 4 }}
+  autoAssign: {{ .autoAssign | default true }}
+  avoidBuggyIPs: {{ .avoidBuggyIPs | default false }}
+{{- end }}

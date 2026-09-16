@@ -1,0 +1,75 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: addresspools.rivora.zyvor.dev
+spec:
+  group: rivora.zyvor.dev
+  scope: Cluster
+  names:
+    plural: addresspools
+    singular: addresspool
+    kind: AddressPool
+    shortNames:
+      - rap
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Auto-Assign
+          type: boolean
+          jsonPath: .spec.autoAssign
+        - name: Available
+          type: integer
+          jsonPath: .status.availableIPs
+        - name: Assigned
+          type: integer
+          jsonPath: .status.assignedIPs
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [addresses]
+              properties:
+                addresses:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: string
+                  description: >-
+                    IPv4 CIDRs (10.0.0.0/24), ranges (10.0.0.10-10.0.0.40),
+                    or single addresses. v0.2 is IPv4-only.
+                protocol:
+                  type: string
+                  default: layer2
+                  description: Reserved for a future BGP mode; only layer2 (the ARP speaker) is implemented in v0.2.
+                autoAssign:
+                  type: boolean
+                  default: true
+                  description: Whether rivora-controller may automatically pick addresses from this pool for Services that don't request it by name.
+                avoidBuggyIPs:
+                  type: boolean
+                  default: false
+                  description: Skip a /24 subnet's .0 and .255 addresses (some older client stacks mishandle them) — same option name as MetalLB's IPAddressPool.
+            status:
+              type: object
+              properties:
+                availableIPs:
+                  type: integer
+                  format: int64
+                assignedIPs:
+                  type: integer
+                  format: int64
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true

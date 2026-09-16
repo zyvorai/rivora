@@ -14,9 +14,21 @@ jobs:
       with: {go-version: '1.27.1', cache: true}
     - run: go mod tidy && git diff --exit-code go.mod go.sum
     - run: go vet ./...
-    - run: go build ./cmd/rivorad ./cmd/rivoractl ./cmd/rivora-doctor
+    - run: go build ./cmd/rivorad ./cmd/rivoractl ./cmd/rivora-doctor ./cmd/rivora-controller
     - run: go test ./...
     - run: gofmt -l . | tee /tmp/fmt.out && [ ! -s /tmp/fmt.out ]
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: azure/setup-helm@v4
+    - run: helm lint deploy/helm/rivora --set rivorad.interface=eth0
+    - run: |
+        helm template rivora deploy/helm/rivora \
+          --set rivorad.interface=eth0 \
+          --set 'addressPools[0].name=default' \
+          --set 'addressPools[0].addresses={10.0.0.0/24}' \
+          > /dev/null
   bpf:
     runs-on: ubuntu-latest
     steps:

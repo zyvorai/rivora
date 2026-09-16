@@ -10,12 +10,15 @@ traffic-delivery layer the Zyvor platform doesn't yet have. It's
 CNI-independent and doesn't require Cilium: it attaches its own XDP/TCX
 programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
 
-> **Status: v0.1 shipped, v0.2 (Kubernetes) underway.** Single node, IPv4
-> TCP/UDP, static YAML config, DSR and full-NAT forwarding, Maglev backend
-> selection with graceful draining, active TCP health checks. A node can
-> run multiple VIPs, each independently reconciled and Maglev-partitioned.
-> No Kubernetes controller, IPAM, L2 speaker, or BGP/BFD HA yet — see
-> [Roadmap](#roadmap).
+> **Status: v0.1 shipped, v0.2 (Kubernetes) implemented, pending
+> end-to-end cluster verification.** Single node, IPv4 TCP/UDP, DSR and
+> full-NAT forwarding, Maglev backend selection with graceful draining,
+> active TCP health checks. A node can run multiple VIPs, each
+> independently reconciled and Maglev-partitioned — either from static
+> YAML, or (v0.2, new) from Kubernetes `Service`/`EndpointSlice` objects
+> via `rivorad -kubernetes`, with `rivora-controller` handling `AddressPool`
+> IPAM and an in-`rivorad` L2/ARP speaker announcing assigned VIPs. No
+> BGP/BFD HA yet — see [Roadmap](#roadmap).
 
 ## How it works
 
@@ -102,12 +105,33 @@ connections without disrupting its established ones.
 ## Roadmap
 
 v0.1 was deliberately narrow: single VIP, single node, IPv4 only, static
-config. v0.2 (Kubernetes integration) is underway — the dataplane/BPF
-foundation for multiple VIPs and graceful draining is done (this is what
-`scripts/selftest-multivip.sh` verifies); a `Service`/`EndpointSlice`
-reconciler, an `AddressPool` CRD for VIP IPAM, an L2/ARP speaker, and a Helm
-chart are still ahead. BGP/BFD HA, IPv6, KubeVirt/physical backends, and
-Gateway API come in later milestones.
+config.
+
+v0.2 (Kubernetes integration) is implemented:
+- Dataplane/BPF foundation for multiple VIPs and graceful draining
+  (`scripts/selftest-multivip.sh`).
+- `internal/ipam` + `AddressPool` CRD (`deploy/helm/rivora/crds`) for VIP
+  address-pool allocation, reconciled by the leader-elected
+  `rivora-controller` Deployment (`cmd/rivora-controller`), which patches
+  `Service.Status.LoadBalancer.Ingress[].IP`.
+- `internal/controller`: an in-`rivorad` `Service`/`EndpointSlice`
+  reconciler (client-go informers, no leader election — every node mirrors
+  the same cluster state into its own BPF maps independently), driving the
+  same `Dataplane.UpsertVIP`/`RemoveVIP` the static-YAML path uses.
+  K8s-managed VIPs are NAT-only. Enable with `rivorad -kubernetes
+  -interface <iface> [-loadbalancer-class <class>]`.
+- `internal/speaker`: an L2/ARP responder for K8s-managed VIPs
+  (`mdlayher/arp`), behind a single cluster-wide leader-elected Lease.
+- `deploy/helm/rivora`: Helm chart for both binaries plus the
+  `AddressPool` CRD.
+
+Still ahead before v0.2 is fully done: end-to-end verification against a
+live cluster (a dedicated namespace on the shared remote test host's k3s
+install), and the container images the Helm chart's `image.rivorad`/
+`image.controller` values reference.
+
+BGP/BFD HA, IPv6, KubeVirt/physical backends, and Gateway API come in later
+milestones.
 
 ## License
 

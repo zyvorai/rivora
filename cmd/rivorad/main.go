@@ -7,6 +7,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -16,13 +17,17 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/zyvorai/rivora/internal/api"
 	"github.com/zyvorai/rivora/internal/bpfmaps"
 	"github.com/zyvorai/rivora/internal/config"
+	"github.com/zyvorai/rivora/internal/controller"
 	"github.com/zyvorai/rivora/internal/dataplane"
 	"github.com/zyvorai/rivora/internal/healthcheck"
+	"github.com/zyvorai/rivora/internal/k8s"
 	"github.com/zyvorai/rivora/internal/loader"
+	"github.com/zyvorai/rivora/internal/speaker"
 	"github.com/zyvorai/rivora/internal/tlsutil"
 )
 
@@ -30,9 +35,23 @@ var version = "dev"
 
 func main() {
 	var (
-		configPath = flag.String("config", "/etc/rivora/config.yaml", "path to VIP/backend config")
+		configPath = flag.String("config", "/etc/rivora/config.yaml", "path to VIP/backend config (static-YAML mode; ignored with -kubernetes)")
 		bpfDir     = flag.String("bpf-dir", "/usr/local/share/rivora/bpf", "directory containing xdp_ingress.o and tc_nat.o")
 		showVer    = flag.Bool("version", false, "print version and exit")
+
+		kubeMode   = flag.Bool("kubernetes", false, "run the Kubernetes reconciler + ARP speaker instead of loading -config; VIPs come from Service/EndpointSlice")
+		kubeconfig = flag.String("kubeconfig", "", "path to a kubeconfig file (default: in-cluster config, falling back to $KUBECONFIG / ~/.kube/config); only used with -kubernetes")
+		ifaceFlag  = flag.String("interface", "", "network interface to attach to (required with -kubernetes; static-YAML mode reads this from -config instead)")
+		apiListen  = flag.String("api-listen", "127.0.0.1:9870", "local API listen address; only used with -kubernetes (static-YAML mode reads this from -config instead)")
+		lbClass    = flag.String("loadbalancer-class", "", "only manage Services whose spec.loadBalancerClass matches this value (default: services with no class set); only used with -kubernetes")
+		namespace  = flag.String("namespace", envOr("POD_NAMESPACE", "rivora-system"), "namespace the ARP speaker's leader-election Lease lives in; only used with -kubernetes")
+		workers    = flag.Int("workers", 2, "number of concurrent Service reconcile workers; only used with -kubernetes")
+		speakerOn  = flag.Bool("speaker", true, "run the L2/ARP speaker (requires CAP_NET_RAW); only used with -kubernetes")
+
+		healthInterval = flag.Duration("health-interval", 3*time.Second, "active health check interval; only used with -kubernetes")
+		healthTimeout  = flag.Duration("health-timeout", time.Second, "active health check timeout; only used with -kubernetes")
+		healthFail     = flag.Int("health-fail-threshold", 2, "consecutive failures before marking a backend down; only used with -kubernetes")
+		healthSuccess  = flag.Int("health-success-threshold", 2, "consecutive successes before marking a backend healthy; only used with -kubernetes")
 	)
 	flag.Parse()
 
@@ -43,10 +62,32 @@ func main() {
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		logger.Error("load config", "err", err)
-		os.Exit(1)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	var cfg config.Config
+	if *kubeMode {
+		if *ifaceFlag == "" {
+			logger.Error("-interface is required with -kubernetes")
+			os.Exit(1)
+		}
+		cfg = config.Config{
+			Interface: *ifaceFlag,
+			APIListen: *apiListen,
+			HealthCheck: config.HealthCheck{
+				Interval:         *healthInterval,
+				Timeout:          *healthTimeout,
+				FailThreshold:    *healthFail,
+				SuccessThreshold: *healthSuccess,
+			},
+		}
+	} else {
+		var err error
+		cfg, err = config.Load(*configPath)
+		if err != nil {
+			logger.Error("load config", "err", err)
+			os.Exit(1)
+		}
 	}
 
 	iface, err := net.InterfaceByName(cfg.Interface)
@@ -56,10 +97,14 @@ func main() {
 	}
 
 	natObj := ""
-	for _, vip := range cfg.VIPs {
-		if vip.Mode == config.ModeNAT {
-			natObj = bpfDirPath(*bpfDir, bpfmaps.ProgTCNATEgress)
-			break
+	if *kubeMode {
+		natObj = bpfDirPath(*bpfDir, bpfmaps.ProgTCNATEgress) // K8s-managed VIPs are NAT-only (v0.2)
+	} else {
+		for _, vip := range cfg.VIPs {
+			if vip.Mode == config.ModeNAT {
+				natObj = bpfDirPath(*bpfDir, bpfmaps.ProgTCNATEgress)
+				break
+			}
 		}
 	}
 
@@ -106,6 +151,60 @@ func main() {
 	go checker.Run()
 	defer checker.Stop()
 
+	if *kubeMode {
+		kcfg, err := k8s.BuildConfig(*kubeconfig)
+		if err != nil {
+			logger.Error("build kubeconfig", "err", err)
+			os.Exit(1)
+		}
+		clients, err := k8s.New(kcfg)
+		if err != nil {
+			logger.Error("build k8s clients", "err", err)
+			os.Exit(1)
+		}
+
+		reconciler, factory := controller.New(clients.Clientset, plane, *lbClass, logger)
+
+		var sp *speaker.Speaker
+		if *speakerOn {
+			identity, herr := os.Hostname()
+			if herr != nil || identity == "" {
+				identity = fmt.Sprintf("rivorad-%d", os.Getpid())
+			}
+			sp, err = speaker.New(iface, plane, clients.Clientset, *namespace, identity, logger)
+			if err != nil {
+				logger.Error("start arp speaker", "err", err)
+				os.Exit(1)
+			}
+			defer sp.Close()
+		}
+
+		reconciler.OnChange = func() {
+			var targets []healthcheck.Target
+			for _, t := range plane.Targets() {
+				targets = append(targets, healthcheck.Target{BackendID: t.ID, Address: t.Address, Port: t.Port})
+			}
+			checker.SetTargets(targets)
+			if sp != nil {
+				sp.AnnounceNow()
+			}
+		}
+
+		go func() {
+			if err := reconciler.Run(ctx, factory, *workers); err != nil {
+				logger.Error("k8s reconciler exited", "err", err)
+			}
+		}()
+		if sp != nil {
+			go func() {
+				if err := sp.Run(ctx); err != nil {
+					logger.Error("arp speaker exited", "err", err)
+				}
+			}()
+		}
+		logger.Info("kubernetes mode enabled", "lb_class", *lbClass, "speaker", *speakerOn)
+	}
+
 	apiKey := os.Getenv("RIVORA_API_KEY")
 	tlsCert := os.Getenv("RIVORA_TLS_CERT")
 	tlsKey := os.Getenv("RIVORA_TLS_KEY")
@@ -146,11 +245,16 @@ func main() {
 		}
 	}()
 
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
+	<-ctx.Done()
 	logger.Info("shutting down")
 	_ = srv.Close()
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func bpfDirPath(dir, prog string) string {

@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "rivora.fullname" . }}-rivorad
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rivora.rivorad.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "rivora.rivorad.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "rivora.rivorad.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "rivora.rivorad.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: rivorad
+          image: "{{ .Values.image.rivorad.repository }}:{{ .Values.image.rivorad.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.rivorad.pullPolicy }}
+          args:
+            - -kubernetes
+            - -interface={{ .Values.rivorad.interface }}
+            - -bpf-dir={{ .Values.rivorad.bpfDir }}
+            - -loadbalancer-class={{ .Values.rivorad.loadBalancerClass }}
+            - -workers={{ .Values.rivorad.workers }}
+            - -speaker={{ .Values.rivorad.speaker }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          envFrom:
+            - secretRef:
+                name: {{ include "rivora.fullname" . }}-rivorad
+          securityContext:
+            capabilities:
+              {{- toYaml .Values.rivorad.securityContext.capabilities | nindent 14 }}
+          volumeMounts:
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+          resources:
+            {{- toYaml .Values.rivorad.resources | nindent 12 }}
+      volumes:
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+            type: DirectoryOrCreate
+      {{- with .Values.rivorad.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      tolerations:
+        {{- toYaml .Values.rivorad.tolerations | nindent 8 }}
+      {{- with .Values.rivorad.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
