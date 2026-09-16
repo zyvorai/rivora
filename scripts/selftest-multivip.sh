@@ -137,13 +137,33 @@ run_probes() {
     ip netns exec "$NS_CLIENT" python3 -c "$(client_probe)" "$vip" "$port" "$count"
 }
 
+# map_id <name> -> that map's kernel-wide ID via `bpftool map show -j`.
+# Kernel IDs (unlike bpffs pin paths) are visible from any mount
+# namespace, which matters here: rivorad runs via `ip netns exec ... bash
+# -c "mount -t bpf bpf /sys/fs/bpf; exec rivorad"`, and that mount is a
+# private, ephemeral bpffs instance scoped to that one invocation — a
+# *different* `ip netns exec` (or this script's own shell) mounting or
+# reading /sys/fs/bpf/rivora-lb again would not see those pins at all.
+# `-j` (JSON) is used over the default text table for robust parsing
+# across bpftool/kernel BTF-mismatch combinations (map names are BPF's
+# 15-char-truncated form, hence the prefix match).
+map_id() {
+    local name="$1"
+    bpftool map show -j 2>/dev/null | python3 -c "
+import json, sys
+for m in json.load(sys.stdin):
+    if m.get('name', '').startswith('$name'):
+        print(m['id']); break
+"
+}
+
 # backend_id_for <bind_addr> <bind_port> -> backend_id in backend_map,
 # found by reversing the same little-endian encoding
 # internal/dataplane/dataplane.go's ip4ToBE32/htons use.
 backend_id_for() {
-    local addr="$1" port="$2"
-    local mapid
-    mapid=$(bpftool map show | grep "name backend_map" | head -1 | cut -d: -f1)
+    local addr="$1" port="$2" mapid
+    mapid=$(map_id backend_map)
+    [ -z "$mapid" ] && return 1
     python3 - "$addr" "$port" "$mapid" <<'PYEOF'
 import socket, struct, sys, json, subprocess
 addr, port, mapid = sys.argv[1], int(sys.argv[2]), sys.argv[3]
@@ -162,9 +182,9 @@ PYEOF
 set_health() {
     # backend_id is a little-endian __u32 key; this test only ever has a
     # handful of backends so it always fits in the first byte.
-    local backend_id="$1" value="$2"
-    local mapid
-    mapid=$(bpftool map show | grep "name backend_health_" | head -1 | cut -d: -f1)
+    local backend_id="$1" value="$2" mapid
+    mapid=$(map_id backend_health_)
+    [ -z "$mapid" ] && { echo "backend_health_map not found" >&2; return 1; }
     bpftool map update id "$mapid" key "$backend_id" 0 0 0 value "$value" >/dev/null
 }
 
