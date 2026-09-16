@@ -33,6 +33,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 RIVORAD="$(command -v rivorad || echo "${ROOT}/bin/rivorad")"
+RIVORACTL="$(command -v rivoractl || echo "${ROOT}/bin/rivoractl")"
 BPF_DIR="/usr/local/share/rivora/bpf"
 [ -f "${BPF_DIR}/xdp_ingress.o" ] || BPF_DIR="${ROOT}/bpf"
 
@@ -137,6 +138,29 @@ run_probes() {
     ip netns exec "$NS_CLIENT" python3 -c "$(client_probe)" "$vip" "$port" "$count"
 }
 
+# backend_id_for <vip_addr> <backend_addr> <backend_port> -> backend_id,
+# found via rivoractl's own API — the same thing an operator would use,
+# and avoids bpftool's map enumeration (`map show`) entirely, which this
+# test found unreliable across bpftool/kernel version combinations (CI's
+# runner kernel has no matching bpftool package and warns-then-fails even
+# on basic invocations). Only set_health() below still needs a raw bpftool
+# map write, since there's no API for it yet — SetBackendDraining is wired
+# up by the Kubernetes reconciler in a later v0.2 step, not this one.
+backend_id_for() {
+    local vip="$1" addr="$2" port="$3"
+    ip netns exec "$NS_LB" "$RIVORACTL" vips --format json --api 127.0.0.1:9870 | python3 -c "
+import json, sys
+vip, addr, port = '$vip', '$addr', $port
+for st in json.load(sys.stdin):
+    if st['vipAddress'] != vip:
+        continue
+    for b in st['backends']:
+        if b['address'] == addr and b['port'] == port:
+            print(b['id']); sys.exit(0)
+sys.exit(1)
+"
+}
+
 # map_id <name> -> that map's kernel-wide ID via `bpftool map show -j`.
 # Kernel IDs (unlike bpffs pin paths) are visible from any mount
 # namespace, which matters here: rivorad runs via `ip netns exec ... bash
@@ -144,39 +168,17 @@ run_probes() {
 # private, ephemeral bpffs instance scoped to that one invocation — a
 # *different* `ip netns exec` (or this script's own shell) mounting or
 # reading /sys/fs/bpf/rivora-lb again would not see those pins at all.
-# `-j` (JSON) is used over the default text table for robust parsing
-# across bpftool/kernel BTF-mismatch combinations (map names are BPF's
-# 15-char-truncated form, hence the prefix match).
+# `grep -v WARNING` strips this bpftool build's "not found for kernel X"
+# noise, which (confirmed on CI) prints to stdout ahead of the JSON even
+# though the tool itself is fully functional for what we need here.
 map_id() {
     local name="$1"
-    bpftool map show -j 2>/dev/null | python3 -c "
+    bpftool map show -j 2>/dev/null | grep -v '^WARNING' | python3 -c "
 import json, sys
 for m in json.load(sys.stdin):
     if m.get('name', '').startswith('$name'):
         print(m['id']); break
 "
-}
-
-# backend_id_for <bind_addr> <bind_port> -> backend_id in backend_map,
-# found by reversing the same little-endian encoding
-# internal/dataplane/dataplane.go's ip4ToBE32/htons use.
-backend_id_for() {
-    local addr="$1" port="$2" mapid
-    mapid=$(map_id backend_map)
-    [ -z "$mapid" ] && return 1
-    python3 - "$addr" "$port" "$mapid" <<'PYEOF'
-import socket, struct, sys, json, subprocess
-addr, port, mapid = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-addr_le = struct.unpack('<I', socket.inet_aton(addr))[0]
-port_be = ((port & 0xff) << 8) | (port >> 8)
-data = json.loads(subprocess.check_output(['bpftool', 'map', 'dump', 'id', mapid]))
-for entry in data:
-    v = entry['value']
-    if v['addr'] == addr_le and v['port'] == port_be:
-        print(entry['key'])
-        sys.exit(0)
-sys.exit(1)
-PYEOF
 }
 
 set_health() {
@@ -200,6 +202,7 @@ wait_for_api() {
 
 section "Binaries"
 [ -x "$RIVORAD" ] && pass "rivorad: $RIVORAD" || fail "rivorad not found"
+[ -x "$RIVORACTL" ] && pass "rivoractl: $RIVORACTL" || fail "rivoractl not found"
 [ -f "${BPF_DIR}/xdp_ingress.o" ] && pass "xdp_ingress.o: ${BPF_DIR}/xdp_ingress.o" || fail "xdp_ingress.o missing"
 [ -f "${BPF_DIR}/tc_nat.o" ] && pass "tc_nat.o: ${BPF_DIR}/tc_nat.o" || fail "tc_nat.o missing"
 if [ "$FAIL" -gt 0 ]; then
@@ -262,7 +265,7 @@ else
 fi
 
 section "Graceful draining (backend_health_map, direct BPF verification)"
-id_a1=$(backend_id_for 10.78.0.11 "$PORT_A")
+id_a1=$(backend_id_for "$VIP_A" 10.78.0.11 "$PORT_A")
 if [ -z "$id_a1" ]; then
     fail "could not find backend_map entry for 10.78.0.11:${PORT_A}"
 else
