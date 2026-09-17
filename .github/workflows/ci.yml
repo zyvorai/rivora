@@ -109,6 +109,58 @@ jobs:
         assert "2001:db8:ci::/64" in sample["spec"]["addresses"]
         print("AddressPool CRD + IPv6 sample OK")
         PY
+  # Exercises the rivora CLI (cmd/rivora) against a real API server — a
+  # kind cluster, not the veth/netns rig the integration job uses, since
+  # this is testing Helm-SDK/client-go wiring, not the XDP dataplane. kind
+  # nodes are containers without a stable interface name or guaranteed XDP
+  # support, and the chart's default images aren't published yet (see
+  # release.yml), so this deliberately stops at "the Helm release
+  # installs/upgrades/uninstalls and the expected objects show up" rather
+  # than asserting pods reach Ready.
+  cli:
+    needs: [go]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
+      with: {go-version: '1.27.1', cache: true}
+    - name: Install kind + kubectl
+      run: |
+        kind_version="$(curl -fsSL https://api.github.com/repos/kubernetes-sigs/kind/releases/latest | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4)"
+        curl -fsSLo ./kind "https://kind.sigs.k8s.io/dl/${kind_version}/kind-linux-amd64"
+        chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind
+        kubectl_version="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+        curl -fsSLo ./kubectl "https://dl.k8s.io/release/${kubectl_version}/bin/linux/amd64/kubectl"
+        chmod +x ./kubectl && sudo mv ./kubectl /usr/local/bin/kubectl
+    - run: kind create cluster --name rivora-cli-ci --wait 120s
+    - run: make build-cli
+    - name: rivora install
+      run: ./bin/rivora install --set rivorad.interface=eth0
+    - name: rivora status (Helm objects must exist even if pods can't pull unpublished images)
+      run: |
+        # A brand-new cluster's CRD needs a few seconds to become API-
+        # discoverable after Helm creates it — unlike the shared box this
+        # was manually verified against, where the CRD already pre-existed
+        # from earlier testing. Retry rather than race it.
+        for i in $(seq 1 10); do
+          ./bin/rivora status | tee /tmp/status.out
+          grep -q 'AddressPool CRD  installed' /tmp/status.out && break
+          sleep 2
+        done
+        grep -q 'rivorad (DaemonSet)' /tmp/status.out
+        grep -q 'rivora-controller (Deployment)' /tmp/status.out
+        grep -q 'AddressPool CRD  installed' /tmp/status.out
+    - name: rivora upgrade
+      run: ./bin/rivora upgrade --set rivorad.interface=eth0 --set controller.workers=3
+    - name: rivora uninstall
+      run: ./bin/rivora uninstall
+    - name: confirm workloads were removed
+      run: |
+        out="$(kubectl get all -n rivora-system 2>&1)" || true
+        echo "$out"
+        echo "$out" | grep -q 'No resources found'
+    - if: always()
+      run: kind delete cluster --name rivora-cli-ci
   bpf:
     runs-on: ubuntu-latest
     steps:
