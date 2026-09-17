@@ -22,7 +22,9 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
 > IPAM (IPv4 and IPv6, including sparse `/64` allocation) and an
 > in-`rivorad` L2 ARP+NDP speaker announcing assigned VIPs. BGP/BFD HA is
 > implemented (opt-in, active/active ECMP, `/32` and `/128`) but not yet
-> live-verified against a real router peer.
+> live-verified against a real router peer. IPv6 dataplane, NDP, sparse
+> IPAM, and BGP `/128` are covered by CI selftests on every push — see
+> [IPv6](#ipv6-v03) and [Selftests and CI](#selftests-and-ci).
 
 ## Contents
 
@@ -36,7 +38,16 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
   - [Gateway API (v0.3)](#gateway-api-v03)
   - [BGP/BFD HA (v0.3)](#bgpbfd-ha-v03)
 - [IPv6 (v0.3)](#ipv6-v03)
+  - [Dataplane](#dataplane)
+  - [Static YAML](#static-yaml)
+  - [IPAM and AddressPool](#ipam-and-addresspool)
+  - [Kubernetes dual-stack](#kubernetes-dual-stack)
+  - [NDP speaker](#ndp-speaker)
+  - [BGP IPv6 `/128`](#bgp-ipv6-128)
+  - [Maps and checksums](#maps-and-checksums)
+  - [Verification](#verification)
 - [Building on the remote host](#building-on-the-remote-host)
+- [Selftests and CI](#selftests-and-ci)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -134,12 +145,14 @@ internal/ipam/          address-pool CIDR/range expansion + allocator (pure Go, 
 internal/ipamctrl/      rivora-controller's reconcile logic: AddressPool + Service watch, IPAM
 internal/controller/    rivorad's in-process Service/EndpointSlice reconciler
 internal/k8s/           shared client-go bootstrap (in-cluster/kubeconfig, typed + dynamic clients)
-internal/speaker/       L2/ARP responder for K8s-managed VIPs (mdlayher/arp)
+internal/speaker/       L2 ARP+NDP responder for K8s-managed VIPs (mdlayher/arp + ndp)
+internal/bgp/           gobgp-backed BGP+BFD speaker (/32 IPv4, /128 IPv6, dual AFI/SAFI)
+internal/gatewayapi/    Gateway / TCPRoute / UDPRoute reconciler
 bpf/                    XDP ingress + TCX egress programs (hand-rolled, no libbpf headers)
 deploy/helm/rivora/     Helm chart: rivorad DaemonSet, rivora-controller Deployment, AddressPool CRD
 deploy/systemd/         systemd unit for the static-YAML/non-Kubernetes deployment
-scripts/                selftest.sh, selftest-multivip.sh, deploy-remote.sh
-config/examples/        static-YAML config examples (DSR, full-NAT, multi-VIP)
+scripts/                selftest*.sh (v4/v6 dataplane, NDP, weighted, rate-limit), deploy-remote.sh
+config/examples/        static-YAML examples (DSR/NAT, IPv6, multi-VIP, weighted, rate-limit, BGP)
 ```
 
 ## Securing the API
@@ -172,10 +185,12 @@ sudo ./bin/rivorad -config config/examples/single-vip.yaml -bpf-dir bpf
 ```
 
 See `config/examples/single-vip.yaml` (DSR), `single-vip-nat.yaml` (full
-NAT), `multi-vip.yaml` (several VIPs on one node, mixing modes),
-`weighted-backends.yaml` (unequal traffic shares within one VIP), and
-`rate-limited.yaml` (opt-in per-source-IP SYN-flood protection) for what
-each forwarding mode requires from your backends:
+NAT), `single-vip-ipv6-nat.yaml` / `single-vip-ipv6-dsr.yaml` (IPv6),
+`multi-vip.yaml` (several VIPs on one node, mixing modes),
+`weighted-backends.yaml` (unequal traffic shares within one VIP),
+`rate-limited.yaml` (opt-in per-source-IP SYN-flood protection), and
+`bgp-ha.yaml` (BGP+BFD advertise of healthy VIPs) for what each
+forwarding mode requires from your backends:
 
 - **DSR** — backends need the VIP bound locally (loopback/dummy interface)
   and must be L2-reachable from the Rivora node; no backend MAC = no DSR.
@@ -200,23 +215,33 @@ rivorad -kubernetes -interface eth0 [-loadbalancer-class <class>] [-speaker=true
 Address assignment is handled separately by `rivora-controller`, a
 leader-elected, cluster-scoped Deployment that watches `AddressPool`
 custom resources and patches `Service.Status.LoadBalancer.Ingress[].IP`
-(see `api/v1alpha1` for the CRD shape). An in-`rivorad` L2/ARP speaker
-(`internal/speaker`), behind its own single cluster-wide Lease, announces
-the assigned VIP.
+(see `api/v1alpha1` for the CRD shape). Pools may be IPv4, IPv6, or both
+(separate pools or mixed `addresses` entries) — see
+[IPAM and AddressPool](#ipam-and-addresspool). An in-`rivorad` L2
+ARP+NDP speaker (`internal/speaker`), behind its own single cluster-wide
+Lease, announces the assigned VIP on the node's dataplane interface.
 
 The [Helm chart](deploy/helm/rivora) installs both pieces plus the
 `AddressPool` CRD:
 
 ```sh
+# IPv4 pool
 helm install rivora deploy/helm/rivora \
   --namespace rivora-system --create-namespace \
   --set rivorad.interface=eth0 \
   --set addressPools[0].name=default \
   --set addressPools[0].addresses='{10.0.0.0/24}'
+
+# Dual-stack: add an IPv6 pool (large /64s allocate sparsely — see IPv6)
+helm upgrade rivora deploy/helm/rivora \
+  --namespace rivora-system --reuse-values \
+  --set addressPools[1].name=v6 \
+  --set addressPools[1].addresses='{2001:db8:1::/64}'
 ```
 
 See [`deploy/helm/rivora/README.md`](deploy/helm/rivora/README.md) for the
-full chart reference, including the CRD's manual-upgrade caveat.
+full chart reference, including IPv6 pools, BGP `ipv6NextHop`, and the
+CRD's manual-upgrade caveat.
 
 ### Backends beyond Pods: KubeVirt VMs and external/physical IPs
 
@@ -295,17 +320,20 @@ cluster-level issue is resolved.
 ### BGP/BFD HA (v0.3)
 
 `rivorad`'s BGP+BFD speaker is opt-in active/active ECMP HA: unlike the L2
-ARP speaker above (which answers for a VIP from exactly one node at a
+ARP/NDP speaker above (which answers for a VIP from exactly one node at a
 time, behind a cluster-wide Lease), every node with `-bgp`/`bgp.enabled`
-on **independently** advertises a `/32` host route for each VIP it
-currently has at least one healthy backend for, and withdraws it the
-instant that stops being true — no leader election, since BGP+ECMP's
-whole point is multiple nodes advertising the same VIP simultaneously,
-with upstream routers hashing traffic across next-hops. BFD is wired
-per-peer (not a separate component) for sub-second peer-down detection,
-feeding the same health-gated withdraw path. Unlike the Gateway API
-feature above, this is entirely local to `rivorad` — `rivora-controller`
-isn't involved, since BGP doesn't need cluster-wide IPAM coordination.
+on **independently** advertises a host route for each VIP it currently
+has at least one healthy backend for — `/32` (`RF_IPv4_UC`) for IPv4 and
+`/128` (`RF_IPv6_UC`) for IPv6 — and withdraws it the instant that stops
+being true. Sessions negotiate both unicast families (dual AFI/SAFI) so
+one peer can carry v4 and v6 VIP ads together. No leader election: BGP+
+ECMP's whole point is multiple nodes advertising the same VIP
+simultaneously, with upstream routers hashing traffic across next-hops.
+BFD is wired per-peer (not a separate component) for sub-second peer-down
+detection, feeding the same health-gated withdraw path. Unlike the
+Gateway API feature above, this is entirely local to `rivorad` —
+`rivora-controller` isn't involved, since BGP doesn't need cluster-wide
+IPAM coordination.
 
 Static-YAML mode reads a `bgp:` section (see
 [`config/examples/bgp-ha.yaml`](config/examples/bgp-ha.yaml)); Kubernetes
@@ -314,13 +342,17 @@ mode uses flags:
 ```sh
 rivorad -kubernetes -interface eth0 \
   -bgp -bgp-asn 65001 -bgp-router-id 10.0.0.11 \
+  -bgp-ipv6-next-hop 2001:db8::11 \
   -bgp-peers "10.0.0.1:65000:bfd,10.0.0.2:65000"
 ```
 
 `-bgp-peers` is a comma-separated list of `addr:asn` or `addr:asn:bfd`
-entries. The [Helm chart](deploy/helm/rivora) wires the equivalent
-`bgp.*` values — see
-[`deploy/helm/rivora/README.md#bgpbfd-ha`](deploy/helm/rivora/README.md#bgpbfd-ha).
+entries. `routerId` is the BGP identifier and the IPv4 next-hop for
+advertised `/32`s. IPv6 VIP ads need `-bgp-ipv6-next-hop` / `bgp.ipv6NextHop`
+(the node's IPv6 address used as next-hop in `MP_REACH_NLRI`) — without
+it, IPv4 ads still work and IPv6 VIPs are skipped with an error log.
+The [Helm chart](deploy/helm/rivora) wires the equivalent `bgp.*` values —
+see [`deploy/helm/rivora/README.md#bgpbfd-ha`](deploy/helm/rivora/README.md#bgpbfd-ha).
 
 **A real caveat, not hidden:** in full-NAT mode — which is the **only**
 mode K8s-managed VIPs currently run in (see [Kubernetes (v0.2)](#kubernetes-v02))
@@ -335,36 +367,42 @@ path. This is the same tradeoff MetalLB's BGP mode documents; it's an
 inherent property of stateful NAT + ECMP, not a Rivora-specific gap.
 
 **Verification status:** the health-gated advertise/withdraw/re-advertise
-cycle is verified end-to-end against a real BGP session — an integration
-test peers rivorad's gobgp-backed speaker with a second, independent
-in-process gobgp server over loopback, flips a fake backend's health, and
-confirms the peer's own RIB actually gains and loses the route (see
-`internal/bgp`). Not yet done: live verification against a real/
-containerized BGP peer (FRRouting or BIRD) and BFD timing on the remote
-test cluster — this needs an actual second router-like peer, which the
-loopback integration test deliberately substitutes for correctness
-coverage without needing one.
+cycle is verified end-to-end against a real BGP session for both families
+— an integration test peers rivorad's gobgp-backed speaker with a second,
+independent in-process gobgp server over loopback, flips a fake backend's
+health, and confirms the peer's RIB gains and loses the `/32` or `/128`
+(see `internal/bgp`, including `TestSpeakerAdvertisesIPv6HostRoute`). Not
+yet done: live verification against a real/containerized BGP peer
+(FRRouting or BIRD) and BFD timing on the remote test cluster — this needs
+an actual second router-like peer, which the loopback integration test
+deliberately substitutes for correctness coverage without needing one.
 
 ## IPv6 (v0.3)
 
 IPv6 is a first-class peer of IPv4 across the dataplane, IPAM, Kubernetes
-reconciliation, L2 announcement, and BGP:
+reconciliation, L2 announcement, and BGP. A VIP's backends must all share
+its address family; mixing v4 and v6 behind one VIP is rejected at
+config-validation / reconcile time.
 
-- **Dataplane** — XDP/TCX parse, forward, and checksum-rewrite IPv6 TCP/UDP
-  in DSR and full-NAT (`config/examples/single-vip-ipv6-*.yaml`).
-- **IPAM** — `AddressPool` accepts IPv6 CIDRs/ranges; prefixes with more
-  than 16 host bits (e.g. `/64`) allocate sparsely at random instead of
-  being eagerly expanded.
-- **Kubernetes** — Service/EndpointSlice and Gateway API reconcilers
-  program IPv6 LoadBalancer / Gateway addresses with same-family backends.
-- **NDP speaker** — the L2 speaker answers Neighbor Solicitations and
-  sends unsolicited Neighbor Advertisements for NAT-mode IPv6 VIPs
-  (alongside ARP for IPv4), behind the same cluster-wide Lease.
-- **BGP** — healthy IPv6 VIPs are advertised as `/128` (`RF_IPv6_UC`); set
-  `bgp.ipv6NextHop` (or `-bgp-ipv6-next-hop`) to the node's IPv6 next-hop.
+### Dataplane
 
-A VIP's backends must all share its address family; mixing v4 and v6
-behind one VIP is rejected at config-validation time.
+XDP (`bpf/xdp_ingress.c`) and TCX (`bpf/tc_nat.c`) parse, forward, and
+checksum-rewrite IPv6 TCP/UDP in both **DSR** and **full-NAT**, including
+Maglev selection, connection affinity, graceful draining, and opt-in
+per-source SYN rate limiting. Behavior mirrors IPv4 except where the
+protocols differ (see [Maps and checksums](#maps-and-checksums)).
+
+DSR health checks that would otherwise source from the VIP on loopback
+use `preferred_lft 0` / omit the LB VIP from the node's preferred source
+selection so probes still originate from a real node address.
+
+### Static YAML
+
+```sh
+sudo ./bin/rivorad -config config/examples/single-vip-ipv6-nat.yaml -bpf-dir bpf
+# or DSR:
+sudo ./bin/rivorad -config config/examples/single-vip-ipv6-dsr.yaml -bpf-dir bpf
+```
 
 ```yaml
 interface: eth0
@@ -372,23 +410,131 @@ vips:
   - address: fd00:77::100
     port: 80
     protocol: tcp
-    mode: nat
+    mode: nat   # or dsr (backends need VIP on lo + L2 MAC)
     backends:
       - address: fd00:77::11
         port: 8080
 ```
 
-Under the hood, only the maps keyed or valued by a raw address
-(`vip_map`, `backend_map`, `connection_affinity_map`, `nat_reverse_map`,
-`rl_buckets_map`) have IPv6 siblings — `service_config_map`,
-`maglev_table`, `backend_health_map`, `stats_map`, `iface_mac_map`, and
-`rl_config_map` are address-family-agnostic and shared as-is between v4
-and v6 VIPs/backends. Two IPv6-specific checksum differences from v4 are
-handled explicitly: IPv6 has no IP-header checksum at all, and a UDP
-checksum is never "unset" over IPv6 (unlike v4, where zero means unset).
+Shipped examples:
 
-Verified via `scripts/selftest-ipv6.sh` (DSR + full-NAT, Maglev spread,
-failover) in CI on every push.
+| File | Mode | Notes |
+| --- | --- | --- |
+| [`config/examples/single-vip-ipv6-nat.yaml`](config/examples/single-vip-ipv6-nat.yaml) | full-NAT | Backends route return traffic via the LB |
+| [`config/examples/single-vip-ipv6-dsr.yaml`](config/examples/single-vip-ipv6-dsr.yaml) | DSR | Bind VIP on backend `lo` with `preferred_lft 0`; permanent neigh to LB MAC in labs |
+
+### IPAM and AddressPool
+
+`AddressPool.spec.addresses` accepts IPv4 or IPv6 CIDRs, ranges
+(`a-b`), or single addresses — same field, same CRD.
+
+- **Small prefixes** (host bits ≤ 16, e.g. `/112` or tighter) are expanded
+  eagerly into concrete addresses, same as IPv4 `/24`.
+- **Large prefixes** (host bits > 16, typically a `/64`) are kept as
+  **sparse** prefixes: `rivora-controller` allocates by randomizing host
+  bits inside the network prefix instead of enumerating 2^64 entries.
+  Capacity accounting uses a capped virtual size so status stays useful.
+
+```yaml
+apiVersion: rivora.zyvor.dev/v1alpha1
+kind: AddressPool
+metadata:
+  name: v6
+spec:
+  addresses:
+    - 2001:db8:1::/64   # sparse
+  autoAssign: true
+```
+
+Helm: `--set addressPools[0].addresses='{2001:db8:1::/64}'`. Sample used
+by CI: [`deploy/helm/rivora/ci/addresspool-ipv6.yaml`](deploy/helm/rivora/ci/addresspool-ipv6.yaml).
+
+### Kubernetes dual-stack
+
+With `-kubernetes` (and optional `-gateway-api`):
+
+- `Service` / `Gateway` status may carry IPv6 LoadBalancer / Gateway
+  addresses allocated from IPv6 (or dual) pools.
+- `EndpointSlice` backends are filtered to the **same address family** as
+  the VIP — a v6 VIP only programs v6 endpoints.
+- Dual-stack Services (both families in status) produce one VIP program
+  path per family, each Maglev-partitioned independently.
+
+```sh
+rivorad -kubernetes -interface eth0 -speaker=true [-gateway-api]
+rivora-controller [-gateway-api]   # same AddressPool IPAM for Gateway.status.addresses
+```
+
+### NDP speaker
+
+The L2 speaker (`internal/speaker`, `-speaker` / `rivorad.speaker`, on by
+default in Helm) is **ARP + NDP** behind one cluster-wide Lease:
+
+- **IPv4** — gratuitous ARP + reply to ARP requests for NAT-mode VIPs.
+- **IPv6** — unsolicited Neighbor Advertisements, join each VIP's
+  solicited-node multicast, and reply to Neighbor Solicitations for
+  NAT-mode IPv6 VIPs (`mdlayher/ndp`). Soft-fails to ARP-only if the
+  interface has no IPv6 link-local (v4-only lab NICs).
+
+Only the elected speaker answers; other nodes keep the dataplane warm
+but do not claim the VIP on-link. DSR VIPs are not announced via NDP/ARP
+by the speaker (the backend owns the VIP on-link).
+
+Functional coverage: `scripts/selftest-ndp.sh` →
+`TestNDPRespondsOnVeth` (root + veth).
+
+### BGP IPv6 `/128`
+
+See [BGP/BFD HA](#bgpbfd-ha-v03). Summary for IPv6:
+
+| Setting | Role |
+| --- | --- |
+| `bgp.routerId` / `-bgp-router-id` | BGP ID + IPv4 next-hop for `/32` |
+| `bgp.ipv6NextHop` / `-bgp-ipv6-next-hop` | IPv6 next-hop for `/128` (required to advertise IPv6 VIPs) |
+| Peer AFI/SAFI | Both `AFI_IP` and `AFI_IP6` unicast negotiated on each peer |
+
+```yaml
+bgp:
+  enabled: true
+  asn: 65001
+  routerId: 10.0.0.11
+  ipv6NextHop: 2001:db8::11
+  peers:
+    - address: 10.0.0.1
+      asn: 65000
+      bfd: true
+```
+
+### Maps and checksums
+
+Only maps keyed or valued by a raw address have IPv6 siblings:
+`vip_map`, `backend_map`, `connection_affinity_map`, `nat_reverse_map`,
+`rl_buckets_map`. Address-family-agnostic maps are shared as-is:
+`service_config_map`, `maglev_table`, `backend_health_map`, `stats_map`,
+`iface_mac_map`, `rl_config_map`.
+
+IPv6-specific checksum handling:
+
+1. IPv6 has **no** IP-header checksum (unlike IPv4).
+2. A UDP checksum is **never** "unset" over IPv6 (IPv4 uses zero to mean
+   unset); the dataplane always maintains a correct UDP checksum for v6.
+
+### Verification
+
+| Layer | How |
+| --- | --- |
+| Dataplane DSR + NAT, Maglev, failover | `scripts/selftest-ipv6.sh` (CI every push) |
+| NDP solicit → advertise | `scripts/selftest-ndp.sh` (CI every push) |
+| Sparse IPAM | `go test ./internal/ipam` (`TestParsePoolIPv6SparsePrefix`, …) |
+| BGP `/128` advertise/withdraw | `go test ./internal/bgp` (`TestSpeakerAdvertisesIPv6HostRoute`) |
+| Example configs still Load | `go test ./internal/config` (`TestExamplesLoadAndValidate`) |
+| Helm IPv6 pool + `ipv6NextHop` | CI `helm` job |
+| AddressPool CRD + IPv6 sample | CI `crd` job |
+
+Still ahead as **live-cluster** hardening (not blocking the product
+surface): end-to-end dual-stack Service traffic on the remote test
+cluster, and BGP IPv6 peering against a real router (FRR/BIRD).
+
 ## Building on the remote host
 
 `scripts/deploy-remote.sh` (same shape as the sibling `guestkit` repo's
@@ -398,23 +544,39 @@ script) rsyncs the source, installs build deps, builds, and installs:
 make deploy-remote H=<host> U=<user>          # full deploy
 make deploy-remote-quick H=<host> U=<user>    # skip dependency install
 make deploy-remote-verify H=<host> U=<user>   # re-run all selftest scripts
+make bpf build                                # local Linux build → bpf/*.o + bin/*
+make selftest-all                             # every selftest (needs root + bpftool)
 ```
 
-`scripts/selftest.sh`, `scripts/selftest-multivip.sh`,
-`scripts/selftest-weighted.sh`, `scripts/selftest-ratelimit.sh`, and
-`scripts/selftest-ipv6.sh` each build an isolated network-namespace/veth/
-bridge topology (never touching a host's real interfaces) and run
-`rivorad` against it: the first checks Maglev spread and health-check-
-driven failover for a single VIP in both DSR and NAT mode; the second
-checks that two independent VIPs on one node don't interfere with each
-other and that a draining backend is excluded from new connections
-without disrupting its established ones; the third checks that a
-9:1-weighted VIP decisively skews traffic toward the heavier-weighted
-backend; the fourth checks that a low, deliberately-tight per-source
-rate limit drops most of a connection burst, recovers once the bucket
-refills, and has zero effect when left disabled (the default); the fifth
-repeats the first script's DSR/NAT/Maglev/failover checks over an
-all-IPv6 topology.
+`deploy-remote-verify` runs IPv4 selftests plus
+`scripts/selftest-ipv6.sh` and `scripts/selftest-ndp.sh` (failures are
+warnings for deploy, hard failures in CI).
+
+## Selftests and CI
+
+Each `scripts/selftest*.sh` builds an isolated netns/veth/bridge topology
+(never touching the host's real interfaces) and runs `rivorad` (or a
+focused Go test) against it:
+
+| Target / script | What it proves |
+| --- | --- |
+| `make selftest` / `selftest.sh` | Single VIP, DSR + NAT, Maglev spread, health failover |
+| `make selftest-multivip` | Two VIPs don't interfere; draining excludes new flows |
+| `make selftest-weighted` | 9:1 weighted Maglev skew |
+| `make selftest-ratelimit` | Tight per-source limit drops burst; disabled = no-op |
+| `make selftest-ipv6` | Same as first script over an all-IPv6 topology |
+| `make selftest-ndp` | Speaker answers NS with NA for a NAT IPv6 VIP |
+| `make selftest-all` | All of the above |
+
+GitHub Actions (`.github/workflows/ci.yml`) on every push/PR:
+
+| Job | Checks |
+| --- | --- |
+| `go` | `go mod tidy`, `vet`, build all cmds, `go test -race ./…`, `gofmt` |
+| `helm` | lint; template IPv4 pool; IPv6 pool + BGP `ipv6NextHop`; Gateway API |
+| `crd` | Structural validate AddressPool CRD + IPv6 sample YAML |
+| `bpf` | `make bpf` (clang), upload `bpf/*.o` |
+| `integration` | Needs `go`+`bpf`; runs every selftest above as root |
 
 ## Roadmap
 
@@ -437,15 +599,16 @@ Gateway API is implemented — see [Gateway API](#gateway-api-v03) — with
 reconciler startup/informer-sync/object-creation confirmed live twice;
 the traffic-path scenarios are still pending a retry once an unrelated
 cluster networking issue on the test host clears. BGP/BFD HA is
-implemented and locally verified — see [BGP/BFD HA](#bgpbfd-ha-v03) — with
-the health-gated advertise/withdraw cycle proven against a real BGP
-session (a loopback-peered gobgp integration test); live verification
-against a real/containerized router peer on the remote test cluster is a
-separate follow-up, not yet done. IPv6 is done end-to-end for the
-product surface (dataplane, sparse IPAM, dual-stack Service/Gateway
-reconciliation, NDP speaker, BGP `/128`) — see [IPv6](#ipv6-v03). Still
-ahead as live-cluster hardening: end-to-end dual-stack Service traffic
-on the remote test cluster and BGP IPv6 peering against a real router.
+implemented and locally verified for IPv4 `/32` and IPv6 `/128` — see
+[BGP/BFD HA](#bgpbfd-ha-v03) — with the health-gated advertise/withdraw
+cycle proven against a real BGP session (loopback-peered gobgp); live
+verification against a real/containerized router peer on the remote test
+cluster is a separate follow-up. IPv6 is done end-to-end for the product
+surface (dataplane, sparse IPAM, dual-stack Service/Gateway
+reconciliation, NDP speaker, BGP `/128`, CI selftests) — see
+[IPv6](#ipv6-v03). Still ahead as live-cluster hardening: end-to-end
+dual-stack Service traffic on the remote test cluster and BGP IPv6
+peering against a real router.
 
 ## License
 

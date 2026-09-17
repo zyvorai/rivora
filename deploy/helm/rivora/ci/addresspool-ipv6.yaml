@@ -1,5 +1,6 @@
-# Sample AddressPool used by CI kubeconform / schema checks.
-# Large IPv6 prefixes allocate sparsely (randomized-within-prefix).
+# Sample AddressPool used by CI structural checks and as a dual-stack
+# reference. Large IPv6 prefixes (host bits > 16, e.g. /64) allocate
+# sparsely — see README.md "IPv6 → IPAM and AddressPool".
 apiVersion: rivora.zyvor.dev/v1alpha1
 kind: AddressPool
 metadata:

@@ -2,8 +2,9 @@
 
 Kubernetes integration for [Rivora](https://github.com/zyvorai/rivora): a
 per-node `rivorad` DaemonSet (eBPF dataplane + Service/EndpointSlice
-reconciler + L2/ARP speaker) and the cluster-scoped `rivora-controller`
-Deployment (IPAM).
+reconciler + L2 ARP+NDP speaker + optional BGP) and the cluster-scoped
+`rivora-controller` Deployment (IPAM for Services and optional Gateway
+API).
 
 ## Install
 
@@ -17,6 +18,35 @@ helm install rivora deploy/helm/rivora \
 
 `rivorad.interface` is required — the host network interface every node
 attaches XDP/TCX to (see `values.yaml`).
+
+### Dual-stack (IPv4 + IPv6 pools)
+
+Large IPv6 prefixes (e.g. `/64`) allocate **sparsely** — the controller
+does not expand 2^64 addresses into memory. See the top-level
+[IPv6](../../../README.md#ipv6-v03) docs.
+
+```sh
+helm upgrade rivora deploy/helm/rivora \
+  --namespace rivora-system --reuse-values \
+  --set addressPools[0].name=default \
+  --set addressPools[0].addresses='{10.0.0.0/24}' \
+  --set addressPools[1].name=v6 \
+  --set addressPools[1].addresses='{2001:db8:1::/64}'
+```
+
+Equivalent values file:
+
+```yaml
+addressPools:
+  - name: default
+    addresses: ["10.0.0.0/24"]
+    autoAssign: true
+  - name: v6
+    addresses: ["2001:db8:1::/64"]
+    autoAssign: true
+```
+
+CI sample: [`ci/addresspool-ipv6.yaml`](ci/addresspool-ipv6.yaml).
 
 ## The CRD is not managed by upgrade/uninstall
 
@@ -39,12 +69,27 @@ kubectl delete addresspools.rivora.zyvor.dev --all
 kubectl delete -f deploy/helm/rivora/crds/addresspool-crd.yaml
 ```
 
+The OpenAPI description on `spec.addresses` documents IPv6 CIDRs/ranges
+and sparse `/64` allocation; keep that text in sync when changing IPAM.
+
+## L2 speaker (ARP + NDP)
+
+`rivorad.speaker` defaults to `true`. The elected speaker (cluster-wide
+Lease) answers ARP for IPv4 NAT VIPs and NDP (Neighbor Solicitation →
+Advertisement, plus unsolicited NAs) for IPv6 NAT VIPs on
+`rivorad.interface`. Disable only if something else on the cluster already
+owns ARP/NDP for these addresses.
+
+```sh
+--set rivorad.speaker=false
+```
+
 ## Gateway API
 
 Setting `gatewayApi.enabled=true` turns on a second control loop, on both
 `rivorad` and `rivora-controller`, that watches `Gateway`/`TCPRoute`/
 `UDPRoute` (the Gateway API's L4 "experimental channel" resources) instead
-of `Service`. `HTTPRoute` is deliberately out of scope — Rivora's XDP
+of only `Service`. `HTTPRoute` is deliberately out of scope — Rivora's XDP
 dataplane has no L7 visibility, so it can't enforce HTTPRoute's path/header
 matching rules.
 
@@ -66,21 +111,24 @@ helm upgrade rivora deploy/helm/rivora \
 ```
 
 A `Gateway` referencing this `GatewayClass` gets an address assigned from
-an `AddressPool` the same way a `type: LoadBalancer` Service does;
+an `AddressPool` the same way a `type: LoadBalancer` Service does
+(IPv4 and/or IPv6 depending on pools and Gateway listeners);
 `TCPRoute`/`UDPRoute` objects with `parentRefs` pointing at that `Gateway`
 supply the backends (`backendRefs[].weight` maps onto Rivora's existing
-weighted-Maglev backend selection).
+weighted-Maglev backend selection). Same-family backends only per VIP.
 
 ## BGP/BFD HA
 
 Setting `bgp.enabled=true` turns on rivorad's BGP+BFD speaker: active/
-active ECMP HA where every node independently advertises a `/32` route
-for each VIP it currently has a healthy backend for, and withdraws it the
-instant that stops being true. Unlike Gateway API, this is `rivorad`-only
-— `rivora-controller` isn't involved, since BGP doesn't need cluster-wide
-IPAM coordination.
+active ECMP HA where every node independently advertises a `/32` (IPv4)
+or `/128` (IPv6) host route for each VIP it currently has a healthy
+backend for, and withdraws it the instant that stops being true. Peers
+negotiate both unicast families. Unlike Gateway API, this is `rivorad`-
+only — `rivora-controller` isn't involved, since BGP doesn't need
+cluster-wide IPAM coordination.
 
 ```sh
+# IPv4 ads (routerId is BGP ID + IPv4 next-hop)
 helm upgrade rivora deploy/helm/rivora \
   --namespace rivora-system --reuse-values \
   --set bgp.enabled=true \
@@ -89,14 +137,46 @@ helm upgrade rivora deploy/helm/rivora \
   --set "bgp.peers[0].address=10.0.0.1" \
   --set "bgp.peers[0].asn=65000" \
   --set "bgp.peers[0].bfd=true"
+
+# Also advertise IPv6 VIP /128s — ipv6NextHop is required
+helm upgrade rivora deploy/helm/rivora \
+  --namespace rivora-system --reuse-values \
+  --set bgp.enabled=true \
+  --set bgp.asn=65001 \
+  --set bgp.routerId=10.0.0.11 \
+  --set bgp.ipv6NextHop=2001:db8::11 \
+  --set "bgp.peers[0].address=10.0.0.1" \
+  --set "bgp.peers[0].asn=65000" \
+  --set "bgp.peers[0].bfd=true"
 ```
 
-Read the top-level README's BGP/BFD HA section before enabling this —
-it covers the health-gated advertise/withdraw model and a real caveat:
-in full-NAT mode (the **only** mode K8s-managed VIPs currently run in,
-per the note below), a router-side ECMP rehash can disrupt in-flight
-connections on a node that's rebalanced away from, since connection
-state isn't shared across nodes.
+| Value | Meaning |
+| --- | --- |
+| `bgp.asn` | Local AS |
+| `bgp.routerId` | BGP identifier + IPv4 next-hop for `/32` |
+| `bgp.ipv6NextHop` | IPv6 next-hop for `/128` (omit → IPv6 VIPs not advertised) |
+| `bgp.peers[].address` / `.asn` / `.bfd` | Peer list; `bfd: true` enables BFD on that peer |
+
+Read the top-level README's [BGP/BFD HA](../../../README.md#bgpbfd-ha-v03)
+section before enabling this — it covers the health-gated
+advertise/withdraw model and a real caveat: in full-NAT mode (the
+**only** mode K8s-managed VIPs currently run in, per the note below), a
+router-side ECMP rehash can disrupt in-flight connections on a node that's
+rebalanced away from, since connection state isn't shared across nodes.
+
+## Values reference (IPv6-related)
+
+| Path | Default | Notes |
+| --- | --- | --- |
+| `rivorad.interface` | `""` (required) | Host iface for XDP/TCX + speaker |
+| `rivorad.speaker` | `true` | ARP+NDP Lease speaker |
+| `gatewayApi.enabled` | `false` | Service + Gateway control loops |
+| `gatewayClass.create` / `.name` | `false` / `rivora` | Optional GatewayClass |
+| `bgp.enabled` | `false` | Per-node BGP speaker |
+| `bgp.ipv6NextHop` | `""` | Required for IPv6 `/128` ads |
+| `addressPools[]` | `[]` | Seeded `AddressPool` CRs; IPv6 `/64` OK |
+
+Full defaults and comments: [`values.yaml`](values.yaml).
 
 ## Notes
 
@@ -109,3 +189,5 @@ state isn't shared across nodes.
 - A node running this DaemonSet manages only K8s-sourced VIPs; the
   static-YAML `-config` path (see the top-level README) is a separate,
   non-Kubernetes deployment mode and isn't used here.
+- Dual-stack Services get one programmed VIP per family; backends are
+  filtered to matching EndpointSlice address types.

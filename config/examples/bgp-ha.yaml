@@ -1,17 +1,22 @@
 # Opt-in BGP+BFD speaker: active/active ECMP HA across multiple Rivora
-# nodes. Each node independently advertises a /32 host route for every
-# VIP it currently has at least one healthy backend for, and withdraws it
-# the instant that stops being true — there's no leader election here,
-# unlike DSR/NAT's local forwarding state, since BGP+ECMP's whole point is
-# multiple nodes advertising the same VIP at once, with upstream routers
-# hashing traffic across next-hops. See README.md's "BGP/BFD HA" section
-# for the full-NAT/ECMP flow-affinity caveat before running this with
-# mode: nat VIPs at real scale.
+# nodes. Each node independently advertises a /32 (IPv4) or /128 (IPv6)
+# host route for every VIP it currently has at least one healthy backend
+# for, and withdraws it the instant that stops being true — there's no
+# leader election here, unlike DSR/NAT's local forwarding state, since
+# BGP+ECMP's whole point is multiple nodes advertising the same VIP at
+# once, with upstream routers hashing traffic across next-hops. Peers
+# negotiate both IPv4 and IPv6 unicast families. See README.md's "BGP/BFD
+# HA" and "IPv6" sections for the full-NAT/ECMP flow-affinity caveat and
+# ipv6NextHop requirements before running this with mode: nat VIPs at
+# real scale.
 #
 # routerId only needs to be a syntactically valid IPv4 address — it's an
-# opaque 32-bit BGP identifier, not necessarily a real routable/bindable
-# address (though using this node's own address, as below, is the normal
-# convention and keeps troubleshooting simple).
+# opaque 32-bit BGP identifier and the IPv4 next-hop for /32 ads, not
+# necessarily a real routable/bindable address (though using this node's
+# own address, as below, is the normal convention). To also advertise
+# IPv6 VIP /128s, set ipv6NextHop to this node's IPv6 address:
+#
+#   ipv6NextHop: 2001:db8::11
 
 interface: eth0
 apiListen: 127.0.0.1:9870
@@ -20,6 +25,7 @@ bgp:
   enabled: true
   asn: 65001
   routerId: 10.0.0.11
+  # ipv6NextHop: 2001:db8::11   # uncomment to advertise IPv6 VIP /128s
   peers:
     - address: 10.0.0.1  # top-of-rack router, BFD enabled for sub-second down detection
       asn: 65000
