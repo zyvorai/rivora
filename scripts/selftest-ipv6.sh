@@ -261,6 +261,22 @@ except Exception as e:
 "
     echo "  [diag] LB neigh table after pre-warm:"
     ip netns exec "$NS_LB" ip -6 neigh show 2>&1 | sed 's/^/    /'
+    # This connect test runs BEFORE rivorad/XDP is even loaded — a failure
+    # here is unrelated to any Rivora BPF code, ruling that out entirely.
+    # Broader diagnostics to isolate whether it's TCP-specific (app-layer/
+    # conntrack) or general IPv6 reachability (ping), and whether the
+    # addresses/routes actually look sane.
+    echo "  [diag] ping LB->${PREFIX}11 (bypasses TCP/conntrack entirely):"
+    ip netns exec "$NS_LB" ping -6 -c2 -W2 "${PREFIX}11" 2>&1 | sed 's/^/    /'
+    echo "  [diag] LB addr/route state:"
+    ip netns exec "$NS_LB" ip -6 addr show 2>&1 | sed 's/^/    /'
+    ip netns exec "$NS_LB" ip -6 route show 2>&1 | sed 's/^/    /'
+    echo "  [diag] be1 addr state:"
+    ip netns exec "$NS_BE1" ip -6 addr show 2>&1 | sed 's/^/    /'
+    echo "  [diag] be1's own ip6tables (per-netns, independent of root):"
+    ip netns exec "$NS_BE1" ip6tables -L -n 2>&1 | sed 's/^/    /'
+    echo "  [diag] recent kernel log (drops/errors):"
+    dmesg 2>&1 | tail -n 30 | sed 's/^/    /' || true
 
     ip netns exec "$NS_LB" bash -c \
         "mount -t bpf bpf /sys/fs/bpf 2>/dev/null; exec '$RIVORAD' -config '$CONFIG' -bpf-dir '$BPF_DIR'" \
