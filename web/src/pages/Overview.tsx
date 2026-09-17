@@ -1,8 +1,11 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { useCountUp } from '../hooks/useCountUp';
+import Sparkline from '../components/Sparkline';
 import type { VIPStatus } from '../types';
 import { fmtBytes } from '../types';
+
+const HISTORY_LEN = 30; // 30 samples @ 3s polling = 90s of visible history
 
 function Metric({ value, label }: { value: number | string; label: string }) {
   const numeric = typeof value === 'number' && Number.isFinite(value);
@@ -13,6 +16,29 @@ function Metric({ value, label }: { value: number | string; label: string }) {
       <span>{label}</span>
     </div>
   );
+}
+
+/** Tracks the last cumulative (total, timestampMs) sample and turns each new
+ * one into a per-second rate, since the API only ever reports monotonic
+ * counters (see dataplane.Status's Packets/Bytes) — the rate is what makes
+ * "what it's doing right now" visible rather than a slowly-climbing total. */
+function useRateHistory(total: number) {
+  const [history, setHistory] = useState<number[]>([]);
+  const prevRef = useRef<{ total: number; t: number } | null>(null);
+
+  useEffect(() => {
+    const now = performance.now();
+    const prev = prevRef.current;
+    prevRef.current = { total, t: now };
+    if (!prev) return;
+    const dt = (now - prev.t) / 1000;
+    if (dt <= 0) return;
+    const rate = Math.max(0, (total - prev.total) / dt);
+    setHistory((h) => [...h, rate].slice(-HISTORY_LEN));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [total]);
+
+  return history;
 }
 
 export default function Overview() {
@@ -46,6 +72,11 @@ export default function Overview() {
   const dropped = vips[0]?.dropped ?? 0;
   const iface = vips[0]?.interface || '—';
 
+  const packetRate = useRateHistory(packets);
+  const byteRate = useRateHistory(bytes);
+  const currentPPS = packetRate.length ? packetRate[packetRate.length - 1] : 0;
+  const currentBPS = byteRate.length ? byteRate[byteRate.length - 1] : 0;
+
   return (
     <div className="grid">
       <section className="card span2">
@@ -62,6 +93,28 @@ export default function Overview() {
           <Metric value={dropped} label="dropped" />
         </div>
         {err && <p className="warning">{err}</p>}
+      </section>
+
+      <section className="card span2">
+        <p className="eyebrow">LIVE THROUGHPUT</p>
+        <h3>
+          {Math.round(currentPPS).toLocaleString()} pkt/s · {fmtBytes(currentBPS)}/s
+        </h3>
+        <p>Sampled every 3s from the dataplane's own packet/byte counters — a flat line means no traffic is currently flowing.</p>
+        <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', marginTop: 8 }}>
+          <div>
+            <Sparkline values={packetRate} color="var(--accent-cyan)" />
+            <p className="eyebrow" style={{ marginTop: 4 }}>
+              packets/sec
+            </p>
+          </div>
+          <div>
+            <Sparkline values={byteRate} color="var(--accent-purple)" />
+            <p className="eyebrow" style={{ marginTop: 4 }}>
+              bytes/sec
+            </p>
+          </div>
+        </div>
       </section>
 
       <section className="card">
