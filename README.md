@@ -1,6 +1,7 @@
 # Rivora
 
 [![CI](https://github.com/zyvorai/rivora/actions/workflows/ci.yml/badge.svg)](https://github.com/zyvorai/rivora/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-zyvorai.github.io%2Frivora-blue)](https://zyvorai.github.io/rivora/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 ![Rivora — eBPF-native load balancer for Kubernetes and bare metal](docs/social/rivora-share-card.png)
@@ -48,6 +49,7 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
   - [Verification](#verification)
 - [Building on the remote host](#building-on-the-remote-host)
 - [Selftests and CI](#selftests-and-ci)
+- [Operator docs (GitHub Pages)](#operator-docs-github-pages)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -577,6 +579,13 @@ GitHub Actions (`.github/workflows/ci.yml`) on every push/PR:
 | `crd` | Structural validate AddressPool CRD + IPv6 sample YAML |
 | `bpf` | `make bpf` (clang), upload `bpf/*.o` |
 | `integration` | Needs `go`+`bpf`; runs every selftest above as root |
+
+## Operator docs (GitHub Pages)
+
+Published MkDocs site: **[zyvorai.github.io/rivora](https://zyvorai.github.io/rivora/)**.
+Sources live under `docs/` (`mkdocs.yml`); preview with `make docs-serve`,
+strict build with `make docs-build`. Deploys on every push that touches
+docs via `.github/workflows/docs.yml`.
 
 ## Roadmap
 

@@ -7,3 +7,7 @@
 
 # Deploy state (no secrets)
 .deploy-last
+
+# MkDocs
+/site/
+.venv-docs/

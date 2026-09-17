@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 .PHONY: build bpf test fmt vet selftest selftest-multivip selftest-weighted selftest-ratelimit selftest-ipv6 selftest-ndp selftest-all \
+	docs-serve docs-build \
 	deploy deploy-remote deploy-remote-quick deploy-remote-preflight deploy-remote-verify deploy-remote-uninstall deploy-remote-fleet
 
 CLANG ?= clang
@@ -51,6 +52,12 @@ selftest-ndp:
 	bash scripts/selftest-ndp.sh
 
 selftest-all: selftest selftest-multivip selftest-weighted selftest-ratelimit selftest-ipv6 selftest-ndp
+
+docs-serve: ## Local MkDocs preview (pip install -r requirements-docs.txt)
+	mkdocs serve
+
+docs-build: ## Strict MkDocs build into site/
+	mkdocs build --strict
 
 deploy: deploy-remote ## Alias for deploy-remote
 
