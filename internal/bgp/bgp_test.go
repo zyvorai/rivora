@@ -87,6 +87,7 @@ func startFakePeer(t *testing.T, peerASN, ourASN uint32) (*server.BgpServer, int
 		Peer: &api.Peer{
 			Conf:      &api.PeerConf{NeighborAddress: "127.0.0.1", PeerAsn: ourASN},
 			Transport: &api.Transport{PassiveMode: true},
+			AfiSafis:  dualStackAfiSafis(),
 		},
 	}); err != nil {
 		t.Fatalf("fake peer add our speaker as a peer: %v", err)
@@ -95,15 +96,18 @@ func startFakePeer(t *testing.T, peerASN, ourASN uint32) (*server.BgpServer, int
 	return s, port
 }
 
-// receivedPrefixes lists the /32 host-route prefix strings currently in
-// the fake peer's global RIB (its best-path table across all its own
-// peers — here, just our Speaker).
+// receivedPrefixes lists host-route prefix strings currently in the fake
+// peer's global RIB for family (IPv4 /32 or IPv6 /128).
 func receivedPrefixes(t *testing.T, peer *server.BgpServer) map[string]bool {
+	return receivedPrefixesFamily(t, peer, bgp.RF_IPv4_UC)
+}
+
+func receivedPrefixesFamily(t *testing.T, peer *server.BgpServer, family bgp.Family) map[string]bool {
 	t.Helper()
 	out := map[string]bool{}
 	err := peer.ListPath(apiutil.ListPathRequest{
 		TableType: api.TableType_TABLE_TYPE_GLOBAL,
-		Family:    bgp.RF_IPv4_UC,
+		Family:    family,
 	}, func(prefix bgp.NLRI, paths []*apiutil.Path) {
 		if len(paths) > 0 {
 			out[prefix.String()] = true
@@ -203,6 +207,58 @@ func TestSpeakerAdvertisesAndWithdrawsOnHealthChange(t *testing.T) {
 	sp.AnnounceNow()
 	waitFor(t, testTimeout, "vip1 re-advertised after its backend recovered", func() bool {
 		return receivedPrefixes(t, peer)["10.9.0.1/32"]
+	})
+}
+
+func vipStatus6(addr string, healthy bool) dataplane.Status {
+	return dataplane.Status{
+		VIPAddress: addr,
+		Protocol:   "tcp",
+		Mode:       "nat",
+		Backends:   []dataplane.BackendStatus{{ID: 1, Address: "2001:db8::11", Port: 8080, Healthy: healthy}},
+	}
+}
+
+// TestSpeakerAdvertisesIPv6HostRoute mirrors the IPv4 health-gated test
+// for an IPv6 VIP: with ipv6NextHop set, a healthy VIP must appear on the
+// peer as a /128 (RF_IPv6_UC) and withdraw when the backend goes down.
+func TestSpeakerAdvertisesIPv6HostRoute(t *testing.T) {
+	peer, peerPort := startFakePeer(t, peerASN, ourASN)
+
+	source := &fakeSource{}
+	source.set([]dataplane.Status{
+		vipStatus6("2001:db8:9::1", true),
+		vipStatus6("2001:db8:9::2", false),
+	})
+
+	cfg := config.BGP{
+		Enabled:     true,
+		ASN:         ourASN,
+		RouterID:    ourRouterID,
+		IPv6NextHop: "2001:db8::1",
+		Peers:       []config.BGPPeer{{Address: "127.0.0.1", ASN: peerASN}},
+	}
+	sp, err := newSpeaker(cfg, source, testLogger(), -1, map[string]uint32{"127.0.0.1": uint32(peerPort)})
+	if err != nil {
+		t.Fatalf("new speaker: %v", err)
+	}
+	defer sp.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sp.Run(ctx)
+
+	waitFor(t, testTimeout, "ipv6 vip1 advertised as /128", func() bool {
+		return receivedPrefixesFamily(t, peer, bgp.RF_IPv6_UC)["2001:db8:9::1/128"]
+	})
+	if got := receivedPrefixesFamily(t, peer, bgp.RF_IPv6_UC); got["2001:db8:9::2/128"] {
+		t.Fatal("unhealthy ipv6 vip must never be advertised")
+	}
+
+	source.set([]dataplane.Status{vipStatus6("2001:db8:9::1", false)})
+	sp.AnnounceNow()
+	waitFor(t, testTimeout, "ipv6 vip1 withdrawn", func() bool {
+		return !receivedPrefixesFamily(t, peer, bgp.RF_IPv6_UC)["2001:db8:9::1/128"]
 	})
 }
 

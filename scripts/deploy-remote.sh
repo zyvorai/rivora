@@ -311,7 +311,7 @@ REMOTE
 verify_remote() {
     info "Running selftest on ${TARGET_HOST}..."
     if [ "$DRY_RUN" = true ]; then
-        dry "would run: bash ${REMOTE_DIR}/scripts/selftest.sh && bash ${REMOTE_DIR}/scripts/selftest-multivip.sh"
+        dry "would run: bash ${REMOTE_DIR}/scripts/selftest.sh && bash ${REMOTE_DIR}/scripts/selftest-multivip.sh && bash ${REMOTE_DIR}/scripts/selftest-ipv6.sh && bash ${REMOTE_DIR}/scripts/selftest-ndp.sh"
         return 0
     fi
     # Selftest failures are warnings, not fatal to the deploy — matches the
@@ -325,6 +325,16 @@ verify_remote() {
         ok "multi-VIP selftest passed"
     else
         warn "multi-VIP selftest reported failures (see above)"
+    fi
+    if _ssh_once "cd '${REMOTE_DIR}' && sudo bash scripts/selftest-ipv6.sh"; then
+        ok "IPv6 dataplane selftest passed"
+    else
+        warn "IPv6 dataplane selftest reported failures (see above)"
+    fi
+    if _ssh_once "cd '${REMOTE_DIR}' && sudo bash scripts/selftest-ndp.sh"; then
+        ok "NDP speaker selftest passed"
+    else
+        warn "NDP speaker selftest reported failures (see above)"
     fi
     return 0
 }

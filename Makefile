@@ -1,7 +1,7 @@
 # Copyright 2026 Zyvor AI Labs · https://zyvor.dev
 # SPDX-License-Identifier: Apache-2.0
 
-.PHONY: build bpf test fmt vet selftest selftest-multivip selftest-weighted selftest-ratelimit \
+.PHONY: build bpf test fmt vet selftest selftest-multivip selftest-weighted selftest-ratelimit selftest-ipv6 selftest-ndp selftest-all \
 	deploy deploy-remote deploy-remote-quick deploy-remote-preflight deploy-remote-verify deploy-remote-uninstall deploy-remote-fleet
 
 CLANG ?= clang
@@ -13,6 +13,7 @@ build:
 	go build -o bin/rivorad ./cmd/rivorad
 	go build -o bin/rivoractl ./cmd/rivoractl
 	go build -o bin/rivora-doctor ./cmd/rivora-doctor
+	go build -o bin/rivora-controller ./cmd/rivora-controller
 
 # Linux-only: needs linux/bpf.h and friends. Run on the remote build host,
 # not on macOS — see scripts/deploy-remote.sh.
@@ -42,6 +43,14 @@ selftest-weighted:
 
 selftest-ratelimit:
 	bash scripts/selftest-ratelimit.sh
+
+selftest-ipv6:
+	bash scripts/selftest-ipv6.sh
+
+selftest-ndp:
+	bash scripts/selftest-ndp.sh
+
+selftest-all: selftest selftest-multivip selftest-weighted selftest-ratelimit selftest-ipv6 selftest-ndp
 
 deploy: deploy-remote ## Alias for deploy-remote
 

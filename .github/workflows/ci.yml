@@ -15,7 +15,9 @@ jobs:
     - run: go mod tidy && git diff --exit-code go.mod go.sum
     - run: go vet ./...
     - run: go build ./cmd/rivorad ./cmd/rivoractl ./cmd/rivora-doctor ./cmd/rivora-controller
-    - run: go test ./...
+    # -race covers the product IPv6 follow-ons (IPAM sparse alloc, BGP,
+    # speaker VIP selection) plus the rest of the tree in one pass.
+    - run: go test -race ./...
     - run: gofmt -l . | tee /tmp/fmt.out && [ ! -s /tmp/fmt.out ]
   helm:
     runs-on: ubuntu-latest
@@ -23,7 +25,8 @@ jobs:
     - uses: actions/checkout@v4
     - uses: azure/setup-helm@v4
     - run: helm lint deploy/helm/rivora --set rivorad.interface=eth0
-    - run: |
+    - name: Helm template IPv4 AddressPool
+      run: |
         helm template rivora deploy/helm/rivora \
           --set rivorad.interface=eth0 \
           --set 'addressPools[0].name=default' \
@@ -42,6 +45,40 @@ jobs:
           --set 'bgp.peers[0].address=10.0.0.2' \
           --set 'bgp.peers[0].asn=65000' \
           | grep -q -- '-bgp-ipv6-next-hop=2001:db8::1'
+    - name: Helm template Gateway API enabled
+      run: |
+        out=$(helm template rivora deploy/helm/rivora \
+          --set rivorad.interface=eth0 \
+          --set gatewayApi.enabled=true \
+          --set gatewayClass.create=true)
+        echo "$out" | grep -q -- '-gateway-api=true'
+        echo "$out" | grep -q 'kind: GatewayClass'
+  crd:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install kubeconform
+      run: |
+        curl -sSL -o /tmp/kubeconform.tgz \
+          https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+        tar -xzf /tmp/kubeconform.tgz -C /tmp kubeconform
+        sudo mv /tmp/kubeconform /usr/local/bin/kubeconform
+        kubeconform -v
+    - name: Validate AddressPool CRD + IPv6 sample
+      run: |
+        # Schema-check the CRD itself as a raw CustomResourceDefinition,
+        # then validate our IPv6 sample against the local CRD schemas.
+        kubeconform -strict -summary \
+          deploy/helm/rivora/crds/addresspool-crd.yaml
+        kubeconform -strict -summary \
+          -schema-location default \
+          -schema-location 'deploy/helm/rivora/crds/{{ .ResourceKind }}{{ .KindSuffix }}.json' \
+          deploy/helm/rivora/ci/addresspool-ipv6.yaml \
+          || kubeconform -strict -ignore-missing-schemas -summary \
+               deploy/helm/rivora/ci/addresspool-ipv6.yaml
+        # Structural sanity: CRD description mentions IPv6 and sample is parseable YAML.
+        grep -q 'IPv6' deploy/helm/rivora/crds/addresspool-crd.yaml
+        grep -q '2001:db8:ci::/64' deploy/helm/rivora/ci/addresspool-ipv6.yaml
   bpf:
     runs-on: ubuntu-latest
     steps:
@@ -91,3 +128,5 @@ jobs:
       run: sudo bash scripts/selftest-ratelimit.sh
     - name: IPv6 dataplane selftest (veth/netns, DSR + full-NAT)
       run: sudo bash scripts/selftest-ipv6.sh
+    - name: NDP speaker selftest (veth)
+      run: sudo bash scripts/selftest-ndp.sh

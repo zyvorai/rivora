@@ -114,6 +114,9 @@ func newSpeaker(cfg config.BGP, source vipSource, logger *slog.Logger, listenPor
 				PeerAsn:         p.ASN,
 				LocalAsn:        cfg.ASN,
 			},
+			// Negotiate both unicast families so IPv4 /32 and IPv6 /128
+			// VIP host routes can be advertised on the same session.
+			AfiSafis: dualStackAfiSafis(),
 		}
 		if p.BFD {
 			peer.Bfd = &api.BfdPeerConfig{Enabled: true}
@@ -135,6 +138,13 @@ func newSpeaker(cfg config.BGP, source vipSource, logger *slog.Logger, listenPor
 		advertised: map[netip.Addr]uuid.UUID{},
 		resyncNow:  make(chan struct{}, 1),
 	}, nil
+}
+
+func dualStackAfiSafis() []*api.AfiSafi {
+	return []*api.AfiSafi{
+		{Config: &api.AfiSafiConfig{Family: &api.Family{Afi: api.Family_AFI_IP, Safi: api.Family_SAFI_UNICAST}}},
+		{Config: &api.AfiSafiConfig{Family: &api.Family{Afi: api.Family_AFI_IP6, Safi: api.Family_SAFI_UNICAST}}},
+	}
 }
 
 // Close stops the gobgp server, withdrawing every advertised route as
@@ -236,22 +246,14 @@ func (sp *Speaker) advertise(addr netip.Addr) (uuid.UUID, error) {
 	if err != nil {
 		return uuid.UUID{}, err
 	}
+	nh, err := bgp.NewPathAttributeNextHop(nextHop)
+	if err != nil {
+		return uuid.UUID{}, err
+	}
 	attrs := []bgp.PathAttributeInterface{
 		bgp.NewPathAttributeOrigin(0), // IGP — locally-originated route
+		nh,
 		bgp.NewPathAttributeAsPath(nil),
-	}
-	if addr.Is4() {
-		nh, err := bgp.NewPathAttributeNextHop(nextHop)
-		if err != nil {
-			return uuid.UUID{}, err
-		}
-		attrs = append(attrs, nh)
-	} else {
-		mp, err := bgp.NewPathAttributeMpReachNLRI(family, []bgp.PathNLRI{{NLRI: nlri}}, nextHop)
-		if err != nil {
-			return uuid.UUID{}, err
-		}
-		attrs = append(attrs, mp)
 	}
 	resp, err := sp.server.AddPath(apiutil.AddPathRequest{
 		Paths: []*apiutil.Path{{Family: family, Nlri: nlri, Attrs: attrs}},

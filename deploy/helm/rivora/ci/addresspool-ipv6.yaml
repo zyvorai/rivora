@@ -1,0 +1,11 @@
+# Sample AddressPool used by CI kubeconform / schema checks.
+# Large IPv6 prefixes allocate sparsely (randomized-within-prefix).
+apiVersion: rivora.zyvor.dev/v1alpha1
+kind: AddressPool
+metadata:
+  name: ci-ipv6
+spec:
+  addresses:
+    - 2001:db8:ci::/64
+  autoAssign: true
+  avoidBuggyIPs: false
