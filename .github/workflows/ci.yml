@@ -29,6 +29,19 @@ jobs:
           --set 'addressPools[0].name=default' \
           --set 'addressPools[0].addresses={10.0.0.0/24}' \
           > /dev/null
+    - name: Helm template IPv6 pool + BGP /128 next-hop
+      run: |
+        helm template rivora deploy/helm/rivora \
+          --set rivorad.interface=eth0 \
+          --set 'addressPools[0].name=v6' \
+          --set 'addressPools[0].addresses={2001:db8::/64}' \
+          --set bgp.enabled=true \
+          --set bgp.asn=65001 \
+          --set bgp.routerId=10.0.0.1 \
+          --set bgp.ipv6NextHop=2001:db8::1 \
+          --set 'bgp.peers[0].address=10.0.0.2' \
+          --set 'bgp.peers[0].asn=65000' \
+          | grep -q -- '-bgp-ipv6-next-hop=2001:db8::1'
   bpf:
     runs-on: ubuntu-latest
     steps:
