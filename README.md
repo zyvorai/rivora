@@ -21,7 +21,8 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
 > via `rivorad -kubernetes`, with `rivora-controller` handling `AddressPool`
 > IPAM and an in-`rivorad` L2/ARP speaker announcing assigned VIPs. BGP/BFD
 > HA is implemented (opt-in, active/active ECMP) but not yet live-verified
-> against a real router peer — see [Roadmap](#roadmap).
+> against a real router peer. IPv6 dataplane support (static-YAML mode
+> only so far) is implemented and CI-verified — see [Roadmap](#roadmap).
 
 ## Contents
 
@@ -34,6 +35,7 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
   - [Backends beyond Pods: KubeVirt VMs and external/physical IPs](#backends-beyond-pods-kubevirt-vms-and-externalphysical-ips)
   - [Gateway API (v0.3)](#gateway-api-v03)
   - [BGP/BFD HA (v0.3)](#bgpbfd-ha-v03)
+- [IPv6 (v0.3, in progress)](#ipv6-v03-in-progress)
 - [Building on the remote host](#building-on-the-remote-host)
 - [Roadmap](#roadmap)
 - [License](#license)
@@ -343,6 +345,45 @@ test cluster — this needs an actual second router-like peer, which the
 loopback integration test deliberately substitutes for correctness
 coverage without needing one.
 
+## IPv6 (v0.3, in progress)
+
+The dataplane foundation is implemented: `rivorad` parses, forwards, and
+checksum-rewrites IPv6 TCP/UDP traffic in both DSR and full-NAT mode,
+in **static-YAML config mode only** — Kubernetes reconciliation, IPAM
+(`AddressPool`), and an NDP responder (IPv6's equivalent of the L2/ARP
+speaker) are separate, not-yet-implemented follow-on phases. A VIP's
+backends must all share its own address family; mixing v4 and v6 behind
+one VIP is rejected at config-validation time.
+
+```yaml
+interface: eth0
+vips:
+  - address: fd00:77::100
+    port: 80
+    protocol: tcp
+    mode: nat
+    backends:
+      - address: fd00:77::11
+        port: 8080
+```
+
+Under the hood, only the maps keyed or valued by a raw address
+(`vip_map`, `backend_map`, `connection_affinity_map`, `nat_reverse_map`,
+`rl_buckets_map`) have IPv6 siblings — `service_config_map`,
+`maglev_table`, `backend_health_map`, `stats_map`, `iface_mac_map`, and
+`rl_config_map` are address-family-agnostic and shared as-is between v4
+and v6 VIPs/backends, including the same Maglev table and ID allocators.
+Two IPv6-specific checksum differences from v4 are handled explicitly:
+IPv6 has no IP-header checksum at all, and a UDP checksum is never
+"unset" over IPv6 (unlike v4, where zero means unset) — both matter for
+the full-NAT rewrite path's correctness.
+
+Verified via `scripts/selftest-ipv6.sh` (DSR + full-NAT, Maglev spread,
+failover) in CI on every push — BPF C can't be compiled or tested on
+macOS, so this couldn't be verified locally during development the way
+the Go-side changes were; CI (a real Linux runner) is the actual
+verification. Not yet verified against a live cluster or real hardware.
+
 ## Building on the remote host
 
 `scripts/deploy-remote.sh` (same shape as the sibling `guestkit` repo's
@@ -355,17 +396,20 @@ make deploy-remote-verify H=<host> U=<user>   # re-run all selftest scripts
 ```
 
 `scripts/selftest.sh`, `scripts/selftest-multivip.sh`,
-`scripts/selftest-weighted.sh`, and `scripts/selftest-ratelimit.sh` each
-build an isolated network-namespace/veth/bridge topology (never touching
-a host's real interfaces) and run `rivorad` against it: the first checks
-Maglev spread and health-check-driven failover for a single VIP in both
-DSR and NAT mode; the second checks that two independent VIPs on one node
-don't interfere with each other and that a draining backend is excluded
-from new connections without disrupting its established ones; the third
-checks that a 9:1-weighted VIP decisively skews traffic toward the
-heavier-weighted backend; the fourth checks that a low, deliberately-tight
-per-source rate limit drops most of a connection burst, recovers once the
-bucket refills, and has zero effect when left disabled (the default).
+`scripts/selftest-weighted.sh`, `scripts/selftest-ratelimit.sh`, and
+`scripts/selftest-ipv6.sh` each build an isolated network-namespace/veth/
+bridge topology (never touching a host's real interfaces) and run
+`rivorad` against it: the first checks Maglev spread and health-check-
+driven failover for a single VIP in both DSR and NAT mode; the second
+checks that two independent VIPs on one node don't interfere with each
+other and that a draining backend is excluded from new connections
+without disrupting its established ones; the third checks that a
+9:1-weighted VIP decisively skews traffic toward the heavier-weighted
+backend; the fourth checks that a low, deliberately-tight per-source
+rate limit drops most of a connection burst, recovers once the bucket
+refills, and has zero effect when left disabled (the default); the fifth
+repeats the first script's DSR/NAT/Maglev/failover checks over an
+all-IPv6 topology.
 
 ## Roadmap
 
@@ -392,9 +436,16 @@ implemented and locally verified — see [BGP/BFD HA](#bgpbfd-ha-v03) — with
 the health-gated advertise/withdraw cycle proven against a real BGP
 session (a loopback-peered gobgp integration test); live verification
 against a real/containerized router peer on the remote test cluster is a
-separate follow-up, not yet done. IPv6 is still ahead and will land last
-— it's a full parallel dataplane (new BPF maps/structs, checksum path,
-IPAM redesign, an NDP speaker), not a small extension.
+separate follow-up, not yet done. IPv6's dataplane foundation is done —
+see [IPv6](#ipv6-v03-in-progress) — with a new `scripts/selftest-ipv6.sh`
+green in CI on every push (DSR + full-NAT, Maglev spread, failover);
+still ahead for IPv6: the randomized-within-prefix IPAM allocator
+redesign `internal/ipam`'s current eager-CIDR-expansion model can't
+support (a real /64 has ~18 quintillion addresses), dual-stack
+Kubernetes reconciliation, and an NDP responder (the IPv6 analog of the
+L2/ARP speaker) — each its own follow-on phase, mirroring how the
+dataplane foundation itself was scoped and landed as a first, focused
+step rather than attempting all of IPv6 in one change.
 
 ## License
 
