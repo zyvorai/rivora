@@ -231,6 +231,25 @@ EOF
     fi
     sleep 0.3
 
+    # Temporary diagnostic for CI iteration: is direct LB->backend IPv6
+    # connectivity (what the active health checker itself needs, entirely
+    # separate from XDP-forwarded VIP traffic) actually working, and how
+    # long does neighbor resolution take before rivorad's own health
+    # checker (500ms probe timeout) ever gets a chance to try it?
+    echo "  [diag] pre-warm: LB->${PREFIX}11:${PORT} connect test:"
+    ip netns exec "$NS_LB" timeout 3 python3 -c "
+import socket, time
+t0 = time.time()
+try:
+    s = socket.create_connection(('${PREFIX}11', ${PORT}), timeout=2.5)
+    print('    connected in %.3fs' % (time.time() - t0))
+    s.close()
+except Exception as e:
+    print('    FAILED after %.3fs: %s' % (time.time() - t0, e))
+"
+    echo "  [diag] LB neigh table after pre-warm:"
+    ip netns exec "$NS_LB" ip -6 neigh show 2>&1 | sed 's/^/    /'
+
     ip netns exec "$NS_LB" bash -c \
         "mount -t bpf bpf /sys/fs/bpf 2>/dev/null; exec '$RIVORAD' -config '$CONFIG' -bpf-dir '$BPF_DIR'" \
         >"$RIVORAD_LOG" 2>&1 &
