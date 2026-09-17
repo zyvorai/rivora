@@ -62,13 +62,20 @@ func TestNDPRespondsOnVeth(t *testing.T) {
 			t.Fatalf("up %s: %v (%s)", name, err, out)
 		}
 	}
-	// Give each side a ULA so NDP has a stable L3 context; VIP is only
-	// "owned" via the speaker's vipSource, not necessarily assigned on-link.
+	// arp.Dial (used by speaker.New) requires an IPv4 address on the
+	// iface; give each side v4 + ULA so ARP and NDP both have L3 context.
+	// The VIP itself is only "owned" via vipSource, not assigned on-link.
+	if out, err := exec.Command("ip", "addr", "add", "10.255.99.1/30", "dev", aName).CombinedOutput(); err != nil {
+		t.Fatalf("addr4 a: %v (%s)", err, out)
+	}
+	if out, err := exec.Command("ip", "addr", "add", "10.255.99.2/30", "dev", bName).CombinedOutput(); err != nil {
+		t.Fatalf("addr4 b: %v (%s)", err, out)
+	}
 	if out, err := exec.Command("ip", "-6", "addr", "add", "fd00:99::1/64", "dev", aName, "nodad").CombinedOutput(); err != nil {
-		t.Fatalf("addr a: %v (%s)", err, out)
+		t.Fatalf("addr6 a: %v (%s)", err, out)
 	}
 	if out, err := exec.Command("ip", "-6", "addr", "add", "fd00:99::2/64", "dev", bName, "nodad").CombinedOutput(); err != nil {
-		t.Fatalf("addr b: %v (%s)", err, out)
+		t.Fatalf("addr6 b: %v (%s)", err, out)
 	}
 	time.Sleep(200 * time.Millisecond)
 
