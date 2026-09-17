@@ -41,6 +41,13 @@ The CRD lives at chart root `crds/`. Helm installs it on first
 kubectl apply -f deploy/helm/rivora/crds/addresspool-crd.yaml
 ```
 
+`AddressPool` ships a single version (`v1alpha1`) with no conversion
+webhook — most schema changes (new optional fields, loosened validation)
+apply in place with the command above, no migration needed. A
+conversion webhook is only warranted for an actual breaking change; see
+[Evolving the schema](https://github.com/zyvorai/rivora/blob/main/deploy/helm/rivora/README.md#evolving-the-schema)
+for the checklist.
+
 ## Observability
 
 Both workloads serve `/healthz`, `/readyz` and `/metrics` (Prometheus text

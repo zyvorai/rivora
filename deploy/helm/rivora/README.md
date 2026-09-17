@@ -72,6 +72,49 @@ kubectl delete -f deploy/helm/rivora/crds/addresspool-crd.yaml
 The OpenAPI description on `spec.addresses` documents IPv6 CIDRs/ranges
 and sparse `/64` allocation; keep that text in sync when changing IPAM.
 
+## Evolving the schema
+
+`AddressPool` ships a single version, `v1alpha1` (`served: true, storage:
+true`), with no conversion webhook. Most schema changes **don't need a
+new API version at all** — apply directly to `v1alpha1` in place:
+
+- Adding a new optional field, or a new default for an existing one.
+- Loosening a validation (widening an enum, dropping a `minItems`).
+- Adding an `additionalPrinterColumns` entry or a status field.
+
+These are backward-compatible: existing stored objects remain valid
+against the new schema, so `kubectl apply -f
+deploy/helm/rivora/crds/addresspool-crd.yaml` (see above) is sufficient —
+no migration, no downtime, existing `AddressPool` objects keep working
+unmodified.
+
+A new API version (`v1beta1`, then eventually `v1`) is only needed for a
+**breaking** change — renaming/removing a field, or changing one's
+meaning (e.g. `addresses` changing from "list of strings" to "list of
+objects"). If that day comes:
+
+1. Add the new version to `versions:` with `served: true, storage:
+   false` initially — both versions readable/writable, `v1alpha1` still
+   the storage version, so nothing breaks mid-rollout.
+2. Add a `conversion:` block (a `Conversion` webhook, since a purely
+   structural schema change won't satisfy CRD's lossless round-trip
+   requirement for a `None`-strategy conversion) and the Go conversion
+   functions between the two versions' Go types in `api/v1alpha1` /
+   `api/v1beta1`.
+3. Flip `storage: true` to the new version once the webhook is deployed
+   and verified; run `kubectl get addresspools -o yaml` and re-`apply`
+   each object (or use `kubectl-convert`) to force existing objects to
+   migrate storage.
+4. Only after every client has moved off the old version, drop it from
+   `versions:` and remove `served: true`.
+
+This is deliberately not pre-built: a conversion webhook is real
+operational surface (TLS cert management, a new availability dependency
+for every CRD write) that isn't worth carrying until an actual breaking
+change is needed. Rivora's CRD has had zero breaking changes since v0.2;
+if a breaking one comes up, use `git log -- deploy/helm/rivora/crds/` and
+this section as the starting checklist rather than re-deriving it.
+
 ## L2 speaker (ARP + NDP)
 
 `rivorad.speaker` defaults to `true`. The elected speaker (cluster-wide
