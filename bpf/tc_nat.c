@@ -6,12 +6,13 @@
 // (one-armed NAT), so this attaches to that same interface's egress path —
 // it rewrites the backend's reply (src = backend:port) back to
 // (src = VIP:port) right before the packet leaves, using the reverse
-// mapping xdp_ingress wrote to nat_reverse_map. DSR-mode traffic never
-// touches this program (the backend replies directly using the VIP as its
-// own source address).
+// mapping xdp_ingress wrote to nat_reverse_map (or nat_reverse_map6 for
+// IPv6, v0.3). DSR-mode traffic never touches this program (the backend
+// replies directly using the VIP as its own source address).
 
 #include <linux/if_ether.h>
 #include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <linux/in.h>
@@ -26,18 +27,15 @@ struct {
     __type(value, struct nat_reverse_val);
 } nat_reverse_map SEC(".maps");
 
-SEC("tc")
-int rivora_tc_nat_egress(struct __sk_buff *skb)
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct nat_reverse_key6);
+    __type(value, struct nat_reverse_val6);
+} nat_reverse_map6 SEC(".maps");
+
+static __always_inline int handle_ipv4(void *data, void *data_end, struct ethhdr *eth)
 {
-    void *data = (void *)(long)skb->data;
-    void *data_end = (void *)(long)skb->data_end;
-
-    struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end)
-        return TC_ACT_OK;
-    if (eth->h_proto != __constant_htons(ETH_P_IP))
-        return TC_ACT_OK;
-
     struct iphdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end)
         return TC_ACT_OK;
@@ -102,6 +100,90 @@ int rivora_tc_nat_egress(struct __sk_buff *skb)
     }
     iph->saddr = new_saddr;
 
+    return TC_ACT_OK;
+}
+
+/* IPv6 sibling of handle_ipv4 — same reverse-NAT shape against
+ * nat_reverse_map6, with the same two checksum differences xdp_ingress.c's
+ * handle_ipv6 documents: no IP-header checksum to touch at all (IPv6
+ * dropped it), and a UDP checksum is never "unset" over IPv6 so it's
+ * always updated unconditionally, unlike v4's "if (u->check != 0)" skip. */
+static __always_inline int handle_ipv6(void *data, void *data_end, struct ethhdr *eth)
+{
+    struct ipv6hdr *iph = (void *)(eth + 1);
+    if ((void *)(iph + 1) > data_end)
+        return TC_ACT_OK;
+    if (iph->nexthdr != IPPROTO_TCP_ && iph->nexthdr != IPPROTO_UDP_)
+        return TC_ACT_OK;
+
+    void *l4 = (void *)(iph + 1);
+    __u16 sport, dport;
+
+    if (iph->nexthdr == IPPROTO_TCP_) {
+        struct tcphdr *tcph = l4;
+        if ((void *)(tcph + 1) > data_end)
+            return TC_ACT_OK;
+        sport = tcph->source;
+        dport = tcph->dest;
+    } else {
+        struct udphdr *udph = l4;
+        if ((void *)(udph + 1) > data_end)
+            return TC_ACT_OK;
+        sport = udph->source;
+        dport = udph->dest;
+    }
+
+    /* This is the backend->client leg: src = backend, dst = client. */
+    struct nat_reverse_key6 rk = {.backend_port = sport, .client_port = dport, .proto = iph->nexthdr};
+    __builtin_memcpy(rk.backend_addr, &iph->saddr, 16);
+    __builtin_memcpy(rk.client_addr, &iph->daddr, 16);
+    struct nat_reverse_val6 *rv = bpf_map_lookup_elem(&nat_reverse_map6, &rk);
+    if (!rv)
+        return TC_ACT_OK; /* not a flow we NAT'd (or affinity already expired) */
+
+    __u8 old_saddr[16], new_saddr[16];
+    __builtin_memcpy(old_saddr, &iph->saddr, 16);
+    __builtin_memcpy(new_saddr, rv->vip_addr, 16);
+    __u16 old_sport = sport;
+    __u16 new_sport = rv->vip_port;
+
+    /* Re-derive the L4 pointer fresh here too — same reasoning as
+     * handle_ipv4's NAT block. */
+    void *l4b = (void *)(iph + 1);
+    if (iph->nexthdr == IPPROTO_TCP_) {
+        struct tcphdr *t = l4b;
+        if ((void *)(t + 1) > data_end)
+            return TC_ACT_OK;
+        csum_replace(&t->check, old_saddr, new_saddr, 16);
+        csum_replace(&t->check, &old_sport, &new_sport, 2);
+        t->source = new_sport;
+    } else {
+        struct udphdr *u = l4b;
+        if ((void *)(u + 1) > data_end)
+            return TC_ACT_OK;
+        csum_replace(&u->check, old_saddr, new_saddr, 16);
+        csum_replace(&u->check, &old_sport, &new_sport, 2);
+        u->source = new_sport;
+    }
+    __builtin_memcpy(&iph->saddr, new_saddr, 16);
+
+    return TC_ACT_OK;
+}
+
+SEC("tc")
+int rivora_tc_nat_egress(struct __sk_buff *skb)
+{
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return TC_ACT_OK;
+
+    if (eth->h_proto == __constant_htons(ETH_P_IP))
+        return handle_ipv4(data, data_end, eth);
+    if (eth->h_proto == __constant_htons(ETH_P_IPV6))
+        return handle_ipv6(data, data_end, eth);
     return TC_ACT_OK;
 }
 

@@ -72,6 +72,7 @@ type serviceEntry struct {
 type backendState struct {
 	address      string
 	port         uint16
+	isV4         bool // which of backend_map/backend_map6 this ID lives in (v0.3)
 	probeHealthy bool // from internal/healthcheck's active TCP probes
 	draining     bool // from a Kubernetes reconciler's EndpointSlice terminating state (v0.2+)
 	refCount     int
@@ -264,12 +265,8 @@ func (d *Dataplane) UpsertVIP(vip config.VIP) error {
 		return fmt.Errorf("update service_config_map: %w", err)
 	}
 
-	vk, err := vipKeyBPF(vip)
-	if err != nil {
+	if err := d.vipMapWrite(vip, entry.serviceID); err != nil {
 		return fmt.Errorf("vip %s: %w", key, err)
-	}
-	if err := d.dp.Maps[bpfmaps.MapVIP].Update(&vk, entry.serviceID, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("update vip_map: %w", err)
 	}
 
 	entry.vip = vip
@@ -347,7 +344,8 @@ func (d *Dataplane) acquireBackendLocked(name string, b config.Backend) (uint32,
 	}
 	st, exists := d.backendStates[id]
 	if !exists {
-		st = &backendState{address: b.Address, port: b.Port, probeHealthy: true}
+		ip := net.ParseIP(b.Address)
+		st = &backendState{address: b.Address, port: b.Port, isV4: ip != nil && ip.To4() != nil, probeHealthy: true}
 		d.backendStates[id] = st
 	}
 	st.refCount++
@@ -361,10 +359,16 @@ func (d *Dataplane) acquireBackendLocked(name string, b config.Backend) (uint32,
 	return id, nil
 }
 
+// writeBackendInfoLocked writes id's backend_map (or, for an IPv6
+// backend, backend_map6) entry — address-family selection driven by b's
+// own address, the same way vipMapWrite/vipMapDelete drive it from the
+// VIP's address. Config.Validate() already rejects a backend whose family
+// doesn't match its VIP's, so a given backend_id is written to exactly
+// one of the two maps for its whole lifetime.
 func (d *Dataplane) writeBackendInfoLocked(id uint32, b config.Backend) error {
-	beIP := net.ParseIP(b.Address).To4()
-	if beIP == nil {
-		return fmt.Errorf("backend %s is not IPv4", b.Address)
+	ip := net.ParseIP(b.Address)
+	if ip == nil {
+		return fmt.Errorf("backend %s: invalid address", b.Address)
 	}
 	var mac [6]byte
 	if b.MAC != "" {
@@ -374,15 +378,22 @@ func (d *Dataplane) writeBackendInfoLocked(id uint32, b config.Backend) error {
 		}
 		copy(mac[:], hw)
 	}
-	bi := bpfmaps.BackendInfo{Addr: ip4ToBE32(beIP), Port: htons(b.Port), Mac: mac}
-	if err := d.dp.Maps[bpfmaps.MapBackend].Update(&id, &bi, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("update backend_map[%d]: %w", id, err)
+	if ip4 := ip.To4(); ip4 != nil {
+		bi := bpfmaps.BackendInfo{Addr: ip4ToBE32(ip4), Port: htons(b.Port), Mac: mac}
+		if err := d.dp.Maps[bpfmaps.MapBackend].Update(&id, &bi, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update backend_map[%d]: %w", id, err)
+		}
+		return nil
+	}
+	bi6 := bpfmaps.BackendInfo6{Addr: ip6To16(ip), Port: htons(b.Port), Mac: mac}
+	if err := d.dp.Maps[bpfmaps.MapBackend6].Update(&id, &bi6, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("update backend_map6[%d]: %w", id, err)
 	}
 	return nil
 }
 
 // releaseBackendLocked drops one VIP's reference to a backend; the
-// backend_map/backend_health_map entries and its ID are only actually
+// backend_map(6)/backend_health_map entries and its ID are only actually
 // freed once no VIP references it anymore (refCount reaches 0) — e.g. a
 // backend shared by two VIPs, or one still draining in another VIP.
 func (d *Dataplane) releaseBackendLocked(name string, id uint32) {
@@ -395,7 +406,11 @@ func (d *Dataplane) releaseBackendLocked(name string, id uint32) {
 		return
 	}
 	delete(d.backendStates, id)
-	_ = d.dp.Maps[bpfmaps.MapBackend].Delete(&id)
+	if st.isV4 {
+		_ = d.dp.Maps[bpfmaps.MapBackend].Delete(&id)
+	} else {
+		_ = d.dp.Maps[bpfmaps.MapBackend6].Delete(&id)
+	}
 	down := uint8(bpfmaps.HealthDown)
 	_ = d.dp.Maps[bpfmaps.MapBackendHealth].Update(&id, &down, ebpf.UpdateAny) // ARRAY map: zero, can't delete
 	d.backendAlloc.Release(name)
@@ -435,9 +450,7 @@ func (d *Dataplane) RemoveVIP(key string) error {
 		d.releaseBackendLocked(name, id)
 	}
 
-	if vk, err := vipKeyBPF(entry.vip); err == nil {
-		_ = d.dp.Maps[bpfmaps.MapVIP].Delete(&vk)
-	}
+	_ = d.vipMapDelete(entry.vip)
 	var zero bpfmaps.ServiceConfig
 	_ = d.dp.Maps[bpfmaps.MapServiceConfig].Update(&entry.serviceID, &zero, ebpf.UpdateAny)
 
@@ -634,16 +647,54 @@ func backendName(b config.Backend) string {
 func VIPKey(vip config.VIP) string       { return vipKeyString(vip) }
 func BackendKey(b config.Backend) string { return backendName(b) }
 
-func vipKeyBPF(vip config.VIP) (bpfmaps.VipKey, error) {
-	vipIP := net.ParseIP(vip.Address).To4()
-	if vipIP == nil {
-		return bpfmaps.VipKey{}, fmt.Errorf("vip %s is not IPv4 — v0.1/v0.2 are IPv4-only", vip.Address)
+// vipMapWrite writes vip's vip_map (or, for an IPv6 VIP, vip_map6) entry
+// mapping its key to serviceID. Address-family selection is driven
+// entirely by vip.Address itself — Config.Validate() already rejects a
+// VIP whose backends don't share its own family, so nothing downstream
+// needs to re-derive family from anywhere but the VIP's own address.
+func (d *Dataplane) vipMapWrite(vip config.VIP, serviceID uint32) error {
+	ip := net.ParseIP(vip.Address)
+	if ip == nil {
+		return fmt.Errorf("vip %s: invalid address", vip.Address)
 	}
-	proto := uint8(6)
-	if vip.Protocol == config.ProtoUDP {
-		proto = 17
+	proto := protoByte(vip.Protocol)
+	if ip4 := ip.To4(); ip4 != nil {
+		vk := bpfmaps.VipKey{Addr: ip4ToBE32(ip4), Port: htons(vip.Port), Proto: proto}
+		if err := d.dp.Maps[bpfmaps.MapVIP].Update(&vk, serviceID, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update vip_map: %w", err)
+		}
+		return nil
 	}
-	return bpfmaps.VipKey{Addr: ip4ToBE32(vipIP), Port: htons(vip.Port), Proto: proto}, nil
+	vk := bpfmaps.VipKey6{Addr: ip6To16(ip), Port: htons(vip.Port), Proto: proto}
+	if err := d.dp.Maps[bpfmaps.MapVIP6].Update(&vk, serviceID, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("update vip_map6: %w", err)
+	}
+	return nil
+}
+
+// vipMapDelete removes vip's vip_map/vip_map6 entry — vipMapWrite's
+// delete-path counterpart. RemoveVIP's caller intentionally ignores this
+// error (matching its existing best-effort teardown style for every other
+// map it touches), so it isn't wrapped/logged here either.
+func (d *Dataplane) vipMapDelete(vip config.VIP) error {
+	ip := net.ParseIP(vip.Address)
+	if ip == nil {
+		return fmt.Errorf("vip %s: invalid address", vip.Address)
+	}
+	proto := protoByte(vip.Protocol)
+	if ip4 := ip.To4(); ip4 != nil {
+		vk := bpfmaps.VipKey{Addr: ip4ToBE32(ip4), Port: htons(vip.Port), Proto: proto}
+		return d.dp.Maps[bpfmaps.MapVIP].Delete(&vk)
+	}
+	vk := bpfmaps.VipKey6{Addr: ip6To16(ip), Port: htons(vip.Port), Proto: proto}
+	return d.dp.Maps[bpfmaps.MapVIP6].Delete(&vk)
+}
+
+func protoByte(p config.Protocol) uint8 {
+	if p == config.ProtoUDP {
+		return 17
+	}
+	return 6
 }
 
 // ip4ToBE32 converts an IPv4 address into the uint32 that, once cilium/ebpf
@@ -653,6 +704,17 @@ func vipKeyBPF(vip config.VIP) (bpfmaps.VipKey, error) {
 // BigEndian, precisely because the map encoding is little-endian: reading
 // network-order bytes back with LittleEndian.Uint32 is what undoes it.
 func ip4ToBE32(ip net.IP) uint32 { return binary.LittleEndian.Uint32(ip) }
+
+// ip6To16 returns ip's raw 16 network-order bytes directly — unlike
+// ip4ToBE32, no endian conversion is needed: the Go struct field is
+// itself a [16]byte array (not a multi-byte integer cilium/ebpf would
+// otherwise serialize host-endian), so the wire bytes and the map bytes
+// are identical either way.
+func ip6To16(ip net.IP) [16]byte {
+	var out [16]byte
+	copy(out[:], ip.To16())
+	return out
+}
 
 // htons mirrors C's htons on a little-endian host: the byte-swapped value,
 // once serialized little-endian by cilium/ebpf, reproduces the port's

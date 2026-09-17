@@ -76,3 +76,5 @@ jobs:
       run: sudo bash scripts/selftest-weighted.sh
     - name: Rate limit selftest (veth/netns)
       run: sudo bash scripts/selftest-ratelimit.sh
+    - name: IPv6 dataplane selftest (veth/netns, DSR + full-NAT)
+      run: sudo bash scripts/selftest-ipv6.sh

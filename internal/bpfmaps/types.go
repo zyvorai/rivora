@@ -20,6 +20,17 @@ const (
 	MapRateLimitConfig    = "rl_config_map"
 	MapRateLimitBuckets   = "rl_buckets_map"
 
+	// IPv6 siblings (v0.3) of the address-keyed-or-valued maps above.
+	// service_config_map, maglev_table, backend_health_map, stats_map,
+	// iface_mac_map and rl_config_map are shared as-is between v4 and v6
+	// — see bpf/rivora_common.h's comment above the VipKey6/etc. structs
+	// below for why.
+	MapVIP6                = "vip_map6"
+	MapBackend6            = "backend_map6"
+	MapConnectionAffinity6 = "connection_affinity_map6"
+	MapNATReverse6         = "nat_reverse_map6"
+	MapRateLimitBuckets6   = "rl_buckets_map6"
+
 	ProgXDPIngress  = "rivora_xdp_ingress"
 	ProgTCNATEgress = "rivora_tc_nat_egress"
 
@@ -121,4 +132,59 @@ type RLConfig struct {
 type RLBucket struct {
 	Tokens       uint64
 	LastRefillNs uint64
+}
+
+// VipKey6 — struct vip_key6. 20 bytes. Addr holds the address's raw
+// network-order bytes directly (unlike VipKey.Addr's uint32, a 16-byte
+// array needs no endian conversion — see internal/dataplane's
+// vipKeyBPF6/ip6To16 for why that's simpler than v4's ip4ToBE32 trick).
+type VipKey6 struct {
+	Addr  [16]byte
+	Port  uint16
+	Proto uint8
+	Pad   uint8
+}
+
+// BackendInfo6 — struct backend_info6. 24 bytes.
+type BackendInfo6 struct {
+	Addr [16]byte
+	Port uint16
+	Mac  [6]byte
+}
+
+// ConnKey6 — struct conn_key6. 40 bytes.
+type ConnKey6 struct {
+	Saddr [16]byte
+	Daddr [16]byte
+	Sport uint16
+	Dport uint16
+	Proto uint8
+	Pad   [3]uint8
+}
+
+// NATReverseKey6 — struct nat_reverse_key6. 40 bytes.
+type NATReverseKey6 struct {
+	BackendAddr [16]byte
+	ClientAddr  [16]byte
+	BackendPort uint16
+	ClientPort  uint16
+	Proto       uint8
+	Pad         [3]uint8
+}
+
+// NATReverseVal6 — struct nat_reverse_val6. 20 bytes.
+type NATReverseVal6 struct {
+	VIPAddr [16]byte
+	VIPPort uint16
+	Pad     [2]uint8
+}
+
+// Addr6Key — struct addr6_key. 16 bytes. rl_buckets_map6's key (the v6
+// sibling of rl_buckets_map's plain uint32 source-address key) — wrapped
+// in a struct on the C side because __type()'s macro expansion can't take
+// a raw array type directly; mirrored here for the same reason cilium/ebpf
+// needs a concrete Go type per map, not because Go itself needs the
+// wrapper.
+type Addr6Key struct {
+	Addr [16]byte
 }
