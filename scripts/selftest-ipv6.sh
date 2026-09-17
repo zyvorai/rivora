@@ -273,6 +273,19 @@ EOF
         pass "${mode}: failover removed BACKEND-2 from rotation, all traffic reached BACKEND-1"
     else
         fail "${mode}: expected all 10 probes on BACKEND-1 after failover, got ${seen1}/${seen2} — results: $(echo "$results" | tr '\n' ' ')"
+        # Temporary diagnostics for CI iteration — remove once the cause is
+        # understood. Dump backend health as rivorad itself sees it, plus
+        # its recent log, right at the point of failure.
+        echo "  [diag] /api/v1/backends:"
+        ip netns exec "$NS_LB" curl -s "http://127.0.0.1:9870/api/v1/backends" 2>&1 | sed 's/^/    /'
+        echo "  [diag] /api/v1/vips:"
+        ip netns exec "$NS_LB" curl -s "http://127.0.0.1:9870/api/v1/vips" 2>&1 | sed 's/^/    /'
+        echo "  [diag] rivorad log tail:"
+        tail -n 60 "$RIVORAD_LOG" 2>&1 | sed 's/^/    /'
+        echo "  [diag] bridge fdb:"
+        bridge fdb show br "$BR" 2>&1 | sed 's/^/    /'
+        echo "  [diag] client neigh table:"
+        ip netns exec "$NS_CLIENT" ip -6 neigh show 2>&1 | sed 's/^/    /'
     fi
 
     kill "$RIVORAD_PID" 2>/dev/null
