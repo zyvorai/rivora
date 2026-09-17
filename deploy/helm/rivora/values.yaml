@@ -64,7 +64,16 @@ rivorad:
     capabilities:
       add: ["BPF", "NET_ADMIN", "NET_RAW", "SYS_ADMIN"]
 
-  resources: {}
+  # Defaults sized for a modest VIP count; a node forwarding heavy traffic
+  # or running many VIPs (each gets its own health-check goroutines) should
+  # raise these. The dataplane itself is BPF/kernel-side work that doesn't
+  # count against the rivorad process's own cgroup.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
   nodeSelector: {}
   tolerations:
     - operator: Exists
@@ -78,10 +87,37 @@ controller:
   replicaCount: 2
   loadBalancerClass: ""
   workers: 2
-  resources: {}
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
   nodeSelector: {}
   tolerations: []
   affinity: {}
+  # podDisruptionBudget keeps at least one replica up during voluntary node
+  # drains/upgrades — without it, a node-drain that targets both replicas'
+  # nodes back-to-back could leave zero controllers running (both are hot
+  # standbys of a Lease-elected singleton, so even one is enough, but zero
+  # means no AddressPool IPAM/Service.Status writer at all).
+  # minAvailable must be < replicaCount, or a voluntary drain of the last
+  # evictable replica blocks forever — lower it (or disable the PDB) if you
+  # run controller.replicaCount: 1.
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  # networkPolicy restricts inbound traffic to the controller Pod to just
+  # its /metrics,/healthz,/readyz port — it's the only port the controller
+  # ever listens on. Ingress is allowed from any namespace by default (most
+  # clusters run their Prometheus/monitoring stack in a separate namespace);
+  # narrow via fromNamespaceSelector/fromPodSelector if yours needs it.
+  # No effect unless a NetworkPolicy controller (Calico, Cilium, etc.) is
+  # installed — like any other NetworkPolicy object, it's a no-op otherwise.
+  networkPolicy:
+    enabled: false
+    fromNamespaceSelector: {}
+    fromPodSelector: {}
 
 # gatewayApi enables the Gateway API (Gateway + TCPRoute/UDPRoute) control
 # loop on both rivorad and rivora-controller. Requires the Gateway API CRDs

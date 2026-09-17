@@ -94,6 +94,26 @@ func TestAuthMiddlewareRequiresToken(t *testing.T) {
 	})
 }
 
+func TestHealthzAlwaysOK(t *testing.T) {
+	s := &Server{}
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("GET /healthz: status %d, want 200", rec.Code)
+	}
+}
+
+func TestHealthzUnauthenticatedEvenWithAPIKey(t *testing.T) {
+	s := &Server{apiKey: "secret-token"}
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("GET /healthz with an API key configured: status %d, want 200 (probes carry no bearer token)", rec.Code)
+	}
+}
+
 func TestConsoleRoutesServe(t *testing.T) {
 	s := &Server{}
 	h := s.Handler()

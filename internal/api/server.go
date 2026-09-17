@@ -16,20 +16,52 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/zyvorai/rivora/internal/dataplane"
+	"github.com/zyvorai/rivora/internal/metrics"
 )
 
 var errUnauthorized = errors.New("unauthorized")
 
 type Server struct {
-	dp     *dataplane.Dataplane
-	apiKey string
+	dp       *dataplane.Dataplane
+	apiKey   string
+	registry *prometheus.Registry
 }
 
 // New creates a Server. apiKey may be empty, in which case the API is
 // unauthenticated (today's default behavior).
 func New(dp *dataplane.Dataplane, apiKey string) *Server {
-	return &Server{dp: dp, apiKey: apiKey}
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		metrics.NewDataplaneCollector(dp),
+	)
+	return &Server{dp: dp, apiKey: apiKey, registry: reg}
+}
+
+// MetricsHandler serves only /healthz, /readyz and /metrics — no console,
+// no /api/*. Meant for a second listener bound wider than the main API's
+// loopback-only address (see cmd/rivorad), since a hostNetwork Pod's
+// 127.0.0.1 isn't reachable from an in-cluster Prometheus or from kubelet
+// unless kubelet itself runs on that node — which it does for probes, but
+// a cluster-wide scraper needs this on a routable address instead.
+func (s *Server) MetricsHandler() http.Handler {
+	mux := http.NewServeMux()
+	s.registerObservabilityRoutes(mux)
+	return mux
+}
+
+func (s *Server) registerObservabilityRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("GET /readyz", s.handleReadyz)
+	if s.registry != nil {
+		mux.Handle("GET /metrics", promhttp.HandlerFor(s.registry, promhttp.HandlerOpts{}))
+	}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -37,6 +69,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/status", s.handleStatus)
 	mux.HandleFunc("GET /api/v1/vips", s.handleVIPs)
 	mux.HandleFunc("GET /api/v1/backends", s.handleBackends)
+	// /healthz, /readyz and /metrics are deliberately outside /api/* so they
+	// stay reachable without a bearer token — same routes MetricsHandler
+	// serves standalone, kept here too so a local kubelet/rivoractl caller
+	// can still reach them over the loopback-only API address.
+	s.registerObservabilityRoutes(mux)
 
 	uiFS, err := fs.Sub(uiContent, "ui")
 	if err != nil {
@@ -121,6 +158,27 @@ func (s *Server) handleBackends(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, st.Backends)
+}
+
+// handleHealthz is a liveness probe: it only proves the HTTP server is up
+// and answering, not that the dataplane itself is healthy (see handleReadyz
+// for that check).
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
+
+// handleReadyz is a readiness probe: it reads the BPF maps the same way
+// handleVIPs does, so a node whose pinned maps have gone missing or become
+// unreadable (e.g. /sys/fs/bpf/rivora-lb was tampered with) fails readiness
+// even though the process is still alive.
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.dp.Statuses(); err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

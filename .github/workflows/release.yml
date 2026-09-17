@@ -1,0 +1,72 @@
+# Publishes rivorad/rivora-controller images to GHCR on every version tag —
+# the gap the top-level README's roadmap calls out ("Still ahead:
+# publishing the container images the Helm chart's image.rivorad/
+# image.controller values reference"). Chart.yaml's image.*.tag defaults to
+# .Chart.AppVersion; override with --set image.rivorad.tag=<tag> to pin to
+# one of these releases explicitly.
+name: Release images
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and push (e.g. v0.3.0); defaults to the triggering git tag'
+        required: false
+permissions:
+  contents: read
+jobs:
+  build-push-sign:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # cosign keyless (OIDC) signing
+    strategy:
+      matrix:
+        include:
+          - image: rivora-rivorad
+            dockerfile: Dockerfile.rivorad
+          - image: rivora-controller
+            dockerfile: Dockerfile.rivora-controller
+    steps:
+    - uses: actions/checkout@v4
+    - name: Resolve tag
+      id: tag
+      run: echo "value=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+    - uses: docker/setup-buildx-action@v3
+    - uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - uses: docker/metadata-action@v5
+      id: meta
+      with:
+        images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+        tags: |
+          type=raw,value=${{ steps.tag.outputs.value }}
+          type=raw,value=latest
+    - uses: docker/build-push-action@v6
+      id: build
+      with:
+        context: .
+        file: ${{ matrix.dockerfile }}
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+    - name: Smoke test (binary starts, -version exits without touching BPF)
+      run: docker run --rm "ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}" -version
+    - uses: anchore/sbom-action@v0
+      with:
+        image: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}
+        artifact-name: ${{ matrix.image }}-sbom.spdx.json
+        output-file: ${{ matrix.image }}-sbom.spdx.json
+    - uses: sigstore/cosign-installer@v3
+    - name: Sign image and attach SBOM attestation (keyless)
+      run: |
+        cosign sign --yes "ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}"
+        cosign attest --yes \
+          --predicate "${{ matrix.image }}-sbom.spdx.json" \
+          --type spdxjson \
+          "ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}"

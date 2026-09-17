@@ -19,6 +19,10 @@ spec:
     metadata:
       labels:
         {{- include "rivora.rivorad.selectorLabels" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9871"
+        prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: {{ include "rivora.rivorad.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
@@ -60,6 +64,25 @@ spec:
             privileged: {{ .Values.rivorad.securityContext.privileged }}
             capabilities:
               {{- toYaml .Values.rivorad.securityContext.capabilities | nindent 14 }}
+          ports:
+            - name: api
+              containerPort: 9870
+              protocol: TCP
+            - name: metrics
+              containerPort: 9871
+              protocol: TCP
+          # The metrics port (always plain HTTP, no auth — see -metrics-listen
+          # in cmd/rivorad) is used for probes too, not the main API port:
+          # rivorad runs hostNetwork, so the API's 127.0.0.1-only listener
+          # isn't reachable via the Pod IP kubelet's default httpGet targets.
+          livenessProbe:
+            httpGet: {path: /healthz, port: metrics}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /readyz, port: metrics}
+            initialDelaySeconds: 5
+            periodSeconds: 10
           volumeMounts:
             - name: bpffs
               mountPath: /sys/fs/bpf

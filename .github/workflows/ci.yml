@@ -19,6 +19,23 @@ jobs:
     # speaker VIP selection) plus the rest of the tree in one pass.
     - run: go test -race ./...
     - run: gofmt -l . | tee /tmp/fmt.out && [ ! -s /tmp/fmt.out ]
+  security:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
+      with: {go-version: '1.27.1', cache: true}
+    - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+    - name: govulncheck (fail only on unaccepted findings)
+      run: |
+        govulncheck ./... > govulncheck.out 2>&1 || true
+        cat govulncheck.out
+        # GO-2026-4736 (gobgp NEXT_HOP DoS) has no upstream fix yet — tracked
+        # as an accepted risk in SECURITY.md. Fail the job on anything else.
+        if grep -A1 '^Vulnerability #' govulncheck.out | grep -oE 'GO-[0-9]{4}-[0-9]+' | sort -u | grep -v -x 'GO-2026-4736' | grep -q .; then
+          echo "::error::govulncheck found vulnerabilities beyond the accepted GO-2026-4736"
+          exit 1
+        fi
   helm:
     runs-on: ubuntu-latest
     steps:
@@ -53,6 +70,15 @@ jobs:
           --set gatewayClass.create=true)
         echo "$out" | grep -q -- '-gateway-api=true'
         echo "$out" | grep -q 'kind: GatewayClass'
+    - name: Helm template PDB + NetworkPolicy
+      run: |
+        out=$(helm template rivora deploy/helm/rivora \
+          --set rivorad.interface=eth0 \
+          --set controller.networkPolicy.enabled=true \
+          --set 'controller.networkPolicy.fromNamespaceSelector.matchLabels.kubernetes\.io/metadata\.name=monitoring')
+        echo "$out" | grep -q 'kind: PodDisruptionBudget'
+        echo "$out" | grep -q 'kind: NetworkPolicy'
+        echo "$out" | grep -q 'kubernetes.io/metadata.name: monitoring'
   crd:
     runs-on: ubuntu-latest
     steps:

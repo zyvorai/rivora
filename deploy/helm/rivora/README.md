@@ -164,6 +164,26 @@ advertise/withdraw model and a real caveat: in full-NAT mode (the
 router-side ECMP rehash can disrupt in-flight connections on a node that's
 rebalanced away from, since connection state isn't shared across nodes.
 
+## Observability
+
+Both `rivorad` and `rivora-controller` serve `/healthz`, `/readyz` and
+`/metrics` (Prometheus text format) on a plain-HTTP, no-auth port `9871` —
+wired into the DaemonSet/Deployment's liveness/readiness probes and
+annotated `prometheus.io/scrape: "true"` for annotation-based scrape
+configs. `rivorad` runs `hostNetwork: true`, which is why this is a
+*separate* port from its main API (`9870`, loopback-only, optionally
+TLS'd/authenticated per [Securing the API](../../../README.md#securing-the-api)) —
+127.0.0.1 on a hostNetwork Pod is the node's own loopback, unreachable to
+an in-cluster Prometheus. `rivora_*` metrics cover per-VIP/backend
+packets/bytes/health from the BPF maps; `rivora_controller_leader` reports
+which `rivora-controller` replica currently holds the leader-election
+Lease.
+
+If you run the Prometheus Operator instead of annotation-based scraping,
+add your own `PodMonitor` targeting port `9871` on both workloads — this
+chart doesn't bundle `monitoring.coreos.com` CRDs, the same policy it
+applies to the Gateway API CRDs above.
+
 ## Values reference (IPv6-related)
 
 | Path | Default | Notes |
@@ -175,6 +195,8 @@ rebalanced away from, since connection state isn't shared across nodes.
 | `bgp.enabled` | `false` | Per-node BGP speaker |
 | `bgp.ipv6NextHop` | `""` | Required for IPv6 `/128` ads |
 | `addressPools[]` | `[]` | Seeded `AddressPool` CRs; IPv6 `/64` OK |
+| `controller.podDisruptionBudget.enabled` / `.minAvailable` | `true` / `1` | Keeps a controller replica up during node drains |
+| `controller.networkPolicy.enabled` | `false` | Restrict ingress to the controller's metrics port |
 
 Full defaults and comments: [`values.yaml`](values.yaml).
 

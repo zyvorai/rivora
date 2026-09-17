@@ -14,6 +14,10 @@ spec:
     metadata:
       labels:
         {{- include "rivora.controller.selectorLabels" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9871"
+        prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: {{ include "rivora.controller.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
@@ -33,6 +37,19 @@ spec:
             - -loadbalancer-class={{ .Values.controller.loadBalancerClass }}
             - -workers={{ .Values.controller.workers }}
             - -gateway-api={{ .Values.gatewayApi.enabled }}
+            - -metrics-listen=:9871
+          ports:
+            - name: metrics
+              containerPort: 9871
+              protocol: TCP
+          livenessProbe:
+            httpGet: {path: /healthz, port: metrics}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /readyz, port: metrics}
+            initialDelaySeconds: 5
+            periodSeconds: 10
           env:
             - name: POD_NAMESPACE
               valueFrom:

@@ -15,11 +15,15 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
@@ -32,12 +36,13 @@ var version = "dev"
 
 func main() {
 	var (
-		kubeconfig = flag.String("kubeconfig", "", "path to a kubeconfig file (default: in-cluster config, falling back to $KUBECONFIG / ~/.kube/config)")
-		namespace  = flag.String("namespace", envOr("POD_NAMESPACE", "rivora-system"), "namespace the leader-election Lease lives in")
-		lbClass    = flag.String("loadbalancer-class", "", "only manage Services whose spec.loadBalancerClass matches this value (default: services with no class set)")
-		workers    = flag.Int("workers", 2, "number of concurrent Service reconcile workers")
-		gatewayAPI = flag.Bool("gateway-api", false, "also watch GatewayClass/Gateway and assign addresses to managed Gateways; requires the Gateway API CRDs to be installed")
-		showVer    = flag.Bool("version", false, "print version and exit")
+		kubeconfig    = flag.String("kubeconfig", "", "path to a kubeconfig file (default: in-cluster config, falling back to $KUBECONFIG / ~/.kube/config)")
+		namespace     = flag.String("namespace", envOr("POD_NAMESPACE", "rivora-system"), "namespace the leader-election Lease lives in")
+		lbClass       = flag.String("loadbalancer-class", "", "only manage Services whose spec.loadBalancerClass matches this value (default: services with no class set)")
+		workers       = flag.Int("workers", 2, "number of concurrent Service reconcile workers")
+		gatewayAPI    = flag.Bool("gateway-api", false, "also watch GatewayClass/Gateway and assign addresses to managed Gateways; requires the Gateway API CRDs to be installed")
+		metricsListen = flag.String("metrics-listen", ":9871", "address the /metrics, /healthz, /readyz endpoints listen on")
+		showVer       = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
 
@@ -69,6 +74,25 @@ func main() {
 
 	reconciler, factory, dynFactory := ipamctrl.New(clients.Clientset, clients.Dynamic, *lbClass, *gatewayAPI, logger)
 
+	leaderGauge := prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "rivora", Subsystem: "controller", Name: "leader",
+		Help: "Whether this replica currently holds the leader-election Lease (1) or not (0).",
+	})
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(leaderGauge, collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+
+	metricsMux := http.NewServeMux()
+	metricsMux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	metricsMux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	metricsMux.Handle("GET /metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+	metricsSrv := &http.Server{Addr: *metricsListen, Handler: metricsMux}
+	go func() {
+		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("metrics server", "err", err)
+		}
+	}()
+	defer metricsSrv.Close()
+
 	lock := &resourcelock.LeaseLock{
 		LeaseMeta: metav1.ObjectMeta{Name: "rivora-controller", Namespace: *namespace},
 		Client:    clients.Clientset.CoordinationV1(),
@@ -86,12 +110,14 @@ func main() {
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
 				logger.Info("acquired leadership", "identity", identity)
+				leaderGauge.Set(1)
 				if err := reconciler.Run(ctx, factory, dynFactory, *workers); err != nil {
 					logger.Error("reconciler exited", "err", err)
 				}
 			},
 			OnStoppedLeading: func() {
 				logger.Info("lost leadership", "identity", identity)
+				leaderGauge.Set(0)
 			},
 			OnNewLeader: func(newIdentity string) {
 				if newIdentity != identity {

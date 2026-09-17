@@ -46,14 +46,15 @@ func main() {
 		bpfDir     = flag.String("bpf-dir", "/usr/local/share/rivora/bpf", "directory containing xdp_ingress.o and tc_nat.o")
 		showVer    = flag.Bool("version", false, "print version and exit")
 
-		kubeMode   = flag.Bool("kubernetes", false, "run the Kubernetes reconciler + ARP speaker instead of loading -config; VIPs come from Service/EndpointSlice")
-		kubeconfig = flag.String("kubeconfig", "", "path to a kubeconfig file (default: in-cluster config, falling back to $KUBECONFIG / ~/.kube/config); only used with -kubernetes")
-		ifaceFlag  = flag.String("interface", "", "network interface to attach to (required with -kubernetes; static-YAML mode reads this from -config instead)")
-		apiListen  = flag.String("api-listen", "127.0.0.1:9870", "local API listen address; only used with -kubernetes (static-YAML mode reads this from -config instead)")
-		lbClass    = flag.String("loadbalancer-class", "", "only manage Services whose spec.loadBalancerClass matches this value (default: services with no class set); only used with -kubernetes")
-		namespace  = flag.String("namespace", envOr("POD_NAMESPACE", "rivora-system"), "namespace the ARP speaker's leader-election Lease lives in; only used with -kubernetes")
-		workers    = flag.Int("workers", 2, "number of concurrent Service reconcile workers; only used with -kubernetes")
-		speakerOn  = flag.Bool("speaker", true, "run the L2 ARP+NDP speaker (requires CAP_NET_RAW); only used with -kubernetes")
+		kubeMode      = flag.Bool("kubernetes", false, "run the Kubernetes reconciler + ARP speaker instead of loading -config; VIPs come from Service/EndpointSlice")
+		kubeconfig    = flag.String("kubeconfig", "", "path to a kubeconfig file (default: in-cluster config, falling back to $KUBECONFIG / ~/.kube/config); only used with -kubernetes")
+		ifaceFlag     = flag.String("interface", "", "network interface to attach to (required with -kubernetes; static-YAML mode reads this from -config instead)")
+		apiListen     = flag.String("api-listen", "127.0.0.1:9870", "local API listen address; only used with -kubernetes (static-YAML mode reads this from -config instead)")
+		metricsListen = flag.String("metrics-listen", ":9871", "listen address for /healthz, /readyz and /metrics — unlike -api-listen this is meant to be routable from outside the node (e.g. an in-cluster Prometheus), since rivorad's hostNetwork Pod makes 127.0.0.1 unreachable except from the local kubelet")
+		lbClass       = flag.String("loadbalancer-class", "", "only manage Services whose spec.loadBalancerClass matches this value (default: services with no class set); only used with -kubernetes")
+		namespace     = flag.String("namespace", envOr("POD_NAMESPACE", "rivora-system"), "namespace the ARP speaker's leader-election Lease lives in; only used with -kubernetes")
+		workers       = flag.Int("workers", 2, "number of concurrent Service reconcile workers; only used with -kubernetes")
+		speakerOn     = flag.Bool("speaker", true, "run the L2 ARP+NDP speaker (requires CAP_NET_RAW); only used with -kubernetes")
 
 		gatewayAPIOn = flag.Bool("gateway-api", false, "also watch GatewayClass/Gateway/TCPRoute/UDPRoute and program their VIPs; only used with -kubernetes; requires the Gateway API CRDs to be installed")
 
@@ -310,7 +311,22 @@ func main() {
 	tlsKey := os.Getenv("RIVORA_TLS_KEY")
 	selfSigned := os.Getenv("RIVORA_TLS_SELF_SIGNED") != ""
 
-	srv := &http.Server{Addr: cfg.APIListen, Handler: api.New(plane, apiKey).Handler()}
+	apiServer := api.New(plane, apiKey)
+
+	// metricsSrv is deliberately separate from the (loopback-only, optionally
+	// TLS'd/authenticated) API server above: rivorad runs hostNetwork, so
+	// 127.0.0.1 is unreachable to anything but the local kubelet, and an
+	// in-cluster Prometheus needs a routable, plain-HTTP address instead.
+	// /healthz, /readyz and /metrics carry no sensitive data, so no auth here.
+	metricsSrv := &http.Server{Addr: *metricsListen, Handler: apiServer.MetricsHandler()}
+	go func() {
+		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("metrics server", "err", err)
+		}
+	}()
+	defer metricsSrv.Close()
+
+	srv := &http.Server{Addr: cfg.APIListen, Handler: apiServer.Handler()}
 	tlsMode := "off"
 	switch {
 	case tlsCert != "" && tlsKey != "":
@@ -323,6 +339,7 @@ func main() {
 		authMode = "on"
 	}
 	logger.Info("api listening", "addr", cfg.APIListen, "tls", tlsMode, "auth", authMode)
+	logger.Info("metrics listening", "addr", *metricsListen)
 
 	go func() {
 		var err error

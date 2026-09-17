@@ -41,6 +41,27 @@ The CRD lives at chart root `crds/`. Helm installs it on first
 kubectl apply -f deploy/helm/rivora/crds/addresspool-crd.yaml
 ```
 
+## Observability
+
+Both workloads serve `/healthz`, `/readyz` and `/metrics` (Prometheus text
+format) on a plain-HTTP, no-auth port `9871` — wired into the
+DaemonSet/Deployment's liveness/readiness probes and annotated
+`prometheus.io/scrape: "true"`. This is separate from `rivorad`'s main API
+port (`9870`, loopback-only, hostNetwork) because a hostNetwork Pod's
+127.0.0.1 isn't reachable from an in-cluster Prometheus. `rivora_*`
+metrics cover per-VIP/backend packets/bytes/health from the BPF maps;
+`rivora_controller_leader` reports which `rivora-controller` replica
+holds the leader-election Lease. See the [production
+runbook](../operations/runbook.md) for how to read these when something's
+wrong.
+
+## Availability
+
+`controller.podDisruptionBudget` (enabled by default, `minAvailable: 1`)
+keeps a `rivora-controller` replica up during voluntary node drains.
+`controller.networkPolicy` (off by default) restricts ingress to the
+controller's metrics port when a NetworkPolicy controller is installed.
+
 ## Values (IPv6-related)
 
 | Path | Default | Notes |
@@ -51,5 +72,7 @@ kubectl apply -f deploy/helm/rivora/crds/addresspool-crd.yaml
 | `bgp.enabled` | `false` | |
 | `bgp.ipv6NextHop` | `""` | Required for IPv6 `/128` ads |
 | `addressPools[]` | `[]` | Seeded pools; IPv6 `/64` OK |
+| `controller.podDisruptionBudget.enabled` | `true` | Keeps a replica up during drains |
+| `controller.networkPolicy.enabled` | `false` | Restrict ingress to the metrics port |
 
 Full comments: [`values.yaml`](https://github.com/zyvorai/rivora/blob/main/deploy/helm/rivora/values.yaml).
