@@ -203,8 +203,21 @@ test_mode() {
         # addressed to it) — see the top-of-file comment for why this
         # script sidesteps live NDP resolution rather than trying to
         # suppress backend NDP responses the way selftest.sh disables ARP.
-        ip netns exec "$NS_BE1" ip -6 addr add "${VIP}/128" dev lo
-        ip netns exec "$NS_BE2" ip -6 addr add "${VIP}/128" dev lo
+        # scope host (not the default scope global) is the standard fix
+        # for a well-known LVS-DR/DSR gotcha, worse for IPv6 than IPv4:
+        # without it, the kernel's RFC 6724 source-address selection can
+        # pick this lo-bound VIP as the SOURCE address for a backend's
+        # *unrelated* outbound traffic to other hosts (e.g. replying to
+        # the LB's own health-check probe) merely because it's a locally
+        # configured address, not because it's actually appropriate —
+        # breaking that traffic in a way that looks like total packet
+        # loss from the sender's side. scope host makes the kernel treat
+        # it as loopback-only, never eligible as an outbound source
+        # toward another host. (v4's selftest.sh doesn't need this: IPv4
+        # source-address selection is far simpler and doesn't have this
+        # failure mode in practice.)
+        ip netns exec "$NS_BE1" ip -6 addr add "${VIP}/128" dev lo scope host
+        ip netns exec "$NS_BE2" ip -6 addr add "${VIP}/128" dev lo scope host
         ip netns exec "$NS_LB" ip -6 addr add "${VIP}/128" dev veth6-lb
         ip netns exec "$NS_CLIENT" ip -6 neigh add "$VIP" lladdr "$lb_mac" dev veth6-cli nud permanent
         cat > "$CONFIG" <<EOF
