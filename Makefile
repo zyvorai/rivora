@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 .PHONY: build bpf test fmt vet selftest selftest-multivip selftest-weighted selftest-ratelimit selftest-ipv6 selftest-ndp selftest-all \
-	docs-serve docs-build \
+	web web-install docs-serve docs-build \
 	deploy deploy-remote deploy-remote-quick deploy-remote-preflight deploy-remote-verify deploy-remote-uninstall deploy-remote-fleet
 
 CLANG ?= clang
@@ -10,7 +10,17 @@ ARCH  := $(shell uname -m)
 
 all: bpf build
 
+web-install:
+	cd web && npm install
+
+web: ## Build Netra-matching console into internal/api/ui (embedded by rivorad)
+	cd web && npm run build
+
 build:
+	@if [ ! -f internal/api/ui/index.html ]; then \
+		echo "internal/api/ui missing — building web console…"; \
+		$(MAKE) web; \
+	fi
 	go build -o bin/rivorad ./cmd/rivorad
 	go build -o bin/rivoractl ./cmd/rivoractl
 	go build -o bin/rivora-doctor ./cmd/rivora-doctor

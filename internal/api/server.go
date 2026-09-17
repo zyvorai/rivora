@@ -1,17 +1,18 @@
 // Copyright 2026 Zyvor AI Labs · https://zyvor.dev
 // SPDX-License-Identifier: Apache-2.0
 
-// Package api serves rivorad's local HTTP API — the same shape rivoractl
-// and netractl both expect: plain JSON over a loopback listener. Auth is
+// Package api serves rivorad's HTTP API and embedded web console. Auth is
 // off by default (matching netrad's own binary-level default) but, when an
-// API key is configured, every route requires a matching bearer token —
-// same constant-time-compare shape as netrad's validBearer().
+// API key is configured, every /api/* route requires a matching bearer
+// token — same constant-time-compare shape as netrad's validBearer(). The
+// console UI itself stays reachable so the browser can collect credentials.
 package api
 
 import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"net/http"
 	"strings"
 
@@ -36,6 +37,35 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/status", s.handleStatus)
 	mux.HandleFunc("GET /api/v1/vips", s.handleVIPs)
 	mux.HandleFunc("GET /api/v1/backends", s.handleBackends)
+
+	uiFS, err := fs.Sub(uiContent, "ui")
+	if err != nil {
+		panic("api: embed ui: " + err.Error())
+	}
+	fileServer := http.FileServer(http.FS(uiFS))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			http.NotFound(w, r)
+			return
+		}
+		// SPA: unknown paths fall back to index.html (Netra console shape).
+		path := strings.TrimPrefix(r.URL.Path, "/")
+		if path == "" {
+			path = "index.html"
+		}
+		f, err := uiFS.Open(path)
+		if err != nil {
+			http.ServeFileFS(w, r, uiFS, "index.html")
+			return
+		}
+		_ = f.Close()
+		fileServer.ServeHTTP(w, r)
+	})
+
 	return s.auth(mux)
 }
 
@@ -44,6 +74,10 @@ func (s *Server) auth(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/") {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if !s.validBearer(r.Header.Get("Authorization")) {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="rivorad"`)
 			writeError(w, http.StatusUnauthorized, errUnauthorized)

@@ -11,3 +11,7 @@
 # MkDocs (legacy; site is Docusaurus under website/)
 /site/
 .venv-docs/
+
+# Rivora console (Vite)
+web/node_modules/
+web/dist/

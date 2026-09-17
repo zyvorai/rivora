@@ -6,17 +6,19 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+EnvironmentFile=-/etc/rivora/rivorad.env
+# Dummy dataplane iface so XDP never attaches to the public NIC (eno8303 /
+# Cilium host). Safe for API-only / lab remote access; replace interface
+# in /etc/rivora/config.yaml when you wire real VIPs.
+ExecStartPre=-/usr/sbin/ip link add rivora0 type dummy
+ExecStartPre=-/usr/sbin/ip link set rivora0 up
 ExecStart=/usr/local/bin/rivorad -config /etc/rivora/config.yaml -bpf-dir /usr/local/share/rivora/bpf
-# The local API (127.0.0.1:9870 by default) is plain HTTP and unauthenticated
-# unless these are set. Prefer an EnvironmentFile with restrictive
-# permissions over inlining the key here. See README.md#securing-the-api.
-#Environment=RIVORA_API_KEY=change-me
-#Environment=RIVORA_TLS_SELF_SIGNED=1
-#Environment=RIVORA_TLS_CERT=/etc/rivora/tls.crt
-#Environment=RIVORA_TLS_KEY=/etc/rivora/tls.key
 Restart=on-failure
 RestartSec=2
 AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+# Needed for ExecStartPre ip link + BPF attach when AmbientCapabilities
+# alone is insufficient on some distros.
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_NET_BIND_SERVICE
 User=root
 
 [Install]

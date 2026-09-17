@@ -5,6 +5,7 @@ package api
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -80,6 +81,33 @@ func TestAuthMiddlewareRequiresToken(t *testing.T) {
 		handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Errorf("got status %d, want 200", rec.Code)
+		}
+	})
+
+	t.Run("ui path stays public", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("got status %d, want 200 (console must load without a bearer)", rec.Code)
+		}
+	})
+}
+
+func TestConsoleRoutesServe(t *testing.T) {
+	s := &Server{}
+	h := s.Handler()
+
+	t.Run("root serves index", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /: status %d", rec.Code)
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, "Rivora") && !strings.Contains(body, "root") {
+			t.Errorf("GET /: unexpected body prefix %q", body[:min(80, len(body))])
 		}
 	})
 }

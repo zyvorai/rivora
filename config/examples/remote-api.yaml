@@ -1,0 +1,28 @@
+# Lab / remote-access config: serve the API on all interfaces so a laptop
+# can open https://<host>:9870/api/v1/status without an SSH tunnel.
+# Pair with RIVORA_TLS_SELF_SIGNED=1 in /etc/rivora/rivorad.env (default
+# from deploy/systemd/rivorad.env.example).
+#
+# XDP attaches to the rivora0 dummy interface created by the systemd unit
+# (not the public NIC). The VIP below is a private placeholder — replace
+# when you wire real backends.
+#
+# See README.md#securing-the-api before exposing this on the public internet.
+
+interface: rivora0
+apiListen: 0.0.0.0:9870
+
+healthCheck:
+  interval: 3s
+  timeout: 1s
+  failThreshold: 2
+  successThreshold: 2
+
+vips:
+  - address: 10.255.255.1
+    port: 80
+    protocol: tcp
+    mode: nat
+    backends:
+      - address: 127.0.0.1
+        port: 9

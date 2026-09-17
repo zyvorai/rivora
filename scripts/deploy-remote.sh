@@ -248,8 +248,17 @@ sync_files() {
         info "Skipping rsync (--skip-sync)"
         return 0
     fi
+    if [ -f "${PROJECT_DIR}/web/package.json" ]; then
+        info "Building web console (Netra-matching UX)…"
+        if [ "$DRY_RUN" = true ]; then
+            dry "would run: make -C ${PROJECT_DIR} web"
+        else
+            (cd "${PROJECT_DIR}" && make web) || fail "web console build failed (need Node.js in web/)"
+        fi
+    fi
     _ssh "mkdir -p '${REMOTE_DIR}'"
     _rsync --exclude '.git' --exclude 'bin' --exclude '*.o' \
+        --exclude 'web/node_modules' --exclude 'website/node_modules' --exclude 'website/build' \
         "${PROJECT_DIR}/" "${TARGET_USER}@${TARGET_HOST}:${REMOTE_DIR}/"
     ok "Source synced to ${REMOTE_DIR}"
 }
@@ -299,11 +308,10 @@ $SUDO install -m755 bin/rivoractl /usr/local/bin/rivoractl
 $SUDO install -m755 bin/rivora-doctor /usr/local/bin/rivora-doctor
 $SUDO mkdir -p /usr/local/share/rivora/bpf /etc/rivora
 $SUDO install -m644 bpf/xdp_ingress.o bpf/tc_nat.o /usr/local/share/rivora/bpf/
-if [ ! -f /etc/rivora/config.yaml ]; then
-    $SUDO install -m644 config/examples/single-vip.yaml /etc/rivora/config.yaml.example
-fi
-$SUDO install -m644 deploy/systemd/rivorad.service /etc/systemd/system/rivorad.service 2>/dev/null || true
-$SUDO systemctl daemon-reload 2>/dev/null || true
+$SUDO install -m644 config/examples/single-vip.yaml /etc/rivora/config.yaml.example
+$SUDO install -m644 config/examples/remote-api.yaml /etc/rivora/remote-api.yaml.example
+# Enable systemd with a publicly bound API (0.0.0.0:9870) for laptop access.
+bash scripts/install-systemd.sh
 echo "Installed: $(rivorad -version 2>/dev/null || echo ok)"
 REMOTE
 }
@@ -373,6 +381,7 @@ print_deployment_summary() {
     echo "  log:    ${DEPLOY_LOG}"
     echo "  remote: ${REMOTE_DIR}"
     echo ""
+    echo "  UX URL: https://${TARGET_HOST}:9870/  (self-signed console; curl -k for API)"
     echo "  ssh ${TARGET_USER}@${TARGET_HOST}"
     echo "  rivora-doctor"
     echo "  sudo bash ${REMOTE_DIR}/scripts/selftest.sh"
