@@ -114,7 +114,7 @@ jobs:
       run: |
         name="rivora_${{ steps.tag.outputs.value }}_${{ matrix.goos }}_${{ matrix.goarch }}"
         cosign sign-blob --yes --bundle "${name}.tar.gz.cosign-bundle" "${name}.tar.gz"
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v7
       with:
         name: rivora-cli-${{ matrix.goos }}-${{ matrix.goarch }}
         path: |
