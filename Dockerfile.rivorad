@@ -11,11 +11,12 @@ COPY bpf/ bpf/
 RUN make bpf
 
 FROM golang:1.27-bookworm AS go-builder
+ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o /out/rivorad ./cmd/rivorad
+RUN CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /out/rivorad ./cmd/rivorad
 
 FROM gcr.io/distroless/static-debian12
 COPY --from=go-builder /out/rivorad /usr/local/bin/rivorad
