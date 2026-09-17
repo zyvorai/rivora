@@ -4,7 +4,7 @@
 .PHONY: build bpf test fmt vet selftest selftest-multivip selftest-weighted selftest-ratelimit selftest-ipv6 selftest-ndp selftest-all \
 	web web-install docs-serve docs-build \
 	deploy deploy-remote deploy-remote-quick deploy-remote-preflight deploy-remote-verify deploy-remote-uninstall deploy-remote-fleet \
-	sync-chart check-chart-sync build-cli release-cli
+	sync-chart check-chart-sync build-cli release-cli install
 
 CLANG ?= clang
 ARCH  := $(shell uname -m)
@@ -30,6 +30,19 @@ build: sync-chart
 
 build-cli: sync-chart ## Build just the rivora cluster-install CLI
 	go build -o bin/rivora ./cmd/rivora
+
+# Usage: make install [INSTALL_DIR=~/bin]. Same install-vs-sudo logic as
+# scripts/install-cli.sh, for the local-build path instead of a downloaded
+# release tarball.
+INSTALL_DIR ?= /usr/local/bin
+install: build-cli
+	@if [ -w "$(INSTALL_DIR)" ]; then \
+		install -m755 bin/rivora "$(INSTALL_DIR)/rivora"; \
+	else \
+		echo "sudo required to write to $(INSTALL_DIR)"; \
+		sudo install -m755 bin/rivora "$(INSTALL_DIR)/rivora"; \
+	fi
+	@echo "installed $(INSTALL_DIR)/rivora ($$($(INSTALL_DIR)/rivora version))"
 
 # Cross-compiles the rivora CLI for every platform the release workflow
 # publishes (.github/workflows/release.yml's build-cli job) — lets you
