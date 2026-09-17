@@ -34,7 +34,7 @@ struct {
     __type(value, struct nat_reverse_val6);
 } nat_reverse_map6 SEC(".maps");
 
-static __always_inline int handle_ipv4(void *data, void *data_end, struct ethhdr *eth)
+static __always_inline int handle_ipv4(void *data_end, struct ethhdr *eth)
 {
     struct iphdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end)
@@ -108,7 +108,7 @@ static __always_inline int handle_ipv4(void *data, void *data_end, struct ethhdr
  * handle_ipv6 documents: no IP-header checksum to touch at all (IPv6
  * dropped it), and a UDP checksum is never "unset" over IPv6 so it's
  * always updated unconditionally, unlike v4's "if (u->check != 0)" skip. */
-static __always_inline int handle_ipv6(void *data, void *data_end, struct ethhdr *eth)
+static __always_inline int handle_ipv6(void *data_end, struct ethhdr *eth)
 {
     struct ipv6hdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end)
@@ -181,9 +181,9 @@ int rivora_tc_nat_egress(struct __sk_buff *skb)
         return TC_ACT_OK;
 
     if (eth->h_proto == __constant_htons(ETH_P_IP))
-        return handle_ipv4(data, data_end, eth);
+        return handle_ipv4(data_end, eth);
     if (eth->h_proto == __constant_htons(ETH_P_IPV6))
-        return handle_ipv6(data, data_end, eth);
+        return handle_ipv6(data_end, eth);
     return TC_ACT_OK;
 }
 
