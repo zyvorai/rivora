@@ -203,21 +203,25 @@ test_mode() {
         # addressed to it) — see the top-of-file comment for why this
         # script sidesteps live NDP resolution rather than trying to
         # suppress backend NDP responses the way selftest.sh disables ARP.
-        # scope host (not the default scope global) is the standard fix
-        # for a well-known LVS-DR/DSR gotcha, worse for IPv6 than IPv4:
-        # without it, the kernel's RFC 6724 source-address selection can
-        # pick this lo-bound VIP as the SOURCE address for a backend's
-        # *unrelated* outbound traffic to other hosts (e.g. replying to
-        # the LB's own health-check probe) merely because it's a locally
-        # configured address, not because it's actually appropriate —
-        # breaking that traffic in a way that looks like total packet
-        # loss from the sender's side. scope host makes the kernel treat
-        # it as loopback-only, never eligible as an outbound source
-        # toward another host. (v4's selftest.sh doesn't need this: IPv4
-        # source-address selection is far simpler and doesn't have this
-        # failure mode in practice.)
-        ip netns exec "$NS_BE1" ip -6 addr add "${VIP}/128" dev lo scope host
-        ip netns exec "$NS_BE2" ip -6 addr add "${VIP}/128" dev lo scope host
+        #
+        # `scope host` (attempted first) turned out to be a no-op for
+        # IPv6: unlike IPv4, where scope is an admin-assignable label,
+        # IPv6 scope is inherent to the address prefix itself (RFC 4291)
+        # and the kernel silently keeps reporting this ULA as scope
+        # global regardless of what's requested. The actual fix for "make
+        # the kernel never pick this address as an outbound source, while
+        # still accepting traffic addressed to it" is `preferred_lft 0`
+        # (RFC 6724 rule 3: avoid deprecated addresses as a source) — a
+        # deprecated address still receives, it just won't be chosen to
+        # originate new outbound connections. This is the actual, likely
+        # cause of the "total packet loss for the LB's own health-check
+        # probe" symptom: the kernel's RFC 6724 source-address selection
+        # picking this lo-bound VIP as the SOURCE for a backend's
+        # unrelated outbound traffic to another host. (v4's selftest.sh
+        # doesn't need this: IPv4 source-address selection is far simpler
+        # and doesn't have this failure mode in practice.)
+        ip netns exec "$NS_BE1" ip -6 addr add "${VIP}/128" dev lo preferred_lft 0
+        ip netns exec "$NS_BE2" ip -6 addr add "${VIP}/128" dev lo preferred_lft 0
         ip netns exec "$NS_LB" ip -6 addr add "${VIP}/128" dev veth6-lb
         ip netns exec "$NS_CLIENT" ip -6 neigh add "$VIP" lladdr "$lb_mac" dev veth6-cli nud permanent
         cat > "$CONFIG" <<EOF
@@ -261,6 +265,9 @@ EOF
     # separate from XDP-forwarded VIP traffic) actually working, and how
     # long does neighbor resolution take before rivorad's own health
     # checker (500ms probe timeout) ever gets a chance to try it?
+    echo "  [diag] be1's outbound src for a reply to the LB (route get):"
+    ip netns exec "$NS_BE1" ip -6 route get "${PREFIX}1" from "${PREFIX}11" 2>&1 | sed 's/^/    /'
+    ip netns exec "$NS_BE1" ip -6 route get "${PREFIX}1" 2>&1 | sed 's/^/    /'
     echo "  [diag] pre-warm: LB->${PREFIX}11:${PORT} connect test:"
     ip netns exec "$NS_LB" timeout 3 python3 -c "
 import socket, time
