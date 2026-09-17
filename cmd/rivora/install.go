@@ -31,8 +31,9 @@ func newInstallCmd() *cobra.Command {
 	var vf valuesFlags
 	var createNamespace bool
 	cmd := &cobra.Command{
-		Use:   "install",
-		Short: "Install Rivora into the cluster",
+		Use:     "install",
+		Short:   "Install Rivora into the cluster",
+		GroupID: groupLifecycle,
 		Long: "Install Rivora into the cluster using the chart bundled with this CLI release.\n" +
 			"rivorad.interface is required — every node the DaemonSet schedules onto must\n" +
 			"have a network interface of this name. Example:\n\n" +
@@ -66,8 +67,9 @@ func newInstallCmd() *cobra.Command {
 func newUpgradeCmd() *cobra.Command {
 	var vf valuesFlags
 	cmd := &cobra.Command{
-		Use:   "upgrade",
-		Short: "Upgrade an existing Rivora installation",
+		Use:     "upgrade",
+		Short:   "Upgrade an existing Rivora installation",
+		GroupID: groupLifecycle,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			vals, err := vf.merge()
 			if err != nil {
@@ -91,8 +93,9 @@ func newUpgradeCmd() *cobra.Command {
 
 func newUninstallCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "uninstall",
-		Short: "Remove Rivora from the cluster",
+		Use:     "uninstall",
+		Short:   "Remove Rivora from the cluster",
+		GroupID: groupLifecycle,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resp, advisory, err := installer.Uninstall(installer.UninstallOptions{
 				Cluster:     cluster,

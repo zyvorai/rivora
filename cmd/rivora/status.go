@@ -13,8 +13,9 @@ import (
 
 func newStatusCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "status",
-		Short: "Show the cluster-wide status of a Rivora installation",
+		Use:     "status",
+		Short:   "Show the cluster-wide status of a Rivora installation",
+		GroupID: groupInfo,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			st, err := installer.GetClusterStatus(cluster, releaseName)
 			if err != nil {
