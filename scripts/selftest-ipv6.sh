@@ -286,8 +286,17 @@ except Exception as e:
     # Broader diagnostics to isolate whether it's TCP-specific (app-layer/
     # conntrack) or general IPv6 reachability (ping), and whether the
     # addresses/routes actually look sane.
+    echo "  [diag] tcpdump on be1 + LB during a fresh ping (does the echo even arrive/return?):"
+    ( ip netns exec "$NS_BE1" timeout 4 tcpdump -i "veth6-be1" -n icmp6 -c 6 > /tmp/be1-tcpdump.log 2>&1 & )
+    ( ip netns exec "$NS_LB" timeout 4 tcpdump -i "veth6-lb" -n icmp6 -c 6 > /tmp/lb-tcpdump.log 2>&1 & )
+    sleep 0.3
     echo "  [diag] ping LB->${PREFIX}11 (bypasses TCP/conntrack entirely):"
     ip netns exec "$NS_LB" ping -6 -c2 -W2 "${PREFIX}11" 2>&1 | sed 's/^/    /'
+    sleep 0.5
+    echo "  [diag] tcpdump capture on be1 (backend side):"
+    cat /tmp/be1-tcpdump.log 2>&1 | sed 's/^/    /'
+    echo "  [diag] tcpdump capture on veth6-lb (LB side):"
+    cat /tmp/lb-tcpdump.log 2>&1 | sed 's/^/    /'
     echo "  [diag] LB addr/route state:"
     ip netns exec "$NS_LB" ip -6 addr show 2>&1 | sed 's/^/    /'
     ip netns exec "$NS_LB" ip -6 route show 2>&1 | sed 's/^/    /'
