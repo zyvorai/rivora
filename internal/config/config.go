@@ -187,7 +187,8 @@ func (c Config) Validate() error {
 		seen[key] = true
 	}
 	for _, v := range c.VIPs {
-		if net.ParseIP(v.Address) == nil {
+		vipIP := net.ParseIP(v.Address)
+		if vipIP == nil {
 			return fmt.Errorf("vip %q: invalid address", v.Address)
 		}
 		if v.Protocol != ProtoTCP && v.Protocol != ProtoUDP {
@@ -199,9 +200,19 @@ func (c Config) Validate() error {
 		if len(v.Backends) == 0 {
 			return fmt.Errorf("vip %s:%d: at least one backend is required", v.Address, v.Port)
 		}
+		vipIsV4 := vipIP.To4() != nil
 		for _, b := range v.Backends {
-			if net.ParseIP(b.Address) == nil {
+			beIP := net.ParseIP(b.Address)
+			if beIP == nil {
 				return fmt.Errorf("backend %q: invalid address", b.Address)
+			}
+			// A VIP's backends must all share its address family — mixed
+			// v4/v6 backends behind one VIP isn't a sane concept (the
+			// dataplane picks one map set, vip_map/backend_map or
+			// vip_map6/backend_map6, per VIP based on the VIP's own
+			// family; see internal/dataplane's UpsertVIP).
+			if (beIP.To4() != nil) != vipIsV4 {
+				return fmt.Errorf("vip %s:%d: backend %s is a different address family than the VIP", v.Address, v.Port, b.Address)
 			}
 			if v.Mode == ModeDSR {
 				if b.MAC == "" {

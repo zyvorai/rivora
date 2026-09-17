@@ -93,6 +93,68 @@ struct mac_addr {
 };
 _Static_assert(sizeof(struct mac_addr) == 6, "mac_addr ABI");
 
+/* IPv6 siblings of vip_key/backend_info/conn_key/nat_reverse_key/val above.
+ * Only the address-keyed-or-valued maps need a v6 sibling at all —
+ * service_config_map, maglev_table, backend_health_map, stats_map,
+ * iface_mac_map and rl_config_map are keyed/valued purely by opaque
+ * service_id/backend_id (or, for rl_config_map, nothing address-shaped),
+ * so a v4 and a v6 VIP share the exact same instances of those maps, the
+ * same ID allocators (Go-side), and the same maglev_table — see
+ * pick_backend() and internal/maglev, both already address-family
+ * agnostic. Don't add v6 siblings for those; only vip_map, backend_map,
+ * connection_affinity_map, nat_reverse_map and rl_buckets_map get one. */
+
+struct vip_key6 {
+    __u8  addr[16]; /* network byte order */
+    __u16 port;     /* network byte order */
+    __u8  proto;    /* IPPROTO_TCP / IPPROTO_UDP */
+    __u8  pad;
+};
+_Static_assert(sizeof(struct vip_key6) == 20, "vip_key6 ABI");
+
+struct backend_info6 {
+    __u8  addr[16]; /* network byte order */
+    __u16 port;     /* network byte order */
+    __u8  mac[6];
+};
+_Static_assert(sizeof(struct backend_info6) == 24, "backend_info6 ABI");
+
+struct conn_key6 {
+    __u8  saddr[16];
+    __u8  daddr[16];
+    __u16 sport;
+    __u16 dport;
+    __u8  proto;
+    __u8  pad[3];
+};
+_Static_assert(sizeof(struct conn_key6) == 40, "conn_key6 ABI");
+
+struct nat_reverse_key6 {
+    __u8  backend_addr[16];
+    __u8  client_addr[16];
+    __u16 backend_port;
+    __u16 client_port;
+    __u8  proto;
+    __u8  pad[3];
+};
+_Static_assert(sizeof(struct nat_reverse_key6) == 40, "nat_reverse_key6 ABI");
+
+struct nat_reverse_val6 {
+    __u8  vip_addr[16];
+    __u16 vip_port;
+    __u8  pad[2];
+};
+_Static_assert(sizeof(struct nat_reverse_val6) == 20, "nat_reverse_val6 ABI");
+
+/* A bare 16-byte address, wrapped in a struct because __type()'s
+ * `val *name` expansion can't take a raw array type directly — used as
+ * rl_buckets_map6's key (the v6 sibling of rl_buckets_map's plain __u32
+ * source-address key). */
+struct addr6_key {
+    __u8 addr[16];
+};
+_Static_assert(sizeof(struct addr6_key) == 16, "addr6_key ABI");
+
 struct lb_stats {
     __u64 packets;
     __u64 bytes;
@@ -173,6 +235,25 @@ static __always_inline __u32 rivora_hash5(__u32 saddr, __u32 daddr, __u16 sport,
     __u32 h = 2166136261u;
     h = (h ^ saddr) * 16777619u;
     h = (h ^ daddr) * 16777619u;
+    h = (h ^ ((__u32)sport << 16 | dport)) * 16777619u;
+    h = (h ^ proto) * 16777619u;
+    return h;
+}
+
+/* IPv6 sibling of rivora_hash5: folds each 128-bit address in as 4 words
+ * via a fixed (verifier-friendly) 4-iteration unroll instead of the single
+ * XOR/multiply rivora_hash5 does per 32-bit v4 address. */
+static __always_inline __u32 rivora_hash5_v6(const __u8 saddr[16], const __u8 daddr[16], __u16 sport, __u16 dport, __u8 proto)
+{
+    __u32 h = 2166136261u;
+    __u32 sw[4], dw[4];
+    __builtin_memcpy(sw, saddr, 16);
+    __builtin_memcpy(dw, daddr, 16);
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        h = (h ^ sw[i]) * 16777619u;
+        h = (h ^ dw[i]) * 16777619u;
+    }
     h = (h ^ ((__u32)sport << 16 | dport)) * 16777619u;
     h = (h ^ proto) * 16777619u;
     return h;

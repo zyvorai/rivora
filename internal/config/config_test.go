@@ -109,3 +109,45 @@ func TestValidateRejectsBGPPeerWithZeroASN(t *testing.T) {
 		t.Fatal("expected an error for a bgp peer with asn == 0")
 	}
 }
+
+func TestValidateAcceptsIPv6VIP(t *testing.T) {
+	cfg := validConfig()
+	cfg.VIPs = []VIP{{
+		Address:  "fd00:77::100",
+		Port:     80,
+		Protocol: ProtoTCP,
+		Mode:     ModeNAT,
+		Backends: []Backend{{Address: "fd00:77::11", Port: 8080}},
+	}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected an all-IPv6 VIP+backend to be valid, got: %v", err)
+	}
+}
+
+func TestValidateRejectsMixedFamilyBackend(t *testing.T) {
+	cfg := validConfig()
+	cfg.VIPs = []VIP{{
+		Address:  "10.0.0.100", // IPv4 VIP
+		Port:     80,
+		Protocol: ProtoTCP,
+		Mode:     ModeNAT,
+		Backends: []Backend{{Address: "fd00:77::11", Port: 8080}}, // IPv6 backend
+	}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected an error for a v4 VIP with a v6 backend")
+	}
+}
+
+func TestValidateRejectsIPv6VIPWithIPv4Backend(t *testing.T) {
+	cfg := validConfig()
+	cfg.VIPs = []VIP{{
+		Address:  "fd00:77::100", // IPv6 VIP
+		Port:     80,
+		Protocol: ProtoTCP,
+		Mode:     ModeNAT,
+		Backends: []Backend{{Address: "10.0.0.11", Port: 8080}}, // IPv4 backend
+	}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected an error for a v6 VIP with a v4 backend")
+	}
+}

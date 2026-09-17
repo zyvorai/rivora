@@ -143,7 +143,10 @@ func (c *Checker) probeOne(t Target) {
 }
 
 func tcpProbe(addr string, port uint16, timeout time.Duration) bool {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", addr, port), timeout)
+	// net.JoinHostPort, not a raw fmt.Sprintf("%s:%d", ...) — an IPv6
+	// literal needs bracketing ("[fd00::1]:8080") or it's ambiguous with
+	// the port separator; JoinHostPort handles both families correctly.
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(addr, fmt.Sprintf("%d", port)), timeout)
 	if err != nil {
 		return false
 	}
