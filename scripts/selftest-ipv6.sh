@@ -193,13 +193,24 @@ wait_for_api() {
     return 1
 }
 
-# wait_for_backend_health polls /api/v1/backends until backend ids 0 and 1
-# report the requested healthy flags (Python True/False), or times out.
+# wait_for_backend_health polls /api/v1/backends until the given
+# address→healthy map matches. Match by address, not opaque backend_id —
+# IDs are allocated from a free list and are not YAML-order stable.
 # Failover probes must not run until rivorad has actually marked the killed
 # backend unhealthy — a fixed sleep races the health-check interval.
+# Args: <addr> <True|False> [<addr> <True|False> ...]
 wait_for_backend_health() {
-    local want0="$1" want1="$2"
     local i json
+    # Build a Python dict literal from addr/flag pairs, e.g.
+    # {'fd00:77::11': True, 'fd00:77::12': False}
+    local want="{"
+    local first=1 addr flag
+    while [ "$#" -ge 2 ]; do
+        addr="$1"; flag="$2"; shift 2
+        if [ "$first" -eq 1 ]; then first=0; else want+=", "; fi
+        want+="'${addr}': ${flag}"
+    done
+    want+="}"
     for i in $(seq 1 40); do
         json=$(ip netns exec "$NS_LB" curl -sf "http://127.0.0.1:9870/api/v1/backends" 2>/dev/null) || {
             sleep 0.25
@@ -207,10 +218,10 @@ wait_for_backend_health() {
         }
         if python3 -c "
 import json, sys
-want0, want1 = ${want0}, ${want1}
+want = ${want}
 bs = json.load(sys.stdin)
-by = {b['id']: bool(b['healthy']) for b in bs}
-sys.exit(0 if by.get(0) is want0 and by.get(1) is want1 else 1)
+by = {b['address']: bool(b['healthy']) for b in bs}
+sys.exit(0 if all(by.get(a) is h for a, h in want.items()) else 1)
 " <<<"$json"; then
             return 0
         fi
@@ -304,7 +315,7 @@ EOF
     # Backends start healthy; wait until probes have confirmed both before
     # measuring Maglev spread (avoids racing the first failThreshold window
     # if the topology is still settling).
-    if ! wait_for_backend_health True True; then
+    if ! wait_for_backend_health "${PREFIX}11" True "${PREFIX}12" True; then
         fail "${mode}: backends did not both become healthy before Maglev probes"
         ip netns exec "$NS_LB" curl -s "http://127.0.0.1:9870/api/v1/backends" 2>&1 || true
         kill "$RIVORAD_PID" 2>/dev/null
@@ -333,10 +344,10 @@ EOF
     ip netns exec "$NS_BE2" kill "$BE2_PID" 2>/dev/null
     BE2_PID=""
 
-    if wait_for_backend_health True False; then
+    if wait_for_backend_health "${PREFIX}11" True "${PREFIX}12" False; then
         :
     else
-        fail "${mode}: BE2 did not go unhealthy (or BE1 lost health) after kill"
+        fail "${mode}: BE2 (${PREFIX}12) did not go unhealthy (or BE1 lost health) after kill"
         ip netns exec "$NS_LB" curl -s "http://127.0.0.1:9870/api/v1/backends" 2>&1 || true
         kill "$RIVORAD_PID" 2>/dev/null
         wait "$RIVORAD_PID" 2>/dev/null
