@@ -8,6 +8,6 @@
 # Deploy state (no secrets)
 .deploy-last
 
-# MkDocs
+# MkDocs (legacy; site is Docusaurus under website/)
 /site/
 .venv-docs/

@@ -1,0 +1,36 @@
+---
+sidebar_position: 2
+title: Selftests and CI
+---
+
+# Selftests and CI
+
+Each `scripts/selftest*.sh` builds an isolated netns/veth topology and
+runs `rivorad` (or a focused Go test) as root.
+
+| Target | Proves |
+| --- | --- |
+| `make selftest` | Single VIP, DSR + NAT, Maglev, health failover |
+| `make selftest-multivip` | Two VIPs; draining excludes new flows |
+| `make selftest-weighted` | 9:1 Maglev skew |
+| `make selftest-ratelimit` | Tight per-source limit; disabled = no-op |
+| `make selftest-ipv6` | Same as first over all-IPv6 |
+| `make selftest-ndp` | NS → NA for NAT IPv6 VIP |
+| `make selftest-all` | All of the above |
+
+```sh
+make deploy-remote-verify H=<host> U=<user>
+```
+
+## GitHub Actions
+
+| Job | Checks |
+| --- | --- |
+| `go` | `mod tidy`, `vet`, build, `go test -race ./…`, `gofmt` |
+| `helm` | lint; IPv4/IPv6 pools; Gateway API template |
+| `crd` | AddressPool CRD + IPv6 sample |
+| `bpf` | `make bpf` |
+| `integration` | Every selftest above |
+
+Docs site: `.github/workflows/pages.yml` → this site (Docusaurus, same
+shape as Netra).

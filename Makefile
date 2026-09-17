@@ -53,11 +53,12 @@ selftest-ndp:
 
 selftest-all: selftest selftest-multivip selftest-weighted selftest-ratelimit selftest-ipv6 selftest-ndp
 
-docs-serve: ## Local MkDocs preview (pip install -r requirements-docs.txt)
-	mkdocs serve
+docs-serve: ## Local Docusaurus preview (website/)
+	npm --prefix website start
 
-docs-build: ## Strict MkDocs build into site/
-	mkdocs build --strict
+docs-build: ## Production Docusaurus build into website/build/
+	npm --prefix website ci
+	npm --prefix website run build
 
 deploy: deploy-remote ## Alias for deploy-remote
 

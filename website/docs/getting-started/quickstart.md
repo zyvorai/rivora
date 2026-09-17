@@ -1,4 +1,9 @@
-# Getting started
+---
+sidebar_position: 1
+title: Quickstart
+---
+
+# Quickstart
 
 Rivora needs a real Linux kernel (XDP/eBPF). From macOS or a thin laptop,
 use the remote deploy path below.
@@ -6,8 +11,8 @@ use the remote deploy path below.
 ## Local Linux build
 
 ```sh
-make bpf build                     # bpf/*.o + bin/{rivorad,rivoractl,rivora-doctor,rivora-controller}
-sudo ./bin/rivora-doctor           # host readiness
+make bpf build
+sudo ./bin/rivora-doctor
 sudo ./bin/rivorad -config config/examples/single-vip.yaml -bpf-dir bpf
 ./bin/rivoractl status
 ```
@@ -52,15 +57,15 @@ Default listen: `127.0.0.1:9870` (plain HTTP, unauthenticated).
 ## Remote deploy
 
 ```sh
-make deploy-remote H=<host> U=<user>          # full: sync, deps, build, verify
-make deploy-remote-quick H=<host> U=<user>    # skip dependency install
-make deploy-remote-verify H=<host> U=<user>   # selftests only (incl. IPv6 + NDP)
+make deploy-remote H=<host> U=<user>
+make deploy-remote-quick H=<host> U=<user>
+make deploy-remote-verify H=<host> U=<user>
 ```
 
-`scripts/deploy-remote.sh` rsyncs sources, builds on the host, and runs
-verify. Selftest failures are warnings for deploy; they are hard failures
-in CI.
+Selftest failures are warnings for deploy; they are hard failures in CI.
 
-## Kubernetes path
+## Next
 
-See [Kubernetes](kubernetes.md) and [Helm chart](helm.md).
+- [Architecture](../core-concepts/architecture.md)
+- [Kubernetes](../kubernetes/overview.md)
+- [Helm chart](../kubernetes/helm.md)

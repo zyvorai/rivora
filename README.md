@@ -582,10 +582,11 @@ GitHub Actions (`.github/workflows/ci.yml`) on every push/PR:
 
 ## Operator docs (GitHub Pages)
 
-Published MkDocs site: **[zyvorai.github.io/rivora](https://zyvorai.github.io/rivora/)**.
-Sources live under `docs/` (`mkdocs.yml`); preview with `make docs-serve`,
-strict build with `make docs-build`. Deploys on every push that touches
-docs via `.github/workflows/docs.yml`.
+Published Docusaurus site (same shape as Netra):
+**[zyvorai.github.io/rivora](https://zyvorai.github.io/rivora/)**.
+Sources live under `website/`; preview with `make docs-serve`, production
+build with `make docs-build`. Deploys on every push that touches
+`website/` or `docs/social/` via `.github/workflows/pages.yml`.
 
 ## Roadmap
 
