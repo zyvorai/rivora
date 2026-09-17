@@ -156,7 +156,14 @@ jobs:
       run: ./bin/rivora uninstall
     - name: confirm workloads were removed
       run: |
-        out="$(kubectl get all -n rivora-system 2>&1)" || true
+        # Pods take a few seconds to finish Terminating after `helm
+        # uninstall` returns — confirmed manually against a live cluster
+        # (an immediate check there also raced this the first time).
+        for i in $(seq 1 15); do
+          out="$(kubectl get all -n rivora-system 2>&1)" || true
+          echo "$out" | grep -q 'No resources found' && break
+          sleep 2
+        done
         echo "$out"
         echo "$out" | grep -q 'No resources found'
     - if: always()
