@@ -187,18 +187,49 @@ func TestBuildDesiredVIPsMultiplePorts(t *testing.T) {
 	}
 }
 
-func TestBuildDesiredVIPsIgnoresIPv6Endpoints(t *testing.T) {
+func TestBuildDesiredVIPsAcceptsIPv6Endpoints(t *testing.T) {
 	svc := lbService(corev1.ServicePort{Name: "http", Port: 80})
+	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "2001:db8::100"}}
 	sl := slice("http", 8080, discoveryv1.Endpoint{
 		Addresses:  []string{"2001:db8::1"},
 		Conditions: discoveryv1.EndpointConditions{Ready: ptr(true), Serving: ptr(true)},
 	})
+	sl.AddressType = discoveryv1.AddressTypeIPv6
 	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{sl})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 0 {
-		t.Errorf("expected an IPv6-only backend to yield no VIP (v0.2 is IPv4-only), got %+v", got)
+	if len(got) != 1 {
+		t.Fatalf("expected an IPv6 VIP with IPv6 backend, got %+v", got)
+	}
+	if got[0].VIP.Address != "2001:db8::100" {
+		t.Errorf("VIP address = %q, want 2001:db8::100", got[0].VIP.Address)
+	}
+	if len(got[0].VIP.Backends) != 1 || got[0].VIP.Backends[0].Address != "2001:db8::1" {
+		t.Errorf("backends = %+v, want 2001:db8::1", got[0].VIP.Backends)
+	}
+}
+
+func TestBuildDesiredVIPsFiltersCrossFamilyBackends(t *testing.T) {
+	svc := lbService(corev1.ServicePort{Name: "http", Port: 80})
+	v4 := slice("http", 8080, discoveryv1.Endpoint{
+		Addresses:  []string{"10.1.0.1"},
+		Conditions: discoveryv1.EndpointConditions{Ready: ptr(true), Serving: ptr(true)},
+	})
+	v6 := slice("http", 8080, discoveryv1.Endpoint{
+		Addresses:  []string{"2001:db8::1"},
+		Conditions: discoveryv1.EndpointConditions{Ready: ptr(true), Serving: ptr(true)},
+	})
+	v6.AddressType = discoveryv1.AddressTypeIPv6
+	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{v4, v6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d VIPs, want 1", len(got))
+	}
+	if len(got[0].VIP.Backends) != 1 || got[0].VIP.Backends[0].Address != "10.1.0.1" {
+		t.Errorf("expected only the IPv4 backend for an IPv4 VIP, got %+v", got[0].VIP.Backends)
 	}
 }
 

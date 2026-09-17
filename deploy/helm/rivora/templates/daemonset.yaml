@@ -43,6 +43,9 @@ spec:
             {{- if .Values.bgp.enabled }}
             - -bgp-asn={{ .Values.bgp.asn }}
             - -bgp-router-id={{ .Values.bgp.routerId }}
+            {{- if .Values.bgp.ipv6NextHop }}
+            - -bgp-ipv6-next-hop={{ .Values.bgp.ipv6NextHop }}
+            {{- end }}
             - -bgp-peers={{ $bgpPeers | join "," }}
             {{- end }}
           env:

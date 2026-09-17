@@ -3,6 +3,7 @@
 package ipam
 
 import (
+	"net/netip"
 	"reflect"
 	"testing"
 )
@@ -73,7 +74,52 @@ func TestExpandPoolRejectsInvalidRange(t *testing.T) {
 	if _, err := ExpandPool([]string{"not-an-ip"}, false); err == nil {
 		t.Error("expected error for garbage input")
 	}
-	if _, err := ExpandPool([]string{"2001:db8::/32"}, false); err == nil {
-		t.Error("expected error for IPv6 CIDR (v0.2 is IPv4-only)")
+}
+
+func TestParsePoolIPv6SmallPrefix(t *testing.T) {
+	got, err := ParsePool([]string{"2001:db8::/126"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Prefixes) != 0 {
+		t.Fatalf("expected eager expand for /126, got prefixes %v", got.Prefixes)
+	}
+	if len(got.Addresses) != 4 {
+		t.Fatalf("got %d addresses, want 4: %v", len(got.Addresses), got.Addresses)
+	}
+}
+
+func TestParsePoolIPv6SparsePrefix(t *testing.T) {
+	got, err := ParsePool([]string{"2001:db8::/64"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Addresses) != 0 {
+		t.Fatalf("expected no eager addresses for /64, got %v", got.Addresses)
+	}
+	if len(got.Prefixes) != 1 || got.Prefixes[0].String() != "2001:db8::/64" {
+		t.Fatalf("got prefixes %v, want 2001:db8::/64", got.Prefixes)
+	}
+}
+
+func TestExpandPoolRejectsSparseIPv6(t *testing.T) {
+	if _, err := ExpandPool([]string{"2001:db8::/64"}, false); err == nil {
+		t.Error("expected ExpandPool to reject sparse IPv6 /64")
+	}
+}
+
+func TestAllocatorSparseIPv6(t *testing.T) {
+	a := NewAllocator()
+	a.SetPools(map[string]PoolSpec{"v6": poolOf(t, "2001:db8::/64", true)})
+	ip, err := a.Allocate("ns/svc", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := netip.ParseAddr(ip)
+	if err != nil || !addr.Is6() {
+		t.Fatalf("expected an IPv6 allocation, got %q", ip)
+	}
+	if !netip.MustParsePrefix("2001:db8::/64").Contains(addr) {
+		t.Fatalf("allocated %s outside 2001:db8::/64", ip)
 	}
 }

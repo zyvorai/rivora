@@ -9,11 +9,11 @@ import (
 
 func poolOf(t *testing.T, cidr string, autoAssign bool) PoolSpec {
 	t.Helper()
-	addrs, err := ExpandPool([]string{cidr}, false)
+	exp, err := ParsePool([]string{cidr}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return PoolSpec{Addresses: addrs, AutoAssign: autoAssign}
+	return PoolSpec{Addresses: exp.Addresses, Prefixes: exp.Prefixes, AutoAssign: autoAssign}
 }
 
 func TestAllocatorAllocateIsIdempotent(t *testing.T) {

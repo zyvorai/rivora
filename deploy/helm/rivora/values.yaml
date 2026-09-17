@@ -22,7 +22,7 @@ rbac:
   create: true
 
 # rivorad is the per-node DaemonSet: XDP/TCX dataplane, the Service/
-# EndpointSlice reconciler, and (optionally) the L2/ARP speaker.
+# EndpointSlice reconciler, and (optionally) the L2 ARP+NDP speaker.
 rivorad:
   # interface is the host network interface XDP/TCX attach to. Required —
   # every node the DaemonSet schedules onto must have an interface of this
@@ -36,9 +36,9 @@ rivorad:
   # LoadBalancer Service with no explicit spec.loadBalancerClass set.
   loadBalancerClass: ""
   workers: 2
-  # speaker runs the L2/ARP responder for K8s-managed VIPs. Requires
-  # CAP_NET_RAW (already granted below); disable only if something else on
-  # the cluster already owns ARP for these VIPs.
+  # speaker runs the L2 ARP+NDP responder for K8s-managed NAT VIPs.
+  # Requires CAP_NET_RAW (already granted below); disable only if something
+  # else on the cluster already owns ARP/NDP for these VIPs.
   speaker: true
 
   # apiKey/tls configure rivorad's local HTTP API the same way the
@@ -100,17 +100,17 @@ gatewayClass:
   name: rivora
 
 # bgp enables rivorad's BGP+BFD speaker: active/active ECMP HA where every
-# node independently advertises a /32 route for each VIP it currently has
-# a healthy backend for. Unlike gatewayApi (which also touches
-# rivora-controller), this is rivorad-only — BGP doesn't need any
-# cluster-wide IPAM coordination, each node just tells its BGP peers the
-# truth about what it can currently serve. Off by default. See the
-# top-level README's BGP/BFD HA section for the full-NAT/ECMP
-# flow-affinity caveat before enabling this with mode: nat VIPs.
+# node independently advertises a /32 (IPv4) or /128 (IPv6) host route for
+# each VIP it currently has a healthy backend for. ipv6NextHop is required
+# to advertise IPv6 VIPs (routerId stays the BGP identifier / IPv4
+# next-hop). Off by default. See the top-level README's BGP/BFD HA section
+# for the full-NAT/ECMP flow-affinity caveat before enabling this with
+# mode: nat VIPs.
 bgp:
   enabled: false
   asn: 0
   routerId: ""
+  ipv6NextHop: ""
   # peers:
   #   - address: 10.0.0.1
   #     asn: 65000
@@ -120,6 +120,9 @@ bgp:
 # addressPools seeds AddressPool custom resources on install, e.g.:
 #   --set addressPools[0].name=default \
 #   --set addressPools[0].addresses={10.0.0.0/24}
+# IPv6 pools are supported (large prefixes like /64 allocate sparsely):
+#   - name: v6
+#     addresses: ["2001:db8:1::/64"]
 # Equivalent values-file form:
 # addressPools:
 #   - name: default

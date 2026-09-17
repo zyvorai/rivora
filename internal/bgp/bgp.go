@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package bgp is rivorad's opt-in BGP+BFD speaker for active/active ECMP
-// HA: unlike internal/speaker's ARP responder, which answers for a VIP
+// HA: unlike internal/speaker's L2 responder, which answers for a VIP
 // from exactly one node at a time (behind a cluster-wide Lease), this
 // speaker runs unleadered on every node and independently advertises a
-// /32 host route for every VIP it currently has at least one healthy
-// backend for — withdrawing it the instant that stops being true. BGP
-// itself (via ECMP on the upstream routers) is what arbitrates which
-// node(s) traffic actually lands on; Rivora's only job is to tell the
-// truth about which VIPs this node can currently serve.
+// /32 (IPv4) or /128 (IPv6) host route for every VIP it currently has at
+// least one healthy backend for — withdrawing it the instant that stops
+// being true. BGP itself (via ECMP on the upstream routers) is what
+// arbitrates which node(s) traffic actually lands on; Rivora's only job
+// is to tell the truth about which VIPs this node can currently serve.
 //
 // Caveat, not hidden: in full-NAT mode a flow's connection state lives
 // only on the node that first received it. If the router's ECMP hash
@@ -222,25 +222,39 @@ func (sp *Speaker) resync() {
 }
 
 func (sp *Speaker) advertise(addr netip.Addr) (uuid.UUID, error) {
-	nlri, err := bgp.NewIPAddrPrefix(netip.PrefixFrom(addr, 32))
+	bits := 32
+	family := bgp.RF_IPv4_UC
+	if addr.Is6() {
+		bits = 128
+		family = bgp.RF_IPv6_UC
+	}
+	nlri, err := bgp.NewIPAddrPrefix(netip.PrefixFrom(addr, bits))
 	if err != nil {
 		return uuid.UUID{}, err
 	}
-	nextHop, err := sp.nextHop()
-	if err != nil {
-		return uuid.UUID{}, err
-	}
-	nh, err := bgp.NewPathAttributeNextHop(nextHop)
+	nextHop, err := sp.nextHop(addr)
 	if err != nil {
 		return uuid.UUID{}, err
 	}
 	attrs := []bgp.PathAttributeInterface{
-		bgp.NewPathAttributeOrigin(0), // IGP — this is a locally-originated route, not learned from another IGP/EGP
-		nh,
-		bgp.NewPathAttributeAsPath(nil), // empty AS_PATH: gobgp prepends the local AS itself when exporting to an eBGP peer
+		bgp.NewPathAttributeOrigin(0), // IGP — locally-originated route
+		bgp.NewPathAttributeAsPath(nil),
+	}
+	if addr.Is4() {
+		nh, err := bgp.NewPathAttributeNextHop(nextHop)
+		if err != nil {
+			return uuid.UUID{}, err
+		}
+		attrs = append(attrs, nh)
+	} else {
+		mp, err := bgp.NewPathAttributeMpReachNLRI(family, []bgp.PathNLRI{{NLRI: nlri}}, nextHop)
+		if err != nil {
+			return uuid.UUID{}, err
+		}
+		attrs = append(attrs, mp)
 	}
 	resp, err := sp.server.AddPath(apiutil.AddPathRequest{
-		Paths: []*apiutil.Path{{Family: bgp.RF_IPv4_UC, Nlri: nlri, Attrs: attrs}},
+		Paths: []*apiutil.Path{{Family: family, Nlri: nlri, Attrs: attrs}},
 	})
 	if err != nil {
 		return uuid.UUID{}, err
@@ -259,11 +273,20 @@ func (sp *Speaker) withdraw(id uuid.UUID) error {
 }
 
 // nextHop is the address this node advertises itself as reachable at for
-// the routes it originates — the router-id, which callers already supply
-// as a real, dial-able address on this node (the same convention GoBGP's
-// own docs and MetalLB's BGP speaker use, rather than adding a separate
-// config knob for what would almost always be the same value).
-func (sp *Speaker) nextHop() (netip.Addr, error) {
+// the routes it originates. IPv4 VIPs use routerId (BGP convention);
+// IPv6 VIPs use ipv6NextHop when set, else an error — router-id is always
+// an IPv4 address and is not a valid IPv6 next-hop.
+func (sp *Speaker) nextHop(vip netip.Addr) (netip.Addr, error) {
+	if vip.Is6() {
+		if sp.cfg.IPv6NextHop == "" {
+			return netip.Addr{}, fmt.Errorf("bgp: ipv6NextHop is required to advertise IPv6 VIP %s", vip)
+		}
+		addr, err := netip.ParseAddr(sp.cfg.IPv6NextHop)
+		if err != nil || !addr.Is6() {
+			return netip.Addr{}, fmt.Errorf("bgp: ipv6NextHop %q is not a valid IPv6 address", sp.cfg.IPv6NextHop)
+		}
+		return addr, nil
+	}
 	addr, err := netip.ParseAddr(sp.cfg.RouterID)
 	if err != nil {
 		return netip.Addr{}, fmt.Errorf("router id %q is not a valid next-hop address: %w", sp.cfg.RouterID, err)

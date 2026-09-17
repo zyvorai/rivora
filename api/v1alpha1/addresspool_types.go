@@ -10,20 +10,22 @@ import (
 // convention for this problem, so operators already familiar with it get
 // no surprises.
 type AddressPoolSpec struct {
-	// Addresses is a list of CIDRs ("10.0.0.0/24") and/or explicit ranges
-	// ("10.0.0.10-10.0.0.40") this pool allocates from.
+	// Addresses is a list of CIDRs ("10.0.0.0/24", "2001:db8::/64") and/or
+	// explicit ranges ("10.0.0.10-10.0.0.40") this pool allocates from.
+	// Large IPv6 prefixes are allocated sparsely rather than enumerated.
 	Addresses []string `json:"addresses"`
 
 	// Protocol is reserved for future forwarding-advertisement modes;
-	// v0.2 only implements "layer2" (the L2/ARP speaker).
+	// "layer2" is the ARP+NDP speaker.
 	Protocol string `json:"protocol,omitempty"`
 
 	// AutoAssign controls whether this pool is used for Services that
 	// don't request a specific pool. Defaults to true.
 	AutoAssign *bool `json:"autoAssign,omitempty"`
 
-	// AvoidBuggyIPs skips a CIDR's .0 and .255 addresses (some older
+	// AvoidBuggyIPs skips an IPv4 CIDR's .0 and .255 addresses (some older
 	// client stacks mishandle them), matching MetalLB's own option name.
+	// Ignored for IPv6.
 	AvoidBuggyIPs bool `json:"avoidBuggyIPs,omitempty"`
 }
 

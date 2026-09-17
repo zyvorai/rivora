@@ -42,3 +42,21 @@ func TestNatVIPAddressesEmptyInput(t *testing.T) {
 		t.Errorf("got %v, want none", got)
 	}
 }
+
+func TestNatVIPAddressesIncludesIPv6(t *testing.T) {
+	got := natVIPAddresses([]dataplane.Status{
+		{VIPAddress: "10.0.0.1", Mode: "nat"},
+		{VIPAddress: "2001:db8::1", Mode: "nat"},
+		{VIPAddress: "2001:db8::2", Mode: "dsr"},
+	})
+	if len(got) != 2 {
+		t.Fatalf("got %v, want both NAT-mode v4 and v6", got)
+	}
+	v6 := natVIP6([]dataplane.Status{
+		{VIPAddress: "10.0.0.1", Mode: "nat"},
+		{VIPAddress: "2001:db8::1", Mode: "nat"},
+	})
+	if len(v6) != 1 || v6[0].String() != "2001:db8::1" {
+		t.Errorf("natVIP6 = %v, want only 2001:db8::1", v6)
+	}
+}

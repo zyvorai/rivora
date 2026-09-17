@@ -1,17 +1,18 @@
 // Copyright 2026 Zyvor AI Labs · https://zyvor.dev
 // SPDX-License-Identifier: Apache-2.0
 
-// Package speaker is rivorad's L2 ARP responder for K8s-managed (NAT-mode)
-// VIPs: gratuitous ARP on assignment/refresh, and an ARP-request responder
+// Package speaker is rivorad's L2 responder for K8s-managed (NAT-mode)
+// VIPs: gratuitous ARP / unsolicited Neighbor Advertisements on
+// assignment/refresh, and ARP-request / Neighbor-Solicitation responders
 // for VIPs this node currently owns. DSR-mode VIPs aren't handled here —
 // see natVIPAddresses.
 //
-// Exactly one node in the cluster may answer ARP for a given VIP at a time
+// Exactly one node in the cluster may answer L2 for a given VIP at a time
 // (answering from two nodes at once is a silent traffic-split outage, not
 // a soft degradation), so — unlike internal/controller's per-node
 // dataplane mirror, which every node runs independently — the speaker
 // runs behind a single cluster-wide coordination.k8s.io/v1 Lease
-// (active/passive whole-node failover; per-VIP leadership is a v0.3+
+// (active/passive whole-node failover; per-VIP leadership is a later
 // enhancement, not this milestone).
 package speaker
 
@@ -24,6 +25,7 @@ import (
 
 	"github.com/mdlayher/arp"
 	"github.com/mdlayher/ethernet"
+	"github.com/mdlayher/ndp"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/leaderelection"
@@ -136,39 +138,54 @@ func (s *Speaker) Run(ctx context.Context) error {
 func (s *Speaker) lead(ctx context.Context) {
 	s.logger.Info("acquired speaker leadership", "identity", s.identity)
 	go s.respondLoop(ctx)
-	s.announceLoop(ctx)
+
+	// NDP is best-effort: interfaces without an IPv6 link-local (common on
+	// v4-only lab NICs) skip it and keep answering ARP only.
+	var ndpConn *ndp.Conn
+	if conn, err := s.startNDP(); err != nil {
+		s.logger.Info("ndp speaker unavailable; ARP-only", "err", err)
+	} else {
+		ndpConn = conn
+		defer ndpConn.Close()
+		go s.ndpRespondLoop(ctx, ndpConn)
+	}
+
+	s.announceLoop(ctx, ndpConn)
 }
 
-// announceLoop sends gratuitous ARP for every currently-owned NAT VIP,
-// both periodically and whenever AnnounceNow is signaled, until ctx is
-// cancelled (typically because leadership was lost).
-func (s *Speaker) announceLoop(ctx context.Context) {
+// announceLoop sends gratuitous ARP (and, when ndpConn != nil, unsolicited
+// Neighbor Advertisements) for every currently-owned NAT VIP, both
+// periodically and whenever AnnounceNow is signaled.
+func (s *Speaker) announceLoop(ctx context.Context, ndpConn *ndp.Conn) {
 	ticker := time.NewTicker(announceInterval)
 	defer ticker.Stop()
 
-	s.announceAll()
+	s.announceAll(ndpConn)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.announceAll()
+			s.announceAll(ndpConn)
 		case <-s.announceNow:
-			s.announceAll()
+			s.announceAll(ndpConn)
 		}
 	}
 }
 
-func (s *Speaker) announceAll() {
+func (s *Speaker) announceAll(ndpConn *ndp.Conn) {
 	statuses, err := s.source.Statuses()
 	if err != nil {
 		s.logger.Error("list vip statuses for announce", "err", err)
 		return
 	}
-	for _, addr := range natVIPAddresses(statuses) {
+	for _, addr := range natVIP4(statuses) {
 		if err := s.gratuitous(addr); err != nil {
 			s.logger.Error("send gratuitous arp", "vip", addr, "err", err)
 		}
+	}
+	if ndpConn != nil {
+		s.ndpSyncAndAnnounce(ndpConn)
 	}
 }
 
@@ -221,7 +238,7 @@ func (s *Speaker) owns(addr netip.Addr) bool {
 	if err != nil {
 		return false
 	}
-	for _, owned := range natVIPAddresses(statuses) {
+	for _, owned := range natVIP4(statuses) {
 		if owned == addr {
 			return true
 		}

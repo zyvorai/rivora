@@ -1,0 +1,27 @@
+# IPv6 DSR example. Each backend must accept traffic addressed to the VIP
+# (typically bind the VIP on lo with preferred_lft 0 so it is not chosen
+# as an outbound source) and must not answer Neighbor Discovery for it —
+# in production the NDP speaker on the LB owns that; for static-YAML lab
+# setups, install a permanent client neigh to the LB MAC.
+
+interface: eth0
+apiListen: 127.0.0.1:9870
+
+healthCheck:
+  interval: 3s
+  timeout: 1s
+  failThreshold: 2
+  successThreshold: 2
+
+vips:
+  - address: fd00:77::100
+    port: 80
+    protocol: tcp
+    mode: dsr
+    backends:
+      - address: fd00:77::11
+        port: 8080
+        mac: "02:00:00:00:00:11"
+      - address: fd00:77::12
+        port: 8080
+        mac: "02:00:00:00:00:12"

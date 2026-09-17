@@ -201,9 +201,9 @@ func (r *Reconciler) poolWorker(ctx context.Context, dynFactory dynamicinformer.
 }
 
 // reconcilePools rebuilds the allocator's full pool set from every current
-// AddressPool object. Expansion failures (a malformed CIDR, IPv6, etc.) are
-// logged and that one pool is skipped rather than failing the whole sync —
-// one bad AddressPool shouldn't take every other pool's addresses offline.
+// AddressPool object. Parse failures (a malformed CIDR, etc.) are logged
+// and that one pool is skipped rather than failing the whole sync — one
+// bad AddressPool shouldn't take every other pool's addresses offline.
 func (r *Reconciler) reconcilePools(ctx context.Context, dynFactory dynamicinformer.DynamicSharedInformerFactory) error {
 	lister := dynFactory.ForResource(v1alpha1.AddressPoolResource).Lister()
 	objs, err := lister.List(labels.Everything())
@@ -226,12 +226,12 @@ func (r *Reconciler) reconcilePools(ctx context.Context, dynFactory dynamicinfor
 		if pool.Spec.AutoAssign != nil {
 			autoAssign = *pool.Spec.AutoAssign
 		}
-		addrs, err := ipam.ExpandPool(pool.Spec.Addresses, pool.Spec.AvoidBuggyIPs)
+		exp, err := ipam.ParsePool(pool.Spec.Addresses, pool.Spec.AvoidBuggyIPs)
 		if err != nil {
-			r.logger.Error("expand addresspool", "pool", pool.Name, "err", err)
+			r.logger.Error("parse addresspool", "pool", pool.Name, "err", err)
 			continue
 		}
-		pools[pool.Name] = ipam.PoolSpec{Addresses: addrs, AutoAssign: autoAssign}
+		pools[pool.Name] = ipam.PoolSpec{Addresses: exp.Addresses, Prefixes: exp.Prefixes, AutoAssign: autoAssign}
 	}
 	r.allocator.SetPools(pools)
 	r.logger.Info("address pools synced", "pools", len(pools))

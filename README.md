@@ -13,16 +13,16 @@ CNI-independent and doesn't require Cilium: it attaches its own XDP/TCX
 programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
 
 > **Status: v0.1 shipped, v0.2 (Kubernetes) implemented and verified
-> end-to-end on a live cluster.** Single node, IPv4 TCP/UDP, DSR and
+> end-to-end on a live cluster.** Single node, IPv4/IPv6 TCP/UDP, DSR and
 > full-NAT forwarding, Maglev backend selection with graceful draining,
 > active TCP health checks. A node can run multiple VIPs, each
 > independently reconciled and Maglev-partitioned — either from static
-> YAML, or (v0.2, new) from Kubernetes `Service`/`EndpointSlice` objects
-> via `rivorad -kubernetes`, with `rivora-controller` handling `AddressPool`
-> IPAM and an in-`rivorad` L2/ARP speaker announcing assigned VIPs. BGP/BFD
-> HA is implemented (opt-in, active/active ECMP) but not yet live-verified
-> against a real router peer. IPv6 dataplane support (static-YAML mode
-> only so far) is implemented and CI-verified — see [Roadmap](#roadmap).
+> YAML, or from Kubernetes `Service`/`EndpointSlice` objects via
+> `rivorad -kubernetes`, with `rivora-controller` handling `AddressPool`
+> IPAM (IPv4 and IPv6, including sparse `/64` allocation) and an
+> in-`rivorad` L2 ARP+NDP speaker announcing assigned VIPs. BGP/BFD HA is
+> implemented (opt-in, active/active ECMP, `/32` and `/128`) but not yet
+> live-verified against a real router peer.
 
 ## Contents
 
@@ -35,7 +35,7 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
   - [Backends beyond Pods: KubeVirt VMs and external/physical IPs](#backends-beyond-pods-kubevirt-vms-and-externalphysical-ips)
   - [Gateway API (v0.3)](#gateway-api-v03)
   - [BGP/BFD HA (v0.3)](#bgpbfd-ha-v03)
-- [IPv6 (v0.3, in progress)](#ipv6-v03-in-progress)
+- [IPv6 (v0.3)](#ipv6-v03)
 - [Building on the remote host](#building-on-the-remote-host)
 - [Roadmap](#roadmap)
 - [License](#license)
@@ -85,8 +85,8 @@ or Kubernetes objects across a cluster — both converge on the same
        |                                 Service + EndpointSlice, reconciles
        |                                        |
        |                               internal/speaker (leader-elected
-       |                                 cluster-wide Lease): ARP for the
-       |                                 assigned VIP
+       |                                 cluster-wide Lease): ARP+NDP for
+       |                                 the assigned VIP
        |                                        |
        +---------------> internal/dataplane <---+
                      UpsertVIP / RemoveVIP
@@ -345,15 +345,26 @@ test cluster — this needs an actual second router-like peer, which the
 loopback integration test deliberately substitutes for correctness
 coverage without needing one.
 
-## IPv6 (v0.3, in progress)
+## IPv6 (v0.3)
 
-The dataplane foundation is implemented: `rivorad` parses, forwards, and
-checksum-rewrites IPv6 TCP/UDP traffic in both DSR and full-NAT mode,
-in **static-YAML config mode only** — Kubernetes reconciliation, IPAM
-(`AddressPool`), and an NDP responder (IPv6's equivalent of the L2/ARP
-speaker) are separate, not-yet-implemented follow-on phases. A VIP's
-backends must all share its own address family; mixing v4 and v6 behind
-one VIP is rejected at config-validation time.
+IPv6 is a first-class peer of IPv4 across the dataplane, IPAM, Kubernetes
+reconciliation, L2 announcement, and BGP:
+
+- **Dataplane** — XDP/TCX parse, forward, and checksum-rewrite IPv6 TCP/UDP
+  in DSR and full-NAT (`config/examples/single-vip-ipv6-*.yaml`).
+- **IPAM** — `AddressPool` accepts IPv6 CIDRs/ranges; prefixes with more
+  than 16 host bits (e.g. `/64`) allocate sparsely at random instead of
+  being eagerly expanded.
+- **Kubernetes** — Service/EndpointSlice and Gateway API reconcilers
+  program IPv6 LoadBalancer / Gateway addresses with same-family backends.
+- **NDP speaker** — the L2 speaker answers Neighbor Solicitations and
+  sends unsolicited Neighbor Advertisements for NAT-mode IPv6 VIPs
+  (alongside ARP for IPv4), behind the same cluster-wide Lease.
+- **BGP** — healthy IPv6 VIPs are advertised as `/128` (`RF_IPv6_UC`); set
+  `bgp.ipv6NextHop` (or `-bgp-ipv6-next-hop`) to the node's IPv6 next-hop.
+
+A VIP's backends must all share its address family; mixing v4 and v6
+behind one VIP is rejected at config-validation time.
 
 ```yaml
 interface: eth0
@@ -372,18 +383,12 @@ Under the hood, only the maps keyed or valued by a raw address
 `rl_buckets_map`) have IPv6 siblings — `service_config_map`,
 `maglev_table`, `backend_health_map`, `stats_map`, `iface_mac_map`, and
 `rl_config_map` are address-family-agnostic and shared as-is between v4
-and v6 VIPs/backends, including the same Maglev table and ID allocators.
-Two IPv6-specific checksum differences from v4 are handled explicitly:
-IPv6 has no IP-header checksum at all, and a UDP checksum is never
-"unset" over IPv6 (unlike v4, where zero means unset) — both matter for
-the full-NAT rewrite path's correctness.
+and v6 VIPs/backends. Two IPv6-specific checksum differences from v4 are
+handled explicitly: IPv6 has no IP-header checksum at all, and a UDP
+checksum is never "unset" over IPv6 (unlike v4, where zero means unset).
 
 Verified via `scripts/selftest-ipv6.sh` (DSR + full-NAT, Maglev spread,
-failover) in CI on every push — BPF C can't be compiled or tested on
-macOS, so this couldn't be verified locally during development the way
-the Go-side changes were; CI (a real Linux runner) is the actual
-verification. Not yet verified against a live cluster or real hardware.
-
+failover) in CI on every push.
 ## Building on the remote host
 
 `scripts/deploy-remote.sh` (same shape as the sibling `guestkit` repo's
@@ -436,16 +441,11 @@ implemented and locally verified — see [BGP/BFD HA](#bgpbfd-ha-v03) — with
 the health-gated advertise/withdraw cycle proven against a real BGP
 session (a loopback-peered gobgp integration test); live verification
 against a real/containerized router peer on the remote test cluster is a
-separate follow-up, not yet done. IPv6's dataplane foundation is done —
-see [IPv6](#ipv6-v03-in-progress) — with a new `scripts/selftest-ipv6.sh`
-green in CI on every push (DSR + full-NAT, Maglev spread, failover);
-still ahead for IPv6: the randomized-within-prefix IPAM allocator
-redesign `internal/ipam`'s current eager-CIDR-expansion model can't
-support (a real /64 has ~18 quintillion addresses), dual-stack
-Kubernetes reconciliation, and an NDP responder (the IPv6 analog of the
-L2/ARP speaker) — each its own follow-on phase, mirroring how the
-dataplane foundation itself was scoped and landed as a first, focused
-step rather than attempting all of IPv6 in one change.
+separate follow-up, not yet done. IPv6 is done end-to-end for the
+product surface (dataplane, sparse IPAM, dual-stack Service/Gateway
+reconciliation, NDP speaker, BGP `/128`) — see [IPv6](#ipv6-v03). Still
+ahead as live-cluster hardening: end-to-end dual-stack Service traffic
+on the remote test cluster and BGP IPv6 peering against a real router.
 
 ## License
 

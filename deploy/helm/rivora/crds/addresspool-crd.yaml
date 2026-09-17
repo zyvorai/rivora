@@ -45,12 +45,14 @@ spec:
                   items:
                     type: string
                   description: >-
-                    IPv4 CIDRs (10.0.0.0/24), ranges (10.0.0.10-10.0.0.40),
-                    or single addresses. v0.2 is IPv4-only.
+                    IPv4 or IPv6 CIDRs (10.0.0.0/24, 2001:db8::/64), ranges
+                    (10.0.0.10-10.0.0.40), or single addresses. Large IPv6
+                    prefixes (host bits > 16, e.g. /64) are allocated
+                    sparsely at random rather than eagerly enumerated.
                 protocol:
                   type: string
                   default: layer2
-                  description: Reserved for a future BGP mode; only layer2 (the ARP speaker) is implemented in v0.2.
+                  description: Reserved for a future BGP pool mode; L2 (ARP+NDP speaker) is the default.
                 autoAssign:
                   type: boolean
                   default: true

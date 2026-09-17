@@ -1,0 +1,23 @@
+# IPv6 full-NAT example. Backends must route return traffic through this
+# node so tc_nat's TCX egress program can un-NAT replies. Same-family
+# backends only — mixed v4/v6 behind one VIP is rejected at config load.
+
+interface: eth0
+apiListen: 127.0.0.1:9870
+
+healthCheck:
+  interval: 3s
+  timeout: 1s
+  failThreshold: 2
+  successThreshold: 2
+
+vips:
+  - address: fd00:77::100
+    port: 80
+    protocol: tcp
+    mode: nat
+    backends:
+      - address: fd00:77::11
+        port: 8080
+      - address: fd00:77::12
+        port: 8080

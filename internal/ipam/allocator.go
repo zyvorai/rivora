@@ -3,24 +3,28 @@
 package ipam
 
 import (
+	"crypto/rand"
 	"fmt"
+	"net/netip"
 	"slices"
 	"sync"
 )
 
-// PoolSpec is the allocator's view of one AddressPool — already expanded
-// to a concrete address list (see ExpandPool).
+// PoolSpec is the allocator's view of one AddressPool — either an
+// eagerly-expanded address list (IPv4 and small IPv6 prefixes) and/or
+// sparse Prefixes for large IPv6 blocks that cannot be enumerated.
 type PoolSpec struct {
 	Addresses  []string
+	Prefixes   []netip.Prefix
 	AutoAssign bool
 }
 
 // Allocator tracks which addresses, across every pool, are assigned to
 // which Service. It has no Kubernetes client dependency — the caller
-// (internal/controller's IPAM reconciler) is responsible for calling
-// SetPools when AddressPool objects change and Reserve for every already-
-// assigned Service at startup, so a restart doesn't lose track of live
-// allocations and double-allocate.
+// (internal/ipamctrl) is responsible for calling SetPools when AddressPool
+// objects change and Reserve for every already-assigned Service at
+// startup, so a restart doesn't lose track of live allocations and
+// double-allocate.
 type Allocator struct {
 	mu        sync.Mutex
 	pools     map[string]PoolSpec // pool name -> spec
@@ -99,8 +103,18 @@ func (a *Allocator) Allocate(key, preferredPool, pinnedIP string) (string, error
 	}
 
 	for _, name := range pools {
-		for _, ip := range a.pools[name].Addresses {
+		spec := a.pools[name]
+		for _, ip := range spec.Addresses {
 			if _, taken := a.addrOwner[ip]; taken {
+				continue
+			}
+			a.commit(key, ip)
+			a.addrPool[ip] = name
+			return ip, nil
+		}
+		for _, pfx := range spec.Prefixes {
+			ip, ok := a.allocFromPrefix(pfx)
+			if !ok {
 				continue
 			}
 			a.commit(key, ip)
@@ -124,10 +138,7 @@ func (a *Allocator) Release(key string) {
 	delete(a.addrPool, ip)
 }
 
-// PoolNames returns every pool name currently known to the allocator (from
-// the most recent SetPools call), for callers that need to refresh derived
-// state (e.g. a status subresource) per pool without duplicating SetPools'
-// input.
+// PoolNames returns every pool name currently known to the allocator.
 func (a *Allocator) PoolNames() []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -138,7 +149,9 @@ func (a *Allocator) PoolNames() []string {
 	return names
 }
 
-// Counts returns (available, assigned) for a named pool.
+// Counts returns (available, assigned) for a named pool. Sparse (prefix)
+// pools report available as a large sentinel minus assigned — the true
+// remaining capacity of a /64 cannot fit in a useful counter.
 func (a *Allocator) Counts(pool string) (available, assigned int64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -153,6 +166,26 @@ func (a *Allocator) Counts(pool string) (available, assigned int64) {
 			available++
 		}
 	}
+	// Count assigned addresses that belong to this pool via addrPool
+	// (covers sparse-prefix allocations that aren't in Addresses).
+	var prefixAssigned int64
+	for ip, pname := range a.addrPool {
+		if pname != pool {
+			continue
+		}
+		if slices.Contains(spec.Addresses, ip) {
+			continue // already counted above
+		}
+		prefixAssigned++
+	}
+	assigned += prefixAssigned
+	if len(spec.Prefixes) > 0 {
+		const sparseCapacity int64 = 1 << 30
+		available += sparseCapacity - prefixAssigned
+		if available < 0 {
+			available = 0
+		}
+	}
 	return available, assigned
 }
 
@@ -162,9 +195,18 @@ func (a *Allocator) commit(key, ip string) {
 }
 
 func (a *Allocator) poolFor(ip string) string {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return ""
+	}
 	for name, spec := range a.pools {
-		if slices.Contains(spec.Addresses, ip) {
+		if slices.Contains(spec.Addresses, ip) || slices.Contains(spec.Addresses, addr.String()) {
 			return name
+		}
+		for _, pfx := range spec.Prefixes {
+			if pfx.Contains(addr) {
+				return name
+			}
 		}
 	}
 	return ""
@@ -184,6 +226,64 @@ func (a *Allocator) candidatePools(preferred string) []string {
 		}
 	}
 	return out
+}
+
+// allocFromPrefix picks a free address inside pfx at random. Returns
+// false if several attempts all collide with existing allocations (or the
+// prefix is too small / degenerate).
+func (a *Allocator) allocFromPrefix(pfx netip.Prefix) (string, bool) {
+	hostBits := pfx.Addr().BitLen() - pfx.Bits()
+	network := pfx.Masked().Addr()
+	if hostBits <= 0 {
+		ip := network.String()
+		if _, taken := a.addrOwner[ip]; !taken {
+			return ip, true
+		}
+		return "", false
+	}
+	for attempt := 0; attempt < 64; attempt++ {
+		addr, ok := randomInPrefix(pfx)
+		if !ok {
+			return "", false
+		}
+		// Skip the network address itself when the prefix has room.
+		if addr == network {
+			continue
+		}
+		s := addr.String()
+		if _, taken := a.addrOwner[s]; taken {
+			continue
+		}
+		return s, true
+	}
+	return "", false
+}
+
+func randomInPrefix(pfx netip.Prefix) (netip.Addr, bool) {
+	base := pfx.Masked().Addr().AsSlice()
+	out := make([]byte, len(base))
+	copy(out, base)
+	hostBits := pfx.Addr().BitLen() - pfx.Bits()
+	hostBytes := (hostBits + 7) / 8
+	rnd := make([]byte, hostBytes)
+	if _, err := rand.Read(rnd); err != nil {
+		return netip.Addr{}, false
+	}
+	// Overlay random host bits onto the masked network prefix.
+	bitOffset := pfx.Bits()
+	for i := 0; i < hostBits; i++ {
+		byteIdx := (bitOffset + i) / 8
+		bitIdx := 7 - ((bitOffset + i) % 8)
+		srcByte := rnd[i/8]
+		srcBit := 7 - (i % 8)
+		if srcByte&(1<<srcBit) != 0 {
+			out[byteIdx] |= 1 << bitIdx
+		} else {
+			out[byteIdx] &^= 1 << bitIdx
+		}
+	}
+	addr, ok := netip.AddrFromSlice(out)
+	return addr, ok
 }
 
 func firstNonEmpty(a, b string) string {

@@ -53,7 +53,7 @@ func main() {
 		lbClass    = flag.String("loadbalancer-class", "", "only manage Services whose spec.loadBalancerClass matches this value (default: services with no class set); only used with -kubernetes")
 		namespace  = flag.String("namespace", envOr("POD_NAMESPACE", "rivora-system"), "namespace the ARP speaker's leader-election Lease lives in; only used with -kubernetes")
 		workers    = flag.Int("workers", 2, "number of concurrent Service reconcile workers; only used with -kubernetes")
-		speakerOn  = flag.Bool("speaker", true, "run the L2/ARP speaker (requires CAP_NET_RAW); only used with -kubernetes")
+		speakerOn  = flag.Bool("speaker", true, "run the L2 ARP+NDP speaker (requires CAP_NET_RAW); only used with -kubernetes")
 
 		gatewayAPIOn = flag.Bool("gateway-api", false, "also watch GatewayClass/Gateway/TCPRoute/UDPRoute and program their VIPs; only used with -kubernetes; requires the Gateway API CRDs to be installed")
 
@@ -66,10 +66,11 @@ func main() {
 		rateLimitPPS   = flag.Uint64("rate-limit-pps", 0, "per-source-IP new-connection (SYN) packets/sec allowed when -rate-limit is set; only used with -kubernetes")
 		rateLimitBurst = flag.Uint64("rate-limit-burst", 0, "per-source-IP token-bucket burst size when -rate-limit is set; only used with -kubernetes")
 
-		bgpOn       = flag.Bool("bgp", false, "advertise a BGP route for every VIP this node has a healthy backend for (active/active ECMP HA); only used with -kubernetes (static-YAML mode reads this from -config's bgp section instead)")
-		bgpASN      = flag.Uint("bgp-asn", 0, "this node's BGP AS number when -bgp is set; only used with -kubernetes")
-		bgpRouterID = flag.String("bgp-router-id", "", "this node's BGP router-id (an IPv4 address, need not be routable) when -bgp is set; only used with -kubernetes")
-		bgpPeers    = flag.String("bgp-peers", "", "comma-separated BGP peers when -bgp is set, each addr:asn or addr:asn:bfd (e.g. \"10.0.0.1:65000:bfd,10.0.0.2:65001\"); only used with -kubernetes")
+		bgpOn          = flag.Bool("bgp", false, "advertise a BGP route for every VIP this node has a healthy backend for (active/active ECMP HA); only used with -kubernetes (static-YAML mode reads this from -config's bgp section instead)")
+		bgpASN         = flag.Uint("bgp-asn", 0, "this node's BGP AS number when -bgp is set; only used with -kubernetes")
+		bgpRouterID    = flag.String("bgp-router-id", "", "this node's BGP router-id (an IPv4 address, need not be routable) when -bgp is set; only used with -kubernetes")
+		bgpIPv6NextHop = flag.String("bgp-ipv6-next-hop", "", "IPv6 next-hop for advertised IPv6 VIP /128 routes when -bgp is set; required to advertise IPv6 VIPs; only used with -kubernetes")
+		bgpPeers       = flag.String("bgp-peers", "", "comma-separated BGP peers when -bgp is set, each addr:asn or addr:asn:bfd (e.g. \"10.0.0.1:65000:bfd,10.0.0.2:65001\"); only used with -kubernetes")
 	)
 	flag.Parse()
 
@@ -115,10 +116,11 @@ func main() {
 				os.Exit(1)
 			}
 			cfg.BGP = config.BGP{
-				Enabled:  true,
-				ASN:      uint32(*bgpASN),
-				RouterID: *bgpRouterID,
-				Peers:    peers,
+				Enabled:     true,
+				ASN:         uint32(*bgpASN),
+				RouterID:    *bgpRouterID,
+				IPv6NextHop: *bgpIPv6NextHop,
+				Peers:       peers,
 			}
 			if err := cfg.BGP.Validate(); err != nil {
 				logger.Error("bgp flags", "err", err)

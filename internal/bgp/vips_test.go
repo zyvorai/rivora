@@ -67,15 +67,14 @@ func TestHealthyVIPAddressesDedupesAcrossStatuses(t *testing.T) {
 	}
 }
 
-func TestHealthyVIPAddressesSkipsIPv6(t *testing.T) {
+func TestHealthyVIPAddressesIncludesIPv6(t *testing.T) {
 	statuses := []dataplane.Status{
 		{VIPAddress: "2001:db8::1", Backends: []dataplane.BackendStatus{{Healthy: true}}},
 		{VIPAddress: "10.0.0.1", Backends: []dataplane.BackendStatus{{Healthy: true}}},
 	}
 	got := healthyVIPAddresses(statuses)
-	want := addrs("10.0.0.1")
-	if len(got) != len(want) || got[0] != want[0] {
-		t.Fatalf("got %v, want only the IPv4 address %v", got, want)
+	if len(got) != 2 {
+		t.Fatalf("got %v, want both IPv4 and IPv6 addresses", got)
 	}
 }
 

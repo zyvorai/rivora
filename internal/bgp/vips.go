@@ -8,13 +8,14 @@ import (
 	"github.com/zyvorai/rivora/internal/dataplane"
 )
 
-// healthyVIPAddresses extracts the deduped set of IPv4 addresses this node
+// healthyVIPAddresses extracts the deduped set of VIP addresses this node
 // should currently be advertising: every VIP with at least one healthy
-// backend, regardless of DSR/NAT mode — unlike internal/speaker's
-// mode-gated natVIPAddresses, BGP+ECMP operates at the routing layer
-// above either forwarding mode, so both are eligible here. A VIP with
-// zero backends, or with backends that are all unhealthy, is excluded —
-// that's the health-gating this whole package exists to implement.
+// backend, regardless of DSR/NAT mode or address family — unlike
+// internal/speaker's mode-gated natVIPAddresses, BGP+ECMP operates at the
+// routing layer above either forwarding mode, so both are eligible here.
+// A VIP with zero backends, or with backends that are all unhealthy, is
+// excluded — that's the health-gating this whole package exists to
+// implement.
 func healthyVIPAddresses(statuses []dataplane.Status) []netip.Addr {
 	seen := map[string]bool{}
 	var out []netip.Addr
@@ -26,7 +27,7 @@ func healthyVIPAddresses(statuses []dataplane.Status) []netip.Addr {
 			continue
 		}
 		addr, err := netip.ParseAddr(st.VIPAddress)
-		if err != nil || !addr.Is4() {
+		if err != nil {
 			continue
 		}
 		seen[st.VIPAddress] = true

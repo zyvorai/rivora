@@ -28,65 +28,88 @@ type desiredVIP struct {
 // internal/controller.buildDesiredVIPs' handling of an unassigned
 // Service.
 func (r *Reconciler) buildDesiredVIPs(gw *gwapi.Gateway, routes []attachedRoute) ([]desiredVIP, error) {
-	addr := gatewayIPv4(gw)
-	if addr == "" {
+	addrs := gatewayIPs(gw)
+	if len(addrs) == 0 {
 		return nil, nil
 	}
 
 	var out []desiredVIP
-	for _, l := range gw.Spec.Listeners {
-		proto, ok := listenerProtocol(l.Protocol)
-		if !ok {
-			continue // e.g. a TLS/HTTP listener on a Gateway that also has TCP/UDP listeners: skip that one, not the whole Gateway
-		}
-
-		var backends, draining []config.Backend
-		seen := map[string]bool{}
-		for _, rt := range routes {
-			if !attachesToListener(rt.spec, l.Name) {
-				continue
+	for _, addr := range addrs {
+		for _, l := range gw.Spec.Listeners {
+			proto, ok := listenerProtocol(l.Protocol)
+			if !ok {
+				continue // e.g. a TLS/HTTP listener on a Gateway that also has TCP/UDP listeners: skip that one, not the whole Gateway
 			}
-			for _, rule := range rt.spec.Rules {
-				for _, br := range rule.BackendRefs {
-					bs, bsDraining, err := r.resolveBackendRef(rt.namespace, br)
-					if err != nil {
-						r.logger.Error("resolve backendRef", "backendRef", br.Name, "err", err)
-						continue // one bad backendRef shouldn't drop the whole listener
-					}
-					for _, b := range bs {
-						key := fmt.Sprintf("%s:%d", b.Address, b.Port)
-						if seen[key] {
-							continue
+
+			var backends, draining []config.Backend
+			seen := map[string]bool{}
+			for _, rt := range routes {
+				if !attachesToListener(rt.spec, l.Name) {
+					continue
+				}
+				for _, rule := range rt.spec.Rules {
+					for _, br := range rule.BackendRefs {
+						bs, bsDraining, err := r.resolveBackendRef(rt.namespace, br)
+						if err != nil {
+							r.logger.Error("resolve backendRef", "backendRef", br.Name, "err", err)
+							continue // one bad backendRef shouldn't drop the whole listener
 						}
-						seen[key] = true
-						backends = append(backends, b)
+						for _, b := range bs {
+							key := fmt.Sprintf("%s:%d", b.Address, b.Port)
+							if seen[key] {
+								continue
+							}
+							seen[key] = true
+							backends = append(backends, b)
+						}
+						draining = append(draining, bsDraining...)
 					}
-					draining = append(draining, bsDraining...)
 				}
 			}
-		}
-		if len(backends) == 0 {
-			continue
-		}
+			backends = controller.SameFamily(backends, addr)
+			draining = controller.SameFamily(draining, addr)
+			if len(backends) == 0 {
+				continue
+			}
 
-		out = append(out, desiredVIP{
-			VIP: config.VIP{
-				Address:  addr,
-				Port:     uint16(l.Port),
-				Protocol: proto,
-				Mode:     config.ModeNAT, // K8s-managed VIPs are NAT-only, same as internal/controller
-				Backends: backends,
-			},
-			DrainingBackends: draining,
-		})
+			out = append(out, desiredVIP{
+				VIP: config.VIP{
+					Address:  addr,
+					Port:     uint16(l.Port),
+					Protocol: proto,
+					Mode:     config.ModeNAT, // K8s-managed VIPs are NAT-only, same as internal/controller
+					Backends: backends,
+				},
+				DrainingBackends: draining,
+			})
+		}
 	}
 	return out, nil
 }
 
-func gatewayIPv4(gw *gwapi.Gateway) string {
+// gatewayIPs returns every IPAddress-typed status address (IPv4 and IPv6).
+func gatewayIPs(gw *gwapi.Gateway) []string {
+	var out []string
+	seen := map[string]bool{}
 	for _, a := range gw.Status.Addresses {
-		if ip := net.ParseIP(a.Value).To4(); ip != nil {
-			return ip.String()
+		ip := net.ParseIP(a.Value)
+		if ip == nil {
+			continue
+		}
+		s := ip.String()
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+func gatewayIPv4(gw *gwapi.Gateway) string {
+	for _, ip := range gatewayIPs(gw) {
+		if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() != nil {
+			return ip
 		}
 	}
 	return ""

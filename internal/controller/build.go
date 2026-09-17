@@ -5,6 +5,7 @@ package controller
 import (
 	"fmt"
 	"net"
+	"net/netip"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -25,54 +26,82 @@ type desiredVIP struct {
 
 // buildDesiredVIPs computes what svc's dataplane state should be from its
 // spec/status and the EndpointSlices that back it. K8s-managed VIPs are
-// NAT-only (see plan: DSR would need binding the VIP into backend pods, a
-// CNI-specific story not designed for v0.2) and IPv4-only, matching
-// internal/ipam's scope. A Service with no assigned LoadBalancer IP yet
-// (rivora-controller hasn't run IPAM for it), or that has no ready
-// backends, or that uses an unsupported protocol, yields no VIP for that
-// port — the caller then just removes whatever was previously installed.
+// NAT-only (DSR would need binding the VIP into backend pods, a
+// CNI-specific story not designed yet). IPv4 and IPv6 LoadBalancer
+// ingress addresses are both programmed; backends are filtered to the
+// same address family as each VIP (mixed-family behind one VIP is
+// rejected by config.Validate). A Service with no assigned LoadBalancer
+// IP yet, or that has no ready same-family backends, or that uses an
+// unsupported protocol, yields no VIP for that port — the caller then
+// just removes whatever was previously installed.
 func buildDesiredVIPs(svc *corev1.Service, slices []*discoveryv1.EndpointSlice) ([]desiredVIP, error) {
-	addr := ingressIPv4(svc)
-	if addr == "" {
+	addrs := ingressIPs(svc)
+	if len(addrs) == 0 {
 		return nil, nil
 	}
 
 	var out []desiredVIP
-	for _, p := range svc.Spec.Ports {
-		proto, ok := protocolFor(p.Protocol)
-		if !ok {
-			continue // SCTP or other unsupported protocol: skip this port, not the whole Service
-		}
+	for _, addr := range addrs {
+		for _, p := range svc.Spec.Ports {
+			proto, ok := protocolFor(p.Protocol)
+			if !ok {
+				continue // SCTP or other unsupported protocol: skip this port, not the whole Service
+			}
 
-		backends, draining := EndpointsForPort(slices, p.Name)
-		if len(backends) == 0 {
-			continue
-		}
+			backends, draining := EndpointsForPort(slices, p.Name)
+			backends = SameFamily(backends, addr)
+			draining = SameFamily(draining, addr)
+			if len(backends) == 0 {
+				continue
+			}
 
-		out = append(out, desiredVIP{
-			VIP: config.VIP{
-				Address:  addr,
-				Port:     uint16(p.Port),
-				Protocol: proto,
-				Mode:     config.ModeNAT,
-				Backends: backends,
-			},
-			DrainingBackends: draining,
-		})
+			out = append(out, desiredVIP{
+				VIP: config.VIP{
+					Address:  addr,
+					Port:     uint16(p.Port),
+					Protocol: proto,
+					Mode:     config.ModeNAT,
+					Backends: backends,
+				},
+				DrainingBackends: draining,
+			})
+		}
 	}
 	return out, nil
 }
 
-func ingressIPv4(svc *corev1.Service) string {
+// ingressIPs returns every LoadBalancer ingress IP (IPv4 and IPv6), in
+// status order. Hostname-only ingress entries are skipped.
+func ingressIPs(svc *corev1.Service) []string {
 	if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
-		return ""
+		return nil
 	}
+	var out []string
+	seen := map[string]bool{}
 	for _, ing := range svc.Status.LoadBalancer.Ingress {
 		if ing.IP == "" {
 			continue
 		}
-		if ip := net.ParseIP(ing.IP).To4(); ip != nil {
-			return ip.String()
+		ip := net.ParseIP(ing.IP)
+		if ip == nil {
+			continue
+		}
+		s := ip.String()
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+// ingressIPv4 is kept for callers that still want the first IPv4 ingress
+// only (e.g. older tests). Prefer ingressIPs for new code.
+func ingressIPv4(svc *corev1.Service) string {
+	for _, ip := range ingressIPs(svc) {
+		if addr, err := netip.ParseAddr(ip); err == nil && addr.Is4() {
+			return ip
 		}
 	}
 	return ""
@@ -91,17 +120,12 @@ func protocolFor(p corev1.Protocol) (config.Protocol, bool) {
 
 // EndpointsForPort collects every serving backend, across every
 // EndpointSlice sharding this Service's endpoints, whose slice-local port
-// entry matches portName (Kubernetes matches Service ports to EndpointPort
-// entries by name; an unnamed single-port Service has portName == "" and
-// each slice has exactly one port whose Name is also ""). A "not serving"
-// endpoint (fully torn down, not just terminating) is skipped entirely; a
-// serving-but-not-ready one is included so its established connections
-// keep flowing, and reported back in the draining slice so the caller
-// excludes it from new-flow selection. Exported: workload- and
-// Service-agnostic (never reads a Pod), reused by internal/gatewayapi for
-// TCPRoute/UDPRoute backendRefs.
+// entry matches portName. IPv4 and IPv6 addresses are both accepted;
+// callers that need a single address family (because the VIP is
+// family-scoped) should filter with sameFamily. Exported: reused by
+// internal/gatewayapi for TCPRoute/UDPRoute backendRefs.
 func EndpointsForPort(slices []*discoveryv1.EndpointSlice, portName string) (backends, draining []config.Backend) {
-	seen := map[string]bool{} // "addr:port" — dedupe across slices, defensive against overlap
+	seen := map[string]bool{} // "addr:port" — dedupe across slices
 	for _, slice := range slices {
 		targetPort, ok := PortForName(slice.Ports, portName)
 		if !ok {
@@ -113,9 +137,9 @@ func EndpointsForPort(slices []*discoveryv1.EndpointSlice, portName string) (bac
 			}
 			ready := ep.Conditions.Ready != nil && *ep.Conditions.Ready
 			for _, addr := range ep.Addresses {
-				ip := net.ParseIP(addr).To4()
+				ip := net.ParseIP(addr)
 				if ip == nil {
-					continue // IPv6 endpoint: v0.2 is IPv4-only
+					continue
 				}
 				b := config.Backend{Address: ip.String(), Port: targetPort}
 				key := fmt.Sprintf("%s:%d", b.Address, b.Port)
@@ -131,6 +155,25 @@ func EndpointsForPort(slices []*discoveryv1.EndpointSlice, portName string) (bac
 		}
 	}
 	return backends, draining
+}
+
+// SameFamily keeps backends whose address family matches vip.
+func SameFamily(backends []config.Backend, vip string) []config.Backend {
+	vipAddr, err := netip.ParseAddr(vip)
+	if err != nil {
+		return nil
+	}
+	var out []config.Backend
+	for _, b := range backends {
+		ba, err := netip.ParseAddr(b.Address)
+		if err != nil {
+			continue
+		}
+		if ba.Is4() == vipAddr.Is4() {
+			out = append(out, b)
+		}
+	}
+	return out
 }
 
 // PortForName is exported alongside EndpointsForPort for the same reason.
@@ -150,11 +193,6 @@ func PortForName(ports []discoveryv1.EndpointPort, name string) (uint16, bool) {
 	return 0, false
 }
 
-// endpointServing reports whether ep should be programmed into the
-// dataplane at all (as opposed to draining: still programmed, just
-// excluded from new-flow selection — see EndpointsForPort). Conditions
-// default to true when unset per the EndpointSlice API's documented
-// zero-value semantics.
 func endpointServing(ep discoveryv1.Endpoint) bool {
 	return ep.Conditions.Serving == nil || *ep.Conditions.Serving
 }
