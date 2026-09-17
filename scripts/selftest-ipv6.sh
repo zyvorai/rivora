@@ -7,33 +7,27 @@
 # spread/failover checks but with an all-IPv6 topology (ULA prefix
 # fd00:77::/64, echoing the v4 test's 10.77.0.0/24).
 #
-# Two deliberate differences from selftest.sh, both IPv6-specific:
+# One deliberate difference from selftest.sh: DSR mode's "backends mustn't
+# answer neighbor discovery for the VIP" problem doesn't have as clean an
+# equivalent to v4's arp_ignore/arp_announce sysctls, and solving IPv6
+# Neighbor Discovery suppression correctly is arguably part of the future
+# NDP-speaker milestone's job, not this dataplane-foundation one. So this
+# script sidesteps it entirely: the client gets a static, permanent IPv6
+# neighbor entry pointing the VIP directly at the LB's own MAC, and never
+# relies on live NDP resolution for the VIP at all. This isolates "does the
+# XDP/TCX forwarding and checksum logic work" (this script's actual job)
+# from "does NDP-based VIP ownership announcement work" (a separate,
+# later concern) — it isn't an oversight.
 #
-# 1. DSR mode's "backends mustn't answer neighbor discovery for the VIP"
-#    problem doesn't have as clean an equivalent to v4's arp_ignore/
-#    arp_announce sysctls, and solving IPv6 Neighbor Discovery suppression
-#    correctly is arguably part of the future NDP-speaker milestone's job,
-#    not this dataplane-foundation one. So this script sidesteps it
-#    entirely: the client gets a static, permanent IPv6 neighbor entry
-#    pointing the VIP directly at the LB's own MAC, and never relies on
-#    live NDP resolution for the VIP at all. This isolates "does the
-#    XDP/TCX forwarding and checksum logic work" (this script's actual
-#    job) from "does NDP-based VIP ownership announcement work" (a
-#    separate, later concern).
-#
-# 2. Every VIP address bound locally (on the LB's own interface, and on
-#    each DSR backend's lo) is added with `preferred_lft 0` (deprecated).
-#    Without it, a host with the VIP configured alongside its own real
-#    address can have the kernel's RFC 6724 source-address selection pick
-#    the VIP as the SOURCE for that host's *own* unrelated outbound
-#    connections (e.g. the LB's active health-check probe to a backend) —
-#    and since the backend also has that same address configured locally,
-#    it silently delivers the "reply" to itself instead of back over the
-#    wire, total packet loss from the sender's side. A deprecated address
-#    still receives traffic addressed to it; it's just never chosen to
-#    originate a new connection. IPv4 doesn't need this (selftest.sh has
-#    run fine without it all session) — its source-address selection is
-#    far simpler and doesn't have this failure mode.
+# DSR also omits binding the VIP on the LB itself. With a permanent client
+# neigh the LB does not need to own the address on-wire for XDP to match
+# it, and putting the VIP on veth6-lb makes the LB's own health-check
+# probes source FROM the VIP (RFC 6724). Backends that also bind that VIP
+# on lo then absorb the reply locally — total silent loss of health
+# probes. preferred_lft 0 is the usual fix, but on CI runners it was
+# observed not to stick (addr still showed preferred_lft forever); omitting
+# the LB VIP in DSR is the reliable isolation. NAT still binds the VIP on
+# the LB (backends do not), matching selftest.sh.
 #
 # Must run as root (network namespaces, BPF program attach).
 # Usage: sudo ./scripts/selftest-ipv6.sh [--quick]
@@ -114,6 +108,12 @@ cleanup() {
 trap cleanup EXIT
 
 setup_topology() {
+    # CI runners commonly ship ip6tables with a default-DROP FORWARD
+    # policy. This test's bridge lives in the root netns, so if
+    # br_netfilter is loaded, bridged IPv6 traffic is subject to that
+    # FORWARD chain. Best-effort: no-op where ip6tables is absent.
+    ip6tables -P FORWARD ACCEPT 2>/dev/null || true
+
     # Defensive clean slate — see selftest.sh's identical comment: an
     # interrupted previous run can leave orphaned veth halves behind even
     # though their namespace is long gone.
@@ -193,6 +193,40 @@ wait_for_api() {
     return 1
 }
 
+# wait_for_backend_health polls /api/v1/backends until backend ids 0 and 1
+# report the requested healthy flags (Python True/False), or times out.
+# Failover probes must not run until rivorad has actually marked the killed
+# backend unhealthy — a fixed sleep races the health-check interval.
+wait_for_backend_health() {
+    local want0="$1" want1="$2"
+    local i json
+    for i in $(seq 1 40); do
+        json=$(ip netns exec "$NS_LB" curl -sf "http://127.0.0.1:9870/api/v1/backends" 2>/dev/null) || {
+            sleep 0.25
+            continue
+        }
+        if python3 -c "
+import json, sys
+want0, want1 = ${want0}, ${want1}
+bs = json.load(sys.stdin)
+by = {b['id']: bool(b['healthy']) for b in bs}
+sys.exit(0 if by.get(0) is want0 and by.get(1) is want1 else 1)
+" <<<"$json"; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    return 1
+}
+
+# Bind VIP on lo for DSR backends. preferred_lft comes before "dev" so
+# iproute2 reliably applies it (RFC 6724 rule 3: deprecated = not chosen
+# as an outbound source, still accepts inbound).
+add_deprecated_vip_lo() {
+    local ns="$1"
+    ip netns exec "$ns" ip -6 addr add "${VIP}/128" preferred_lft 0 nodad dev lo
+}
+
 test_mode() {
     local mode="$1"
     section "Functional (IPv6): ${mode} mode"
@@ -203,12 +237,10 @@ test_mode() {
     be2_mac=$(ip netns exec "$NS_BE2" cat /sys/class/net/veth6-be2/address)
 
     if [ "$mode" = "dsr" ]; then
-        # DSR: VIP lives on each backend's lo (so it accepts traffic
-        # addressed to it) — preferred_lft 0 on every local copy, see the
-        # top-of-file comment for why.
-        ip netns exec "$NS_BE1" ip -6 addr add "${VIP}/128" dev lo preferred_lft 0
-        ip netns exec "$NS_BE2" ip -6 addr add "${VIP}/128" dev lo preferred_lft 0
-        ip netns exec "$NS_LB" ip -6 addr add "${VIP}/128" dev veth6-lb preferred_lft 0
+        # DSR: VIP on each backend's lo (accepts DSR dest); not on the LB
+        # (see top-of-file comment). Client permanent neigh → LB MAC.
+        add_deprecated_vip_lo "$NS_BE1"
+        add_deprecated_vip_lo "$NS_BE2"
         ip netns exec "$NS_CLIENT" ip -6 neigh add "$VIP" lladdr "$lb_mac" dev veth6-cli nud permanent
         cat > "$CONFIG" <<EOF
 interface: veth6-lb
@@ -224,7 +256,9 @@ EOF
         ip netns exec "$NS_BE2" python3 -c "$(backend_server)" "::" "$PORT" "BACKEND-2" >/dev/null 2>&1 &
         BE2_PID=$!
     else
-        ip netns exec "$NS_LB" ip -6 addr add "${VIP}/128" dev veth6-lb preferred_lft 0
+        # NAT: VIP on LB only (backends do not bind it). preferred_lft 0 so
+        # the LB prefers fd00:77::1 as its outbound health-check source.
+        ip netns exec "$NS_LB" ip -6 addr add "${VIP}/128" preferred_lft 0 nodad dev veth6-lb
         ip netns exec "$NS_CLIENT" ip -6 neigh add "$VIP" lladdr "$lb_mac" dev veth6-cli nud permanent
         # Force backend->client return traffic through the LB (its TCX
         # egress program un-NATs it there), same reasoning as selftest.sh.
@@ -267,6 +301,25 @@ EOF
         fail "${mode}: rivorad API did not come up"
     fi
 
+    # Backends start healthy; wait until probes have confirmed both before
+    # measuring Maglev spread (avoids racing the first failThreshold window
+    # if the topology is still settling).
+    if ! wait_for_backend_health True True; then
+        fail "${mode}: backends did not both become healthy before Maglev probes"
+        ip netns exec "$NS_LB" curl -s "http://127.0.0.1:9870/api/v1/backends" 2>&1 || true
+        kill "$RIVORAD_PID" 2>/dev/null
+        wait "$RIVORAD_PID" 2>/dev/null
+        RIVORAD_PID=""
+        ip netns exec "$NS_BE1" kill "$BE1_PID" 2>/dev/null; BE1_PID=""
+        ip netns exec "$NS_BE2" kill "$BE2_PID" 2>/dev/null; BE2_PID=""
+        ip netns exec "$NS_CLIENT" ip -6 neigh del "$VIP" dev veth6-cli 2>/dev/null
+        ip netns exec "$NS_LB" ip -6 addr del "${VIP}/128" dev veth6-lb 2>/dev/null
+        ip netns exec "$NS_BE1" ip -6 addr del "${VIP}/128" dev lo 2>/dev/null
+        ip netns exec "$NS_BE2" ip -6 addr del "${VIP}/128" dev lo 2>/dev/null
+        rm -f "$RIVORAD_LOG"
+        return
+    fi
+
     local results seen1 seen2
     results=$(run_probes 20)
     seen1=$(grep -c "BACKEND-1" <<<"$results")
@@ -279,20 +332,31 @@ EOF
 
     ip netns exec "$NS_BE2" kill "$BE2_PID" 2>/dev/null
     BE2_PID=""
-    sleep 3 # > failThreshold * interval
+
+    if wait_for_backend_health True False; then
+        :
+    else
+        fail "${mode}: BE2 did not go unhealthy (or BE1 lost health) after kill"
+        ip netns exec "$NS_LB" curl -s "http://127.0.0.1:9870/api/v1/backends" 2>&1 || true
+        kill "$RIVORAD_PID" 2>/dev/null
+        wait "$RIVORAD_PID" 2>/dev/null
+        RIVORAD_PID=""
+        ip netns exec "$NS_BE1" kill "$BE1_PID" 2>/dev/null; BE1_PID=""
+        ip netns exec "$NS_CLIENT" ip -6 neigh del "$VIP" dev veth6-cli 2>/dev/null
+        ip netns exec "$NS_LB" ip -6 addr del "${VIP}/128" dev veth6-lb 2>/dev/null
+        ip netns exec "$NS_BE1" ip -6 addr del "${VIP}/128" dev lo 2>/dev/null
+        ip netns exec "$NS_BE2" ip -6 addr del "${VIP}/128" dev lo 2>/dev/null
+        rm -f "$RIVORAD_LOG"
+        return
+    fi
 
     results=$(run_probes 10)
     seen1=$(grep -c "BACKEND-1" <<<"$results")
     seen2=$(grep -c "BACKEND-2" <<<"$results")
-    # Zero leakage to the removed backend is the actual correctness
-    # property under test; seen1 tolerates one stray timeout (>= 9, not
-    # == 10) for CI-runner timing flakiness right at the exact moment a
-    # backend process dies, the same tolerance-band spirit
-    # selftest-weighted.sh already uses rather than an exact count.
-    if [ "$seen1" -ge 9 ] && [ "$seen2" -eq 0 ]; then
-        pass "${mode}: failover removed BACKEND-2 from rotation, traffic reached BACKEND-1 (${seen1}/10)"
+    if [ "$seen1" -eq 10 ] && [ "$seen2" -eq 0 ]; then
+        pass "${mode}: failover removed BACKEND-2 from rotation, all traffic reached BACKEND-1"
     else
-        fail "${mode}: expected ~10 probes on BACKEND-1 and 0 on BACKEND-2 after failover, got ${seen1}/${seen2} — results: $(echo "$results" | tr '\n' ' ')"
+        fail "${mode}: expected all 10 probes on BACKEND-1 after failover, got ${seen1}/${seen2} — results: $(echo "$results" | tr '\n' ' ')"
     fi
 
     kill "$RIVORAD_PID" 2>/dev/null
