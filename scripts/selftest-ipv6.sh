@@ -222,7 +222,18 @@ test_mode() {
         # and doesn't have this failure mode in practice.)
         ip netns exec "$NS_BE1" ip -6 addr add "${VIP}/128" dev lo preferred_lft 0
         ip netns exec "$NS_BE2" ip -6 addr add "${VIP}/128" dev lo preferred_lft 0
-        ip netns exec "$NS_LB" ip -6 addr add "${VIP}/128" dev veth6-lb
+        # The LB's own copy needs preferred_lft 0 too, for a related but
+        # distinct reason: root-caused via tcpdump — the LB's own
+        # health-check ping/connect was sourcing FROM the VIP (veth6-lb
+        # has both fd00:77::1 and the VIP; RFC 6724 selection picked the
+        # VIP), and since a backend *also* owns that same address locally
+        # (on its own lo, deprecated or not — deprecation only affects
+        # being chosen as a source, not local-address recognition), the
+        # backend's reply got delivered to ITS OWN loopback instead of
+        # back over the wire to the LB — total, silent packet loss from
+        # the LB's perspective. Deprecating it here stops the LB itself
+        # from ever picking it as an outbound source.
+        ip netns exec "$NS_LB" ip -6 addr add "${VIP}/128" dev veth6-lb preferred_lft 0
         ip netns exec "$NS_CLIENT" ip -6 neigh add "$VIP" lladdr "$lb_mac" dev veth6-cli nud permanent
         cat > "$CONFIG" <<EOF
 interface: veth6-lb
@@ -238,7 +249,11 @@ EOF
         ip netns exec "$NS_BE2" python3 -c "$(backend_server)" "::" "$PORT" "BACKEND-2" >/dev/null 2>&1 &
         BE2_PID=$!
     else
-        ip netns exec "$NS_LB" ip -6 addr add "${VIP}/128" dev veth6-lb
+        # preferred_lft 0 here too — see the DSR branch's comment above;
+        # NAT mode doesn't put the VIP on backends' lo, but the LB's own
+        # health-check source-address-selection problem is independent of
+        # that and applies here identically.
+        ip netns exec "$NS_LB" ip -6 addr add "${VIP}/128" dev veth6-lb preferred_lft 0
         ip netns exec "$NS_CLIENT" ip -6 neigh add "$VIP" lladdr "$lb_mac" dev veth6-cli nud permanent
         # Force backend->client return traffic through the LB (its TCX
         # egress program un-NATs it there), same reasoning as selftest.sh.
