@@ -1,0 +1,14 @@
+{{- if .Values.controller.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "rivora.fullname" . }}-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rivora.controller.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.controller.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "rivora.controller.selectorLabels" . | nindent 6 }}
+{{- end }}

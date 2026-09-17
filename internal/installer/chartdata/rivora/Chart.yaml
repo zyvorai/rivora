@@ -1,0 +1,18 @@
+apiVersion: v2
+name: rivora
+description: Rivora — an eBPF-native load balancer for Kubernetes (Service/EndpointSlice reconciliation, IPAM, L2/ARP speaker)
+type: application
+version: 0.2.0
+appVersion: "0.2.0"
+kubeVersion: ">=1.24.0-0"
+home: https://zyvor.dev/rivora
+sources:
+  - https://github.com/zyvorai/rivora
+keywords:
+  - load-balancer
+  - ebpf
+  - networking
+  - metallb-alternative
+maintainers:
+  - name: Zyvor AI Labs
+    url: https://zyvor.dev

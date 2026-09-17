@@ -129,6 +129,7 @@ into backend pods, which needs a CNI-specific story not yet designed.
 
 ```text
 cmd/rivorad/            per-node daemon: BPF load/attach, static-YAML apply, K8s reconciler + speaker, local API
+cmd/rivora/             cluster-lifecycle CLI: install/upgrade/uninstall/status against a live cluster
 cmd/rivoractl/          CLI for rivorad's local API
 cmd/rivora-doctor/      standalone host-readiness checker
 cmd/rivora-controller/  leader-elected cluster-scoped IPAM Deployment
@@ -150,6 +151,7 @@ internal/k8s/           shared client-go bootstrap (in-cluster/kubeconfig, typed
 internal/speaker/       L2 ARP+NDP responder for K8s-managed VIPs (mdlayher/arp + ndp)
 internal/bgp/           gobgp-backed BGP+BFD speaker (/32 IPv4, /128 IPv6, dual AFI/SAFI)
 internal/gatewayapi/    Gateway / TCPRoute / UDPRoute reconciler
+internal/installer/     rivora CLI's install/upgrade/uninstall/status logic (Helm SDK + embedded chart)
 bpf/                    XDP ingress + TCX egress programs (hand-rolled, no libbpf headers)
 deploy/helm/rivora/     Helm chart: rivorad DaemonSet, rivora-controller Deployment, AddressPool CRD
 deploy/systemd/         systemd unit for the static-YAML/non-Kubernetes deployment
@@ -224,10 +226,23 @@ ARP+NDP speaker (`internal/speaker`), behind its own single cluster-wide
 Lease, announces the assigned VIP on the node's dataplane interface.
 
 The [Helm chart](deploy/helm/rivora) installs both pieces plus the
-`AddressPool` CRD:
+`AddressPool` CRD — either directly with `helm`, or with the `rivora` CLI
+(`cmd/rivora`), which drives the same chart via the Helm SDK with no
+`helm` binary required:
 
 ```sh
-# IPv4 pool
+# rivora CLI — install a prebuilt binary (see Releases), or build it:
+#   make build-cli && sudo install -m755 bin/rivora /usr/local/bin/rivora
+curl -fsSL https://raw.githubusercontent.com/zyvorai/rivora/main/scripts/install-cli.sh | bash
+
+rivora install --set rivorad.interface=eth0 \
+  --set addressPools[0].name=default \
+  --set addressPools[0].addresses='{10.0.0.0/24}'
+rivora status       # cluster-wide rollout status
+rivora upgrade --set addressPools[1].name=v6 --set addressPools[1].addresses='{2001:db8:1::/64}'
+rivora uninstall
+
+# Equivalent with plain helm:
 helm install rivora deploy/helm/rivora \
   --namespace rivora-system --create-namespace \
   --set rivorad.interface=eth0 \
@@ -240,6 +255,11 @@ helm upgrade rivora deploy/helm/rivora \
   --set addressPools[1].name=v6 \
   --set addressPools[1].addresses='{2001:db8:1::/64}'
 ```
+
+`rivora`'s chart is embedded at build time from `deploy/helm/rivora` (kept
+in sync via `make sync-chart`/`make check-chart-sync`) — each CLI release
+installs exactly the chart version it shipped with; there's no
+multi-version chart registry to manage.
 
 See [`deploy/helm/rivora/README.md`](deploy/helm/rivora/README.md) for the
 full chart reference, including IPv6 pools, BGP `ipv6NextHop`, and the

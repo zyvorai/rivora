@@ -3,7 +3,8 @@
 
 .PHONY: build bpf test fmt vet selftest selftest-multivip selftest-weighted selftest-ratelimit selftest-ipv6 selftest-ndp selftest-all \
 	web web-install docs-serve docs-build \
-	deploy deploy-remote deploy-remote-quick deploy-remote-preflight deploy-remote-verify deploy-remote-uninstall deploy-remote-fleet
+	deploy deploy-remote deploy-remote-quick deploy-remote-preflight deploy-remote-verify deploy-remote-uninstall deploy-remote-fleet \
+	sync-chart check-chart-sync build-cli release-cli
 
 CLANG ?= clang
 ARCH  := $(shell uname -m)
@@ -16,7 +17,7 @@ web-install:
 web: ## Build Netra-matching console into internal/api/ui (embedded by rivorad)
 	cd web && npm run build
 
-build:
+build: sync-chart
 	@if [ ! -f internal/api/ui/index.html ]; then \
 		echo "internal/api/ui missing — building web console…"; \
 		$(MAKE) web; \
@@ -25,6 +26,43 @@ build:
 	go build -o bin/rivoractl ./cmd/rivoractl
 	go build -o bin/rivora-doctor ./cmd/rivora-doctor
 	go build -o bin/rivora-controller ./cmd/rivora-controller
+	go build -o bin/rivora ./cmd/rivora
+
+build-cli: sync-chart ## Build just the rivora cluster-install CLI
+	go build -o bin/rivora ./cmd/rivora
+
+# Cross-compiles the rivora CLI for every platform the release workflow
+# publishes (.github/workflows/release.yml's build-cli job) — lets you
+# produce real release artifacts locally without pushing a tag.
+# Usage: make release-cli VERSION=v0.3.0
+RELEASE_PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
+release-cli: sync-chart
+	@test -n "$(VERSION)" || { echo "  VERSION is required, e.g. make release-cli VERSION=v0.3.0"; exit 1; }
+	@mkdir -p dist
+	@for platform in $(RELEASE_PLATFORMS); do \
+		goos=$${platform%/*}; goarch=$${platform#*/}; \
+		name="rivora_$(VERSION)_$${goos}_$${goarch}"; \
+		echo "building $$name..."; \
+		mkdir -p "dist/$$name"; \
+		GOOS=$$goos GOARCH=$$goarch CGO_ENABLED=0 go build -ldflags "-X main.version=$(VERSION)" -o "dist/$$name/rivora" ./cmd/rivora || exit 1; \
+		tar czf "dist/$$name.tar.gz" -C dist "$$name/rivora"; \
+		( cd dist && (sha256sum "$$name.tar.gz" 2>/dev/null || shasum -a 256 "$$name.tar.gz") > "$$name.tar.gz.sha256" ); \
+		rm -rf "dist/$$name"; \
+	done
+	@echo "release artifacts in dist/"
+
+# internal/installer embeds a copy of deploy/helm/rivora (go:embed can't
+# reach outside its own package directory) — deploy/helm/rivora stays the
+# one human-facing source of truth; this copy is a generated build
+# artifact. check-chart-sync (run in CI) fails if they've drifted.
+sync-chart:
+	rm -rf internal/installer/chartdata/rivora
+	mkdir -p internal/installer/chartdata
+	cp -r deploy/helm/rivora internal/installer/chartdata/rivora
+
+check-chart-sync: sync-chart
+	git diff --exit-code internal/installer/chartdata || \
+		{ echo "internal/installer/chartdata is out of sync with deploy/helm/rivora — run 'make sync-chart' and commit the result"; exit 1; }
 
 # Linux-only: needs linux/bpf.h and friends. Run on the remote build host,
 # not on macOS — see scripts/deploy-remote.sh.

@@ -1,0 +1,105 @@
+{{- $bgpPeers := list }}
+{{- range .Values.bgp.peers }}
+{{- $entry := printf "%s:%d" .address (.asn | int) }}
+{{- if .bfd }}{{ $entry = printf "%s:bfd" $entry }}{{ end }}
+{{- $bgpPeers = append $bgpPeers $entry }}
+{{- end }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "rivora.fullname" . }}-rivorad
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rivora.rivorad.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "rivora.rivorad.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "rivora.rivorad.selectorLabels" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9871"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: {{ include "rivora.rivorad.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: rivorad
+          image: "{{ .Values.image.rivorad.repository }}:{{ .Values.image.rivorad.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.rivorad.pullPolicy }}
+          args:
+            - -kubernetes
+            - -interface={{ .Values.rivorad.interface }}
+            - -bpf-dir={{ .Values.rivorad.bpfDir }}
+            - -loadbalancer-class={{ .Values.rivorad.loadBalancerClass }}
+            - -workers={{ .Values.rivorad.workers }}
+            - -speaker={{ .Values.rivorad.speaker }}
+            - -gateway-api={{ .Values.gatewayApi.enabled }}
+            - -bgp={{ .Values.bgp.enabled }}
+            {{- if .Values.bgp.enabled }}
+            - -bgp-asn={{ .Values.bgp.asn }}
+            - -bgp-router-id={{ .Values.bgp.routerId }}
+            {{- if .Values.bgp.ipv6NextHop }}
+            - -bgp-ipv6-next-hop={{ .Values.bgp.ipv6NextHop }}
+            {{- end }}
+            - -bgp-peers={{ $bgpPeers | join "," }}
+            {{- end }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          envFrom:
+            - secretRef:
+                name: {{ include "rivora.fullname" . }}-rivorad
+          securityContext:
+            privileged: {{ .Values.rivorad.securityContext.privileged }}
+            capabilities:
+              {{- toYaml .Values.rivorad.securityContext.capabilities | nindent 14 }}
+          ports:
+            - name: api
+              containerPort: 9870
+              protocol: TCP
+            - name: metrics
+              containerPort: 9871
+              protocol: TCP
+          # The metrics port (always plain HTTP, no auth — see -metrics-listen
+          # in cmd/rivorad) is used for probes too, not the main API port:
+          # rivorad runs hostNetwork, so the API's 127.0.0.1-only listener
+          # isn't reachable via the Pod IP kubelet's default httpGet targets.
+          livenessProbe:
+            httpGet: {path: /healthz, port: metrics}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /readyz, port: metrics}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+          resources:
+            {{- toYaml .Values.rivorad.resources | nindent 12 }}
+      volumes:
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+            type: DirectoryOrCreate
+      {{- with .Values.rivorad.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      tolerations:
+        {{- toYaml .Values.rivorad.tolerations | nindent 8 }}
+      {{- with .Values.rivorad.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

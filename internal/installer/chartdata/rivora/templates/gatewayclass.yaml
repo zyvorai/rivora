@@ -1,0 +1,10 @@
+{{- if and .Values.gatewayApi.enabled .Values.gatewayClass.create }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: {{ .Values.gatewayClass.name }}
+  labels:
+    {{- include "rivora.labels" . | nindent 4 }}
+spec:
+  controllerName: rivora.zyvor.dev/gateway-controller
+{{- end }}

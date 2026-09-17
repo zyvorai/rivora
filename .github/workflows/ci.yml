@@ -14,7 +14,7 @@ jobs:
       with: {go-version: '1.27.1', cache: true}
     - run: go mod tidy && git diff --exit-code go.mod go.sum
     - run: go vet ./...
-    - run: go build ./cmd/rivorad ./cmd/rivoractl ./cmd/rivora-doctor ./cmd/rivora-controller
+    - run: go build ./cmd/rivorad ./cmd/rivoractl ./cmd/rivora-doctor ./cmd/rivora-controller ./cmd/rivora
     # -race covers the product IPv6 follow-ons (IPAM sparse alloc, BGP,
     # speaker VIP selection) plus the rest of the tree in one pass.
     - run: go test -race ./...
@@ -79,6 +79,8 @@ jobs:
         echo "$out" | grep -q 'kind: PodDisruptionBudget'
         echo "$out" | grep -q 'kind: NetworkPolicy'
         echo "$out" | grep -q 'kubernetes.io/metadata.name: monitoring'
+    - name: Chart embedded in the rivora CLI is in sync (make sync-chart)
+      run: make check-chart-sync
   crd:
     runs-on: ubuntu-latest
     steps:

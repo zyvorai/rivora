@@ -70,3 +70,76 @@ jobs:
           --predicate "${{ matrix.image }}-sbom.spdx.json" \
           --type spdxjson \
           "ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}"
+
+  # Cross-compiled `rivora` cluster CLI binaries (see cmd/rivora, internal/
+  # installer) — a curl-installable alternative to `helm install` for
+  # deploy/helm/rivora. linux+darwin only for now (Windows deferred: no
+  # confirmed demand yet, and the product itself is Linux-kernel-only).
+  build-cli:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to upload release assets
+      id-token: write # cosign keyless (OIDC) signing
+    strategy:
+      matrix:
+        goos: [linux, darwin]
+        goarch: [amd64, arm64]
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
+      with: {go-version: '1.27.1', cache: true}
+    - name: Resolve tag
+      id: tag
+      run: echo "value=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+    - name: Build
+      env:
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+        CGO_ENABLED: "0"
+      run: |
+        make sync-chart
+        mkdir -p "dist/rivora_${{ steps.tag.outputs.value }}_${{ matrix.goos }}_${{ matrix.goarch }}"
+        go build -ldflags "-X main.version=${{ steps.tag.outputs.value }}" \
+          -o "dist/rivora_${{ steps.tag.outputs.value }}_${{ matrix.goos }}_${{ matrix.goarch }}/rivora" \
+          ./cmd/rivora
+    - name: Package + checksum
+      working-directory: dist
+      run: |
+        name="rivora_${{ steps.tag.outputs.value }}_${{ matrix.goos }}_${{ matrix.goarch }}"
+        tar czf "${name}.tar.gz" "${name}/rivora"
+        sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+    - uses: sigstore/cosign-installer@v3
+    - name: Sign tarball (keyless)
+      working-directory: dist
+      run: |
+        name="rivora_${{ steps.tag.outputs.value }}_${{ matrix.goos }}_${{ matrix.goarch }}"
+        cosign sign-blob --yes --bundle "${name}.tar.gz.cosign-bundle" "${name}.tar.gz"
+    - uses: actions/upload-artifact@v4
+      with:
+        name: rivora-cli-${{ matrix.goos }}-${{ matrix.goarch }}
+        path: |
+          dist/*.tar.gz
+          dist/*.tar.gz.sha256
+          dist/*.tar.gz.cosign-bundle
+
+  publish-cli-release:
+    needs: build-cli
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: rivora-cli-*
+        path: dist
+        merge-multiple: true
+    - name: Resolve tag
+      id: tag
+      run: echo "value=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+    - name: Publish GitHub Release assets
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh release create "${{ steps.tag.outputs.value }}" --notes "rivora CLI ${{ steps.tag.outputs.value }}" --generate-notes || true
+        gh release upload "${{ steps.tag.outputs.value }}" dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.tar.gz.cosign-bundle --clobber

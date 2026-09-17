@@ -1,0 +1,35 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "rivora.fullname" . }}-controller
+  labels:
+    {{- include "rivora.controller.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["services/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["rivora.zyvor.dev"]
+    resources: ["addresspools"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["rivora.zyvor.dev"]
+    resources: ["addresspools/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+{{- if .Values.gatewayApi.enabled }}
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses", "gateways"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses/status", "gateways/status"]
+    verbs: ["get", "update", "patch"]
+{{- end }}
+{{- end }}
