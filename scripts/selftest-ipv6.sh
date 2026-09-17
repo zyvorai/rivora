@@ -98,6 +98,18 @@ cleanup() {
 trap cleanup EXIT
 
 setup_topology() {
+    # CI runners (and many Docker-enabled hosts generally) commonly ship
+    # ip6tables with a default-DROP FORWARD policy while leaving iptables
+    # (v4) permissive — v4's selftest.sh's identical bridge+veth topology
+    # never hits this because its traffic is v4. This test's bridge lives
+    # in the root netns, so if br_netfilter is loaded, bridged IPv6
+    # traffic between the veth pairs below is subject to the root netns's
+    # ip6tables FORWARD chain. Best-effort or this instead: environments
+    # without ip6tables (or where it's already permissive) just no-op here.
+    echo "  [diag] ip6tables FORWARD policy before: $(ip6tables -L FORWARD -n 2>&1 | head -1)"
+    ip6tables -P FORWARD ACCEPT 2>/dev/null || true
+    echo "  [diag] ip6tables FORWARD policy after:  $(ip6tables -L FORWARD -n 2>&1 | head -1)"
+
     # Defensive clean slate — see selftest.sh's identical comment: an
     # interrupted previous run can leave orphaned veth halves behind even
     # though their namespace is long gone.
