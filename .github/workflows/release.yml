@@ -19,7 +19,11 @@ jobs:
   build-push-sign:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # write, not read: anchore/sbom-action auto-attaches the SBOM to the
+      # matching GitHub Release when the current tag has one (created by
+      # publish-cli-release) — found the hard way on the first real
+      # release, where `contents: read` here made that attach step 403.
+      contents: write
       packages: write
       id-token: write # cosign keyless (OIDC) signing
     strategy:
@@ -155,4 +159,16 @@ jobs:
         GH_TOKEN: ${{ github.token }}
       run: |
         gh release create "${{ steps.tag.outputs.value }}" --notes "rivora CLI ${{ steps.tag.outputs.value }}" --generate-notes || true
-        gh release upload "${{ steps.tag.outputs.value }}" dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.tar.gz.cosign-bundle --clobber
+        # GitHub's release-asset upload API can 500 under concurrent writes
+        # to the same release — build-push-sign's SBOM-attach step writes
+        # to this same release in parallel. --clobber makes a retry safe.
+        uploaded=false
+        for attempt in 1 2 3 4 5; do
+          if gh release upload "${{ steps.tag.outputs.value }}" dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.tar.gz.cosign-bundle --clobber; then
+            uploaded=true
+            break
+          fi
+          echo "upload attempt ${attempt} failed, retrying in $((attempt * 5))s..."
+          sleep $((attempt * 5))
+        done
+        [ "$uploaded" = true ]
