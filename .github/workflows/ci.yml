@@ -177,7 +177,7 @@ jobs:
     # linux-tools-* is best avoided when it isn't actually required).
     - run: sudo apt-get update -qq && sudo apt-get install -y -qq clang llvm libelf-dev
     - run: make bpf
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v7
       with:
         name: bpf-objects
         path: bpf/*.o
