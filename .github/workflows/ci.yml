@@ -40,7 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - uses: azure/setup-helm@v4
+    - uses: azure/setup-helm@v5
     - run: helm lint deploy/helm/rivora --set rivorad.interface=eth0
     - name: Helm template IPv4 AddressPool
       run: |
