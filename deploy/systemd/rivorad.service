@@ -26,11 +26,15 @@ LimitMEMLOCK=infinity
 # Give in-flight API requests a moment to drain (rivorad shuts the API down
 # gracefully on SIGTERM) before systemd escalates to SIGKILL.
 TimeoutStopSec=15
+# `systemctl reload rivorad` sends SIGHUP: rivorad re-reads config.yaml and
+# applies its VIP set live (a file that fails validation is rejected and the
+# running config is kept). Interface, apiListen, healthCheck, rateLimit and bgp
+# are read only at startup and need a restart.
+ExecReload=/bin/kill -HUP $MAINPID
 # Hardening that doesn't touch what rivorad needs: BPF pins under /sys/fs/bpf,
 # `ip link` in ExecStartPre, and reading /etc/rivora. Deliberately NOT set:
 # ProtectSystem=strict / ProtectKernelTunables (would make the bpffs pin path
-# read-only) and there is no ExecReload (rivorad has no SIGHUP reload yet, and
-# an unhandled SIGHUP would terminate it).
+# read-only).
 NoNewPrivileges=yes
 ProtectSystem=full
 ProtectHome=yes

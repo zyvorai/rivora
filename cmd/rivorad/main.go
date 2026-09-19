@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -91,6 +92,18 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// SIGHUP reloads the static-YAML VIP set. Registered this early so a HUP
+	// arriving while the dataplane is still coming up is queued rather than
+	// taking the Go default action (terminate). Not used with -kubernetes,
+	// where the reconcilers own the VIP set and there is no file to re-read;
+	// a nil channel there simply never fires.
+	var hup chan os.Signal
+	if !*kubeMode {
+		hup = make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		defer signal.Stop(hup)
+	}
+
 	var cfg config.Config
 	if *kubeMode {
 		if *ifaceFlag == "" {
@@ -152,13 +165,8 @@ func main() {
 	natObj := ""
 	if *kubeMode {
 		natObj = bpfDirPath(*bpfDir, bpfmaps.ProgTCNATEgress) // K8s-managed VIPs are NAT-only (v0.2)
-	} else {
-		for _, vip := range cfg.VIPs {
-			if vip.Mode == config.ModeNAT {
-				natObj = bpfDirPath(*bpfDir, bpfmaps.ProgTCNATEgress)
-				break
-			}
-		}
+	} else if config.HasNATVIP(cfg.VIPs) {
+		natObj = bpfDirPath(*bpfDir, bpfmaps.ProgTCNATEgress)
 	}
 
 	dp, err := loader.Load(bpfDirPath(*bpfDir, bpfmaps.ProgXDPIngress), natObj)
@@ -220,11 +228,14 @@ func main() {
 			}
 		},
 	)
-	var targets []healthcheck.Target
-	for _, t := range plane.Targets() {
-		targets = append(targets, healthcheck.Target{BackendID: t.ID, Address: t.Address, Port: t.Port})
+	refreshTargets := func() {
+		var targets []healthcheck.Target
+		for _, t := range plane.Targets() {
+			targets = append(targets, healthcheck.Target{BackendID: t.ID, Address: t.Address, Port: t.Port})
+		}
+		checker.SetTargets(targets)
 	}
-	checker.SetTargets(targets)
+	refreshTargets()
 	go checker.Run()
 	defer checker.Stop()
 
@@ -235,6 +246,28 @@ func main() {
 			}
 		}()
 		logger.Info("bgp speaker enabled", "asn", cfg.BGP.ASN, "router_id", cfg.BGP.RouterID, "peers", len(cfg.BGP.Peers))
+	}
+
+	if !*kubeMode {
+		// The startup config is the baseline for "needs a restart" warnings:
+		// only the VIP set is ever re-applied, so those settings stay as they
+		// were until a restart, however many times the file is reloaded.
+		running, natLoaded := cfg, natObj != ""
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-hup:
+					reloadStaticConfig(logger, *configPath, running, natLoaded, plane, func() {
+						refreshTargets()
+						if bgpSpeaker != nil {
+							bgpSpeaker.AnnounceNow()
+						}
+					})
+				}
+			}
+		}()
 	}
 
 	if *kubeMode {
@@ -378,6 +411,54 @@ func main() {
 		logger.Warn("api graceful shutdown incomplete, closing", "err", err)
 		_ = srv.Close()
 	}
+}
+
+// vipReloader is the part of *dataplane.Dataplane a config reload needs,
+// narrowed so the reload rules can be tested without loading BPF maps.
+type vipReloader interface {
+	ReloadVIPs(desired []config.VIP) (dataplane.ReloadResult, error)
+}
+
+type reloadOutcome int
+
+const (
+	reloadRejected reloadOutcome = iota // nothing changed; the running config is kept
+	reloadApplied                       // every VIP change was applied
+	reloadPartial                       // some VIPs failed; the rest were applied
+)
+
+// reloadStaticConfig re-reads the static-YAML file and applies its VIP set.
+// A rejected reload must leave the running load balancer exactly as it was, so
+// everything that can be checked up front is checked before anything is
+// touched: the file must load and validate, and it must not introduce a NAT VIP
+// when the tc egress program (which un-NATs replies) wasn't loaded at startup.
+// Settings only read at startup are reported as ignored, not silently dropped.
+// afterApply runs once VIPs have changed (refresh health targets, nudge BGP),
+// including after a partial failure, since some VIPs did change.
+func reloadStaticConfig(logger *slog.Logger, path string, running config.Config, natLoaded bool, plane vipReloader, afterApply func()) reloadOutcome {
+	next, err := config.Load(path)
+	if err != nil {
+		logger.Error("config reload rejected; keeping the running config", "path", path, "err", err)
+		return reloadRejected
+	}
+	if !natLoaded && config.HasNATVIP(next.VIPs) {
+		logger.Error("config reload rejected: it adds a NAT VIP but the tc egress program was not loaded at startup, so replies would not be un-NATed; restart rivorad instead", "path", path)
+		return reloadRejected
+	}
+	if changed := config.RestartRequired(running, next); len(changed) > 0 {
+		logger.Warn("config reload: these settings are only read at startup and were NOT applied; restart rivorad to apply them", "settings", changed)
+	}
+
+	res, err := plane.ReloadVIPs(next.VIPs)
+	afterApply()
+	if err != nil {
+		logger.Error("config reload partly applied",
+			"added", res.Added, "updated", res.Updated, "removed", res.Removed, "unchanged", res.Unchanged, "err", err)
+		return reloadPartial
+	}
+	logger.Info("config reloaded",
+		"added", res.Added, "updated", res.Updated, "removed", res.Removed, "unchanged", res.Unchanged)
+	return reloadApplied
 }
 
 const (

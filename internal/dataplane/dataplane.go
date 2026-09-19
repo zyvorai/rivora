@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"reflect"
 	"runtime"
 	"sort"
 	"sync"
@@ -337,6 +338,106 @@ func (e *serviceEntry) applyWeightOverrides(spec config.VIP) config.VIP {
 	return out
 }
 
+// ReloadResult summarises what ReloadVIPs changed.
+type ReloadResult struct {
+	Added     int `json:"added"`
+	Updated   int `json:"updated"`
+	Removed   int `json:"removed"`
+	Unchanged int `json:"unchanged"`
+}
+
+// reloadPlan is what ReloadVIPs will do, computed without touching any map.
+type reloadPlan struct {
+	upserts   []config.VIP // new or changed, in desired order
+	removes   []string     // vip keys no longer wanted, sorted
+	added     int
+	updated   int
+	unchanged int
+}
+
+// planReload diffs the VIP specs currently programmed (current: key -> spec as
+// last supplied by the caller, i.e. without operator weight overrides) against
+// the desired set. A VIP whose spec is deep-equal is left alone entirely, so a
+// reload of an unchanged file rewrites no BPF map. If desired lists the same
+// key twice the later entry wins, matching how map writes would resolve it.
+func planReload(current map[string]config.VIP, desired []config.VIP) reloadPlan {
+	var plan reloadPlan
+	want := make(map[string]config.VIP, len(desired))
+	order := make([]string, 0, len(desired))
+	for _, v := range desired {
+		k := vipKeyString(v)
+		if _, dup := want[k]; !dup {
+			order = append(order, k)
+		}
+		want[k] = v
+	}
+	for _, k := range order {
+		v := want[k]
+		cur, exists := current[k]
+		switch {
+		case !exists:
+			plan.added++
+			plan.upserts = append(plan.upserts, v)
+		case !reflect.DeepEqual(cur, v):
+			plan.updated++
+			plan.upserts = append(plan.upserts, v)
+		default:
+			plan.unchanged++
+		}
+	}
+	for k := range current {
+		if _, keep := want[k]; !keep {
+			plan.removes = append(plan.removes, k)
+		}
+	}
+	sort.Strings(plan.removes)
+	return plan
+}
+
+// ReloadVIPs makes the programmed VIP set equal desired: it removes VIPs that
+// are gone, then adds or updates the rest (removals first, so their backend IDs
+// and Maglev extents are free for the additions). It is only meaningful for
+// static-YAML mode, where the config file is the sole source of VIPs — with
+// -kubernetes the reconcilers own the set and would be undone by this.
+//
+// It is best-effort per VIP: one VIP failing (say the Maglev table is full)
+// does not stop the others, and the joined error names each failure. A VIP whose
+// update fails can be left partially updated, but its recorded spec is not
+// advanced, so the next reload sees it as changed and retries it. Operator
+// weight overrides and drains survive, because UpsertVIP re-applies them.
+func (d *Dataplane) ReloadVIPs(desired []config.VIP) (ReloadResult, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	current := make(map[string]config.VIP, len(d.services))
+	for k, e := range d.services {
+		current[k] = e.vipSpec
+	}
+	plan := planReload(current, desired)
+
+	var errs []error
+	res := ReloadResult{Unchanged: plan.unchanged}
+	for _, k := range plan.removes {
+		if err := d.removeVIPLocked(k); err != nil {
+			errs = append(errs, fmt.Errorf("remove vip %s: %w", k, err))
+			continue
+		}
+		res.Removed++
+	}
+	for _, v := range plan.upserts {
+		if err := d.upsertVIPLocked(v); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if _, existed := current[vipKeyString(v)]; existed {
+			res.Updated++
+		} else {
+			res.Added++
+		}
+	}
+	return res, errors.Join(errs...)
+}
+
 // rebuildMaglevLocked rebuilds entry's slice of maglev_table for its
 // current backend set and weights, reusing its existing extent if the
 // backend count still fits that extent's size class, otherwise allocating
@@ -504,7 +605,10 @@ func (d *Dataplane) writeHealthLocked(id uint32) error {
 func (d *Dataplane) RemoveVIP(key string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	return d.removeVIPLocked(key)
+}
 
+func (d *Dataplane) removeVIPLocked(key string) error {
 	entry, ok := d.services[key]
 	if !ok {
 		return nil
