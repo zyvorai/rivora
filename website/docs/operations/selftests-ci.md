@@ -18,7 +18,7 @@ or `tcpdump`. Run one with `sudo ./scripts/selftest-X.sh`, or `make selftest-X`.
 | Target | Proves |
 | --- | --- |
 | `make selftest` | Single VIP, DSR and NAT, Maglev spread, health failover |
-| `make selftest-multivip` | Two VIPs do not interfere; draining excludes new flows |
+| `make selftest-multivip` | Two VIPs do not interfere; draining excludes new flows; the API and `rivoractl` answer for a node with several VIPs (`/api/v1/backends` lists both, `/api/v1/status` is a 409, not a 500) |
 | `make selftest-weighted` | 9:1 Maglev skew |
 | `make selftest-affinity` | `sessionAffinity: clientIP`: stickiness, spread across sources, reload, restart, failover |
 | `make selftest-ratelimit` | Tight node-wide per-source limit drops a burst; disabled is a no-op |
