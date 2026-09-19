@@ -50,7 +50,8 @@ struct service_config {
                            * it lands outside the VIP's populated range and
                            * reads zero-initialized (backend_id=0) slots */
     __u8  mode;           /* 0 = DSR, 1 = full NAT */
-    __u8  pad[3];
+    __u8  affinity;       /* RIVORA_AFFINITY_*: what the Maglev slot is chosen from */
+    __u8  pad[2];
 };
 _Static_assert(sizeof(struct service_config) == 16, "service_config ABI");
 
@@ -217,6 +218,15 @@ _Static_assert(sizeof(struct rl_bucket) == 16, "rl_bucket ABI");
 #define RIVORA_HEALTH_HEALTHY 1
 #define RIVORA_HEALTH_DRAINING 2
 
+/* Session affinity, chosen per service. NONE hashes the whole 5-tuple, so a client's
+ * connections spread across backends. CLIENT_IP hashes the source address only, so
+ * every connection from one client lands on the same backend for as long as the
+ * backend set is unchanged (Maglev moves only a minimal share of clients when it
+ * does). Mirrors bpfmaps.Affinity* on the Go side. An older pinned service_config
+ * has 0 here, which is NONE, so nothing changes on upgrade. */
+#define RIVORA_AFFINITY_NONE 0
+#define RIVORA_AFFINITY_CLIENT_IP 1
+
 #define RIVORA_MAGLEV_M 65537u
 #define RIVORA_MAGLEV_PROBES 8
 
@@ -275,6 +285,36 @@ static __always_inline __u32 rivora_hash5_v6(const __u8 saddr[16], const __u8 da
     h = (h ^ ((__u32)sport << 16 | dport)) * 16777619u;
     h = (h ^ proto) * 16777619u;
     return h;
+}
+
+/* murmur3's 32-bit finalizer: a single FNV round on one word is weak in its low
+ * bits, and the slot is hash % maglev_size, so consecutive client addresses
+ * (10.0.0.1, 10.0.0.2, ...) need real avalanche to spread evenly. */
+static __always_inline __u32 rivora_fmix32(__u32 h)
+{
+    h ^= h >> 16;
+    h *= 0x85ebca6bu;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35u;
+    h ^= h >> 16;
+    return h;
+}
+
+/* Source-address-only hash, for RIVORA_AFFINITY_CLIENT_IP. */
+static __always_inline __u32 rivora_hash_src(__u32 saddr)
+{
+    return rivora_fmix32((2166136261u ^ saddr) * 16777619u);
+}
+
+static __always_inline __u32 rivora_hash_src_v6(const __u8 saddr[16])
+{
+    __u32 h = 2166136261u;
+    __u32 sw[4];
+    __builtin_memcpy(sw, saddr, 16);
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+        h = (h ^ sw[i]) * 16777619u;
+    return rivora_fmix32(h);
 }
 
 #endif /* RIVORA_COMMON_H */

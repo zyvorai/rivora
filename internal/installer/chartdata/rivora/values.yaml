@@ -48,6 +48,16 @@ rivorad:
   # Requires CAP_NET_RAW (already granted below); disable only if something
   # else on the cluster already owns ARP/NDP for these VIPs.
   speaker: true
+  # Kubernetes Service semantics, by mode:
+  #  - sessionAffinity: ClientIP is honoured always: a client's connections all go to
+  #    one backend while the backend set is stable (the Service's timeoutSeconds is
+  #    not honoured; there is no timer).
+  #  - externalTrafficPolicy: Local is honoured ONLY with bgp.enabled=true AND
+  #    speaker=false. The L2 speaker answers ARP/NDP from one elected node whether or
+  #    not it runs the Service's pods, so honouring Local there could blackhole it; in
+  #    that case Local is treated as Cluster (with a once-per-Service warning in the
+  #    log). Cluster and Local both preserve the client address, since the NAT only
+  #    rewrites the destination.
 
   # apiKey/tls configure rivorad's local HTTP API the same way the
   # standalone systemd deployment does (see README.md#securing-the-api) —

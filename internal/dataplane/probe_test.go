@@ -74,3 +74,27 @@ func TestPlanReloadNoticesAProbeChange(t *testing.T) {
 		t.Errorf("an identical healthCheck was seen as a change: %+v", p)
 	}
 }
+
+func TestAffinityByte(t *testing.T) {
+	if affinityByte("") != 0 || affinityByte(config.AffinityNone) != 0 {
+		t.Error("none must encode as 0 (what an old pinned service_config holds)")
+	}
+	if affinityByte(config.AffinityClientIP) != 1 {
+		t.Error("clientIP must encode as 1 (RIVORA_AFFINITY_CLIENT_IP)")
+	}
+	// A round trip, so an adopted service reads back the affinity it was given.
+	for _, a := range []config.SessionAffinity{config.AffinityNone, config.AffinityClientIP} {
+		if got := affinityFromByte(affinityByte(a)); got != a {
+			t.Errorf("round trip of %q = %q", a, got)
+		}
+	}
+}
+
+func TestPlanReloadNoticesAnAffinityChange(t *testing.T) {
+	base := vip("10.0.0.1", 80, "10.1.0.1")
+	sticky := base
+	sticky.SessionAffinity = config.AffinityClientIP
+	if p := planReload(specs(base), []config.VIP{sticky}); p.updated != 1 {
+		t.Errorf("an affinity-only edit was not seen as a change: %+v", p)
+	}
+}
