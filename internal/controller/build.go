@@ -56,7 +56,7 @@ func buildDesiredVIPs(svc *corev1.Service, slices []*discoveryv1.EndpointSlice, 
 				continue // SCTP or other unsupported protocol: skip this port, not the whole Service
 			}
 
-			backends, draining := endpointsForPort(slices, p.Name, localOnly)
+			backends, draining := endpointsForPort(slices, p.Name, localOnly, opts.Policy.weightFor)
 			backends = SameFamily(backends, addr)
 			draining = SameFamily(draining, addr)
 			if len(backends) == 0 {
@@ -72,6 +72,8 @@ func buildDesiredVIPs(svc *corev1.Service, slices []*discoveryv1.EndpointSlice, 
 					Backends: backends,
 
 					SessionAffinity: affinity,
+					HealthCheck:     opts.Policy.probeSpec(),
+					RateLimit:       opts.Policy.vipRateLimit(),
 				},
 				DrainingBackends: draining,
 			})
@@ -90,6 +92,10 @@ type buildOptions struct {
 	// one elected node answers ARP for every VIP whether or not it has the pods: a
 	// Local Service would then blackhole whenever the leader has none.
 	LocalNode string
+
+	// Policy is the ServicePolicy in force for the Service, if any: its health
+	// probe, per-source rate limit and endpoint weights are applied to every VIP.
+	Policy *servicePolicy
 }
 
 // affinityFor maps Service.spec.sessionAffinity. ClientIP becomes source-address
@@ -158,14 +164,15 @@ func protocolFor(p corev1.Protocol) (config.Protocol, bool) {
 // family-scoped) should filter with sameFamily. Exported: reused by
 // internal/gatewayapi for TCPRoute/UDPRoute backendRefs.
 func EndpointsForPort(slices []*discoveryv1.EndpointSlice, portName string) (backends, draining []config.Backend) {
-	return endpointsForPort(slices, portName, "")
+	return endpointsForPort(slices, portName, "", nil)
 }
 
 // endpointsForPort is EndpointsForPort with an optional node filter: a non-empty
 // node keeps only endpoints that run on it. An endpoint with no node at all
 // (external addresses, hand-authored slices) is not on any node, so it is dropped
-// by the filter rather than assumed local.
-func endpointsForPort(slices []*discoveryv1.EndpointSlice, portName, node string) (backends, draining []config.Backend) {
+// by the filter rather than assumed local. weigh, if set, gives each backend its
+// weight from the endpoint it came from.
+func endpointsForPort(slices []*discoveryv1.EndpointSlice, portName, node string, weigh func(discoveryv1.Endpoint) uint32) (backends, draining []config.Backend) {
 	seen := map[string]bool{} // "addr:port" — dedupe across slices
 	for _, slice := range slices {
 		targetPort, ok := PortForName(slice.Ports, portName)
@@ -186,6 +193,9 @@ func endpointsForPort(slices []*discoveryv1.EndpointSlice, portName, node string
 					continue
 				}
 				b := config.Backend{Address: ip.String(), Port: targetPort}
+				if weigh != nil {
+					b.Weight = weigh(ep)
+				}
 				key := fmt.Sprintf("%s:%d", b.Address, b.Port)
 				if seen[key] {
 					continue

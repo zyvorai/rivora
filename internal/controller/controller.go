@@ -23,6 +23,9 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -30,6 +33,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
+	"github.com/zyvorai/rivora/api/v1alpha1"
 	"github.com/zyvorai/rivora/internal/config"
 	"github.com/zyvorai/rivora/internal/dataplane"
 )
@@ -82,6 +86,15 @@ type Reconciler struct {
 	// Guarded by mu.
 	warnedLocal map[string]bool
 
+	// policyLister reads ServicePolicy objects; nil unless EnableServicePolicies
+	// was called, in which case every Service simply has no policy.
+	policyLister  cache.GenericLister
+	policyFactory dynamicinformer.DynamicSharedInformerFactory
+	// warnedPolicy remembers, per policy "namespace/name", the last problem logged
+	// about it (keyed by its resourceVersion), so a bad policy is reported once per
+	// edit rather than on every reconcile. Guarded by mu.
+	warnedPolicy map[string]string
+
 	// OnChange, if set, is called after every reconcile that touched the
 	// dataplane (create/update/remove) — rivorad uses it to refresh the
 	// active health checker's target list, since Targets() only reflects
@@ -107,8 +120,9 @@ func New(clientset kubernetes.Interface, plane dataplaner, lbClass string, logge
 		queue: workqueue.NewTypedRateLimitingQueue[string](
 			workqueue.DefaultTypedControllerRateLimiter[string](),
 		),
-		installed:   map[string][]string{},
-		warnedLocal: map[string]bool{},
+		installed:    map[string][]string{},
+		warnedLocal:  map[string]bool{},
+		warnedPolicy: map[string]string{},
 	}
 
 	svcInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -123,6 +137,98 @@ func New(clientset kubernetes.Interface, plane dataplaner, lbClass string, logge
 	})
 
 	return r, factory
+}
+
+// EnableServicePolicies makes the reconciler honour ServicePolicy objects (see
+// api/v1alpha1): the CRD must be installed, or the informer never syncs and Run
+// fails. Call before Run.
+func (r *Reconciler) EnableServicePolicies(dyn dynamic.Interface) {
+	r.policyFactory = dynamicinformer.NewDynamicSharedInformerFactory(dyn, 30*time.Second)
+	inf := r.policyFactory.ForResource(v1alpha1.ServicePolicyResource)
+	r.policyLister = inf.Lister()
+	inf.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj interface{}) { r.enqueuePolicyTarget(obj) },
+		UpdateFunc: func(old, obj interface{}) { r.enqueuePolicyTarget(old); r.enqueuePolicyTarget(obj) },
+		DeleteFunc: func(obj interface{}) { r.enqueuePolicyTarget(obj) },
+	})
+}
+
+// enqueuePolicyTarget queues the Service a policy points at. On an update both the
+// old and new object are passed, so retargeting a policy re-reconciles the Service
+// it left as well as the one it joined.
+func (r *Reconciler) enqueuePolicyTarget(obj interface{}) {
+	if tomb, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = tomb.Obj
+	}
+	u, ok := obj.(runtime.Unstructured)
+	if !ok {
+		return
+	}
+	p, err := policyFromUnstructured(u)
+	if err != nil || p.Spec.TargetRef.Name == "" {
+		return
+	}
+	r.queue.Add(p.Namespace + "/" + p.Spec.TargetRef.Name)
+}
+
+func policyFromUnstructured(u runtime.Unstructured) (*v1alpha1.ServicePolicy, error) {
+	p := &v1alpha1.ServicePolicy{}
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.UnstructuredContent(), p); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// policyFor returns the compiled ServicePolicy governing service ns/name, or nil.
+// A policy that fails validation is not applied at all and is logged once per edit.
+func (r *Reconciler) policyFor(ns, name string) *servicePolicy {
+	if r.policyLister == nil {
+		return nil
+	}
+	objs, err := r.policyLister.ByNamespace(ns).List(labels.Everything())
+	if err != nil {
+		r.logger.Error("list service policies", "namespace", ns, "err", err)
+		return nil
+	}
+	var targeting []*v1alpha1.ServicePolicy
+	for _, o := range objs {
+		u, ok := o.(runtime.Unstructured)
+		if !ok {
+			continue
+		}
+		p, err := policyFromUnstructured(u)
+		if err != nil {
+			continue
+		}
+		if p.Spec.TargetRef.Name == name {
+			targeting = append(targeting, p)
+		}
+	}
+	winner, ignored := pickPolicy(targeting)
+	if winner == nil {
+		return nil
+	}
+	for _, ig := range ignored {
+		r.warnPolicyOnce(ig, fmt.Sprintf("ignored: ServicePolicy %s/%s already governs Service %s", winner.Namespace, winner.Name, name))
+	}
+	sp, err := compilePolicy(winner)
+	if err != nil {
+		r.warnPolicyOnce(winner, "not applied, the Service keeps its defaults: "+err.Error())
+		return nil
+	}
+	return sp
+}
+
+func (r *Reconciler) warnPolicyOnce(p *v1alpha1.ServicePolicy, msg string) {
+	key := p.Namespace + "/" + p.Name
+	stamp := p.ResourceVersion + "|" + msg
+	r.mu.Lock()
+	seen := r.warnedPolicy[key] == stamp
+	r.warnedPolicy[key] = stamp
+	r.mu.Unlock()
+	if !seen {
+		r.logger.Error("ServicePolicy "+msg, "policy", key)
+	}
 }
 
 // LocalPolicy says how a Service's externalTrafficPolicy: Local is treated.
@@ -173,10 +279,15 @@ func (r *Reconciler) Run(ctx context.Context, factory informers.SharedInformerFa
 	defer r.queue.ShutDown()
 
 	factory.Start(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(),
+	synced := []cache.InformerSynced{
 		factory.Core().V1().Services().Informer().HasSynced,
 		factory.Discovery().V1().EndpointSlices().Informer().HasSynced,
-	) {
+	}
+	if r.policyFactory != nil {
+		r.policyFactory.Start(ctx.Done())
+		synced = append(synced, r.policyFactory.ForResource(v1alpha1.ServicePolicyResource).Informer().HasSynced)
+	}
+	if !cache.WaitForCacheSync(ctx.Done(), synced...) {
 		return fmt.Errorf("timed out waiting for informer caches to sync")
 	}
 	r.logger.Info("controller caches synced")
@@ -235,7 +346,7 @@ func (r *Reconciler) reconcile(key string) error {
 	}
 
 	r.noteLocalPolicy(key, svc)
-	desired, err := buildDesiredVIPs(svc, slices, buildOptions{LocalNode: r.localPolicy.Node})
+	desired, err := buildDesiredVIPs(svc, slices, buildOptions{LocalNode: r.localPolicy.Node, Policy: r.policyFor(ns, name)})
 	if err != nil {
 		return err
 	}

@@ -311,6 +311,9 @@ jobs:
     - name: Session affinity selftest (clientIP stickiness, reload, restart, failover, veth/netns)
       if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-affinity.sh
+    - name: Per-VIP rate limit selftest (own limit, isolation, override, reload, IPv4 + IPv6)
+      if: ${{ !cancelled() }}
+      run: sudo bash scripts/selftest-vipratelimit.sh
     - name: NAT checksum selftest (TCP/UDP over IPv4 and IPv6, checksum offload off)
       if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-checksum.sh

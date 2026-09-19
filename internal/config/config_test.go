@@ -442,3 +442,48 @@ vips:
 		t.Error("a mis-cased sessionAffinity loaded; a typo must fail, not silently mean none")
 	}
 }
+
+func TestVIPRateLimitValidation(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		rl   VIPRateLimit
+		ok   bool
+	}{
+		{"unset", VIPRateLimit{}, true},
+		{"both set", VIPRateLimit{PerSourcePacketsPerSecond: 5, Burst: 10}, true},
+		{"rate only", VIPRateLimit{PerSourcePacketsPerSecond: 5}, false},
+		{"burst only", VIPRateLimit{Burst: 10}, false},
+	} {
+		cfg := validConfig()
+		cfg.VIPs[0].RateLimit = c.rl
+		if err := cfg.Validate(); (err == nil) != c.ok {
+			t.Errorf("%s: Validate() = %v, want ok=%v", c.name, err, c.ok)
+		}
+	}
+	if (VIPRateLimit{}).Set() {
+		t.Error("the zero value must mean 'not set'")
+	}
+}
+
+func TestLoadParsesPerVIPRateLimit(t *testing.T) {
+	path := t.TempDir() + "/c.yaml"
+	body := `interface: eth0
+vips:
+  - {address: 10.0.0.100, port: 80, protocol: tcp, mode: nat, backends: [{address: 10.0.0.11, port: 8080}],
+     rateLimit: {perSourcePacketsPerSecond: 25, burst: 50}}
+  - {address: 10.0.0.101, port: 80, protocol: tcp, mode: nat, backends: [{address: 10.0.0.12, port: 8080}]}
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.VIPs[0].RateLimit; got.PerSourcePacketsPerSecond != 25 || got.Burst != 50 {
+		t.Errorf("vip 0 rateLimit = %+v", got)
+	}
+	if cfg.VIPs[1].RateLimit.Set() {
+		t.Error("a VIP without rateLimit must leave it unset")
+	}
+}

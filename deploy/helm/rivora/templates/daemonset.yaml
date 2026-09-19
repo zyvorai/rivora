@@ -44,6 +44,7 @@ spec:
             - -workers={{ .Values.rivorad.workers }}
             - -speaker={{ .Values.rivorad.speaker }}
             - -gateway-api={{ .Values.gatewayApi.enabled }}
+            - -service-policy={{ .Values.servicePolicy.enabled }}
             - -bgp={{ .Values.bgp.enabled }}
             {{- if .Values.bgp.enabled }}
             - -bgp-asn={{ .Values.bgp.asn }}

@@ -207,6 +207,61 @@ struct rl_bucket {
 };
 _Static_assert(sizeof(struct rl_bucket) == 16, "rl_bucket ABI");
 
+/* A Service can carry its own SYN rate limit, which replaces the node-wide one for
+ * that VIP. Its config lives in svc_rl_config_map, indexed by service_id and shaped
+ * like rl_config (enabled == 0 means "use the node-wide limit"). Its buckets are
+ * keyed by (service_id, source) so two VIPs never share a client's tokens. */
+struct svc_rl_key {
+    __u32 service_id;
+    __u32 saddr;      /* network byte order */
+};
+_Static_assert(sizeof(struct svc_rl_key) == 8, "svc_rl_key ABI");
+
+struct svc_rl_key6 {
+    __u32 service_id;
+    __u8  saddr[16];  /* network byte order */
+};
+_Static_assert(sizeof(struct svc_rl_key6) == 20, "svc_rl_key6 ABI");
+
+/* Beyond this, a bucket is treated as fully refilled regardless of its
+ * configured rate — caps the refill multiply below against overflow
+ * without needing to reason about how long a source IP has been idle
+ * (which, for a long-uptime LB, could otherwise be an arbitrarily large
+ * nanosecond count). Any sane rate/burst combination refills in well
+ * under 10s anyway. */
+#define RIVORA_RL_MAX_ELAPSED_NS 10000000000ULL
+
+/* One token-bucket step: refill cur (a fresh, full bucket when NULL) for the time
+ * since it was last touched, take one token if there is one, write the result to
+ * out, and report whether the bucket was empty. Shared by the node-wide and the
+ * per-service limiters and by their IPv4 and IPv6 forms, so the maths exists once. */
+static __always_inline int rl_take(const struct rl_config *cfg, const struct rl_bucket *cur,
+                                   struct rl_bucket *out, __u64 now)
+{
+    __u64 tokens = cfg->burst;
+    __u64 last = now;
+    if (cur) {
+        tokens = cur->tokens;
+        last = cur->last_refill_ns;
+    }
+
+    __u64 elapsed_ns = now > last ? now - last : 0;
+    if (elapsed_ns > RIVORA_RL_MAX_ELAPSED_NS)
+        elapsed_ns = RIVORA_RL_MAX_ELAPSED_NS;
+
+    tokens += (elapsed_ns * cfg->rate_per_sec) / 1000000000ULL;
+    if (tokens > cfg->burst)
+        tokens = cfg->burst;
+
+    int exceeded = tokens < 1;
+    if (!exceeded)
+        tokens -= 1;
+
+    out->tokens = tokens;
+    out->last_refill_ns = now;
+    return exceeded;
+}
+
 #define RIVORA_MODE_DSR 0
 #define RIVORA_MODE_NAT 1
 

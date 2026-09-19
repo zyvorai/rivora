@@ -3,10 +3,18 @@
 package k8s
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
+	clienttesting "k8s.io/client-go/testing"
 )
 
 const fakeKubeconfig = `
@@ -140,5 +148,26 @@ func TestBuildConfigErrorMentionsBothFallbacks(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "kubeconfig") {
 		t.Errorf("error %q should mention kubeconfig, to point the operator at --kubeconfig/$KUBECONFIG", err.Error())
+	}
+}
+
+func TestCheckResource(t *testing.T) {
+	gvr := schema.GroupVersionResource{Group: "example.zyvor.dev", Version: "v1", Resource: "widgets"}
+	scheme := runtime.NewScheme()
+	scheme.AddKnownTypeWithName(gvr.GroupVersion().WithKind("Widget"), &unstructured.Unstructured{})
+	scheme.AddKnownTypeWithName(gvr.GroupVersion().WithKind("WidgetList"), &unstructured.UnstructuredList{})
+
+	served := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, map[schema.GroupVersionResource]string{gvr: "WidgetList"})
+	if err := CheckResource(context.Background(), served, gvr); err != nil {
+		t.Errorf("a served resource must pass, got %v", err)
+	}
+
+	missing := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, map[schema.GroupVersionResource]string{gvr: "WidgetList"})
+	missing.PrependReactor("list", "widgets", func(clienttesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewNotFound(gvr.GroupResource(), "")
+	})
+	err := CheckResource(context.Background(), missing, gvr)
+	if err == nil || !strings.Contains(err.Error(), "widgets") {
+		t.Errorf("a resource the server does not serve must fail and name it, got %v", err)
 	}
 }
