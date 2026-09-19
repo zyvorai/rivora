@@ -33,6 +33,13 @@ jobs:
     # The BGP tests that need CAP_NET_ADMIN (TCP MD5) skip themselves unprivileged; run them for real.
     - name: BGP TCP MD5 tests (privileged)
       run: sudo env "PATH=$PATH" "GOCACHE=$(go env GOCACHE)" "GOMODCACHE=$(go env GOMODCACHE)" go test -count=1 -run 'TestMD5' -v ./internal/bgp
+    # Adoption after a restart, against real kernel maps (unpinned, so nothing is shared with the
+    # runner). Without the compiled objects and root these tests skip, as they do in `go test ./...` above.
+    - name: Datapath adoption tests against kernel maps (privileged)
+      run: |
+        sudo apt-get update -qq && sudo apt-get install -y -qq clang llvm libelf-dev
+        make bpf
+        sudo env "PATH=$PATH" "GOCACHE=$(go env GOCACHE)" "GOMODCACHE=$(go env GOMODCACHE)" go test -count=1 -run 'TestKubernetesModeAdopts|TestPruneUnclaimed' -v ./internal/dataplane
     - run: gofmt -l . | tee /tmp/fmt.out && [ ! -s /tmp/fmt.out ]
   security:
     runs-on: ubuntu-latest

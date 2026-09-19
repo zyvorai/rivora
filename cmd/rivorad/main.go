@@ -34,6 +34,7 @@ import (
 	"github.com/zyvorai/rivora/internal/dataplane"
 	"github.com/zyvorai/rivora/internal/gatewayapi"
 	"github.com/zyvorai/rivora/internal/healthcheck"
+	"github.com/zyvorai/rivora/internal/initsync"
 	"github.com/zyvorai/rivora/internal/k8s"
 	"github.com/zyvorai/rivora/internal/loader"
 	"github.com/zyvorai/rivora/internal/logging"
@@ -427,6 +428,29 @@ func main() {
 			gwReconciler.OnChange = onChange
 		}
 
+		// VIPs recovered from the pinned maps stay programmed until the reconcilers have each
+		// made a full first pass; whatever none of them claimed is then removed.
+		firstPass := []*initsync.Tracker{initsync.New()}
+		reconciler.SetInitTracker(firstPass[0])
+		if gwReconciler != nil {
+			firstPass = append(firstPass, initsync.New())
+			gwReconciler.SetInitTracker(firstPass[1])
+		}
+		if plane.Unclaimed() > 0 {
+			go func() {
+				if err := initsync.WaitAll(ctx, firstReconcileTimeout, firstPass...); err != nil {
+					if ctx.Err() == nil {
+						logger.Error("not removing the VIPs recovered at start-up that nothing has claimed: the first reconcile did not finish; they stay programmed", "unclaimed", plane.Unclaimed(), "err", err)
+					}
+					return
+				}
+				if pruned := plane.PruneUnclaimed(); len(pruned) > 0 {
+					logger.Warn("removed VIPs left programmed by an earlier run that no Service or Gateway wants any more", "vips", pruned)
+					onChange()
+				}
+			}()
+		}
+
 		go func() {
 			if err := reconciler.Run(ctx, factory, *workers); err != nil {
 				logger.Error("k8s reconciler exited", "err", err)
@@ -586,9 +610,14 @@ func localPolicyFor(bgpOn, speakerOn bool, node string) controller.LocalPolicy {
 // logStartup reports what start-up found already programmed in the pinned maps.
 // Removing a VIP the config no longer lists is worth a warning of its own: it
 // was still forwarding traffic until this moment.
+// firstReconcileTimeout bounds how long start-up waits for the reconcilers' first full pass before
+// giving up on removing VIPs nothing has claimed. A Service that fails to reconcile would otherwise
+// hold that back forever; on timeout nothing is removed, since one of them might still want its VIP.
+const firstReconcileTimeout = 2 * time.Minute
+
 func logStartup(logger *slog.Logger, s dataplane.StartupSummary) {
 	if s.Adopted == 0 && s.Dropped == 0 {
-		return // fresh maps (or Kubernetes mode): nothing was there
+		return // fresh maps: nothing was there
 	}
 	logger.Info("recovered existing datapath state from the pinned maps",
 		"adopted", s.Adopted, "updated", s.Updated, "unchanged", s.Unchanged, "added", s.Added)

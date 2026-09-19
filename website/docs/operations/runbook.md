@@ -558,10 +558,20 @@ What you take on when you enable it:
   it sounds: without it, the removed VIP's service ID is reused by the first VIP
   in the new config, and traffic still addressed to the removed VIP is answered
   by another VIP's backends. `scripts/selftest-adopt.sh` reproduces that on an
-  older build and passes on this one. **Not done with `-kubernetes`**: there the
-  reconcilers supply the VIPs after start-up, so there is nothing to reconcile
-  against yet, and a VIP whose Service was deleted while `rivorad` was down stays
-  programmed until its map entry is cleared.
+  older build and passes on this one.
+- **With `-kubernetes` the same recovery happens, but removal waits for the
+  reconcilers.** At start-up `rivorad` reads the pinned VIPs back (so nothing new
+  is given an ID a leftover still holds) and leaves them forwarding: most are still
+  wanted, and removing them at once would drop connections until the Service and
+  Gateway reconcilers caught up. Each is claimed as its Service or Gateway is
+  reconciled. Once both reconcilers have finished their first full pass, whatever
+  nothing claimed (a Service deleted while `rivorad` was down) is removed, and the log
+  says `removed VIPs left programmed by an earlier run that no Service or Gateway wants any more`.
+  If a Service keeps failing to reconcile, that pass never finishes; after two minutes
+  `rivorad` logs `not removing the VIPs recovered at start-up that nothing has claimed`
+  and removes nothing (one of them might belong to the failing Service), so fix the
+  Service and restart, or remove the entry by hand. Until a leftover is claimed,
+  `rivoractl` weight changes on it are refused with "not reconciled yet".
 - **Changing `interface` or dropping every `mode: nat` VIP leaves the old link
   attached.** The start-up log warns about persisted links this config no
   longer manages; run `rivorad -detach` to clear them.

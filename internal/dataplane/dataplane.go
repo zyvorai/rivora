@@ -155,6 +155,11 @@ type Dataplane struct {
 	tunnelSrc4 net.IP
 	tunnelSrc6 net.IP
 
+	// unclaimed holds the VIPs adopted from a previous run's pinned maps that no reconciler has
+	// programmed since (Kubernetes mode; see PruneUnclaimed). An adopted entry has no spec yet, so
+	// it must not be re-upserted from one (SetBackendWeight skips it).
+	unclaimed map[string]bool
+
 	startup StartupSummary
 }
 
@@ -164,6 +169,7 @@ func New(cfg config.Config, dp *loader.Datapath) *Dataplane {
 		dp:            dp,
 		startedAt:     time.Now(),
 		services:      map[string]*serviceEntry{},
+		unclaimed:     map[string]bool{},
 		backendStates: map[uint32]*backendState{},
 		serviceAlloc:  newIDAllocator(bpfmaps.MaxVIPs),
 		backendAlloc:  newIDAllocator(bpfmaps.MaxBackends),
@@ -195,11 +201,25 @@ func (d *Dataplane) Apply(iface *net.Interface) error {
 
 	// Static-YAML mode: the file is the whole desired VIP set, so recover what
 	// a previous run left in the pinned maps and reconcile it against the file
-	// (see adopt.go) instead of programming on top of leftovers. Kubernetes mode
-	// also calls Apply, but with no VIPs — its reconcilers supply them later, so
-	// there is nothing to reconcile against, and adopting-then-reloading to an
-	// empty set would tear down every persisted VIP. It keeps the old path.
+	// (see adopt.go) instead of programming on top of leftovers.
+	//
+	// Kubernetes mode calls Apply with no VIPs: its reconcilers supply them later, so there is
+	// nothing to reconcile against yet. It still adopts, so the leftovers' service IDs, Maglev
+	// extents and backend IDs are not handed out again, but it must not remove them: they are
+	// most likely still wanted, and tearing them down would drop every connection until the
+	// reconcilers caught up. They are left forwarding, marked unclaimed; an UpsertVIP claims one,
+	// and PruneUnclaimed removes what nothing claimed once the first reconcile pass is done.
 	if len(d.cfg.VIPs) == 0 {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		sum, err := d.adoptLocked()
+		if err != nil {
+			return fmt.Errorf("adopt existing datapath state: %w", err)
+		}
+		for key := range d.services {
+			d.unclaimed[key] = true
+		}
+		d.startup = StartupSummary{AdoptSummary: sum}
 		return nil
 	}
 	d.mu.Lock()
@@ -499,7 +519,34 @@ func (d *Dataplane) upsertVIPLocked(spec config.VIP) error {
 
 	entry.vipSpec = spec
 	entry.vip = vip
+	delete(d.unclaimed, key)
 	return nil
+}
+
+// PruneUnclaimed removes every VIP adopted at start-up that no UpsertVIP has claimed since, and
+// returns their keys. Call it once every reconciler has finished its first full pass: at that
+// point a leftover nothing claimed belongs to a Service or Gateway that no longer exists (or no
+// longer wants it), and it would otherwise stay programmed for good, since the reconcilers never
+// heard of it and so never remove it. Calling it earlier would tear down VIPs still wanted.
+func (d *Dataplane) PruneUnclaimed() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	keys := make([]string, 0, len(d.unclaimed))
+	for k := range d.unclaimed {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		_ = d.removeVIPLocked(k) // never fails: it deletes best-effort
+	}
+	return keys
+}
+
+// Unclaimed returns how many adopted VIPs are still waiting to be claimed or pruned.
+func (d *Dataplane) Unclaimed() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.unclaimed)
 }
 
 // applyProbeLocked records probe as the health-check spec of every backend entry
@@ -827,6 +874,7 @@ func (d *Dataplane) removeVIPLocked(key string) error {
 		d.releaseBackendLocked(name, id)
 	}
 
+	delete(d.unclaimed, key)
 	_ = d.vipMapDelete(entry.vip)
 	var zero bpfmaps.ServiceConfig
 	_ = d.dp.Maps[bpfmaps.MapServiceConfig].Update(&entry.serviceID, &zero, ebpf.UpdateAny)
@@ -938,8 +986,14 @@ func (d *Dataplane) SetBackendWeight(backendID uint32, vipKey string, weight uin
 		name  string
 	}
 	var targets []target
+	waiting := ""
 	for key, entry := range d.services {
 		if vipKey != "" && key != vipKey {
+			continue
+		}
+		if d.unclaimed[key] {
+			// Adopted at start-up and not yet reconciled: there is no spec to rebuild from.
+			waiting = key
 			continue
 		}
 		for name, id := range entry.backendIDs {
@@ -947,6 +1001,9 @@ func (d *Dataplane) SetBackendWeight(backendID uint32, vipKey string, weight uin
 				targets = append(targets, target{entry, name})
 			}
 		}
+	}
+	if len(targets) == 0 && waiting != "" {
+		return 0, fmt.Errorf("vip %q was recovered at start-up and is not reconciled yet, try again shortly: %w", waiting, ErrVIPNotFound)
 	}
 	if len(targets) == 0 {
 		return 0, fmt.Errorf("backend %d: %w", backendID, ErrBackendNotFound)
