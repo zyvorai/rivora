@@ -49,6 +49,10 @@ var (
 const MaxBackendWeight = 1000
 
 type BackendStatus struct {
+	// VIP is the key of the VIP this row is for ("addr:port:proto", the form `rivoractl weight --vip`
+	// takes). A backend shared by several VIPs appears once per VIP, with that VIP's weight; its
+	// counters are the backend's own, so they repeat.
+	VIP     string `json:"vip,omitempty"`
 	ID      uint32 `json:"id"`
 	Address string `json:"address"`
 	Port    uint16 `json:"port"`
@@ -1138,12 +1142,50 @@ func (d *Dataplane) Status() (Status, error) {
 	}
 	switch len(all) {
 	case 0:
-		return Status{}, fmt.Errorf("no VIPs configured")
+		return Status{}, fmt.Errorf("%w: no VIPs configured", ErrNotSingleVIP)
 	case 1:
 		return all[0], nil
 	default:
-		return Status{}, fmt.Errorf("%d VIPs configured; use the vips list (rivoractl vips / /api/v1/vips) instead of status", len(all))
+		return Status{}, fmt.Errorf("%w: %d VIPs configured; use the vips list (rivoractl vips / /api/v1/vips) instead of status", ErrNotSingleVIP, len(all))
 	}
+}
+
+// ErrNotSingleVIP marks a request for "the" VIP on a node that has none or several. It is not a
+// server fault: the caller asked a single-VIP question of a node that cannot answer it, and the
+// vips list (or Backends) answers it for any number.
+var ErrNotSingleVIP = errors.New("this node does not have exactly one VIP")
+
+// Backends returns the backends of every VIP, one row per (VIP, backend), ordered by VIP then ID.
+// Unlike Status it works for any number of VIPs, including none.
+func (d *Dataplane) Backends() ([]BackendStatus, error) {
+	all, err := d.Statuses()
+	if err != nil {
+		return nil, err
+	}
+	return backendsOf(all), nil
+}
+
+// backendsOf flattens statuses into one row per (VIP, backend), labelled with the VIP.
+func backendsOf(statuses []Status) []BackendStatus {
+	rows := make([]BackendStatus, 0, len(statuses))
+	for _, st := range statuses {
+		for _, b := range st.Backends {
+			b.VIP = st.VIPKey()
+			rows = append(rows, b)
+		}
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		if rows[i].VIP != rows[j].VIP {
+			return rows[i].VIP < rows[j].VIP
+		}
+		return rows[i].ID < rows[j].ID
+	})
+	return rows
+}
+
+// VIPKey is the VIP's key in the "addr:port:proto" form (a range reads "addr:first-last:proto").
+func (s Status) VIPKey() string {
+	return fmt.Sprintf("%s:%s:%s", s.VIPAddress, s.PortLabel(), s.Protocol)
 }
 
 // affinityByte is the service_config value for a VIP's session affinity.

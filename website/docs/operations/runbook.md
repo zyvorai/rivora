@@ -22,8 +22,7 @@ auth — see [Helm chart: Observability](../kubernetes/helm.md#observability)):
 
 `rivorad` additionally serves `/api/v1/status`, `/api/v1/vips` and `/api/v1/backends` on its main API port
 (`9870`, loopback by default): see [API and console](api.md). `rivoractl status` / `rivoractl vips` wrap the
-same data for human reading (`status` and `backends` answer only on a node with exactly one VIP; use `vips`
-otherwise).
+same data for human reading ).
 
 ## A VIP stopped responding
 
@@ -91,9 +90,8 @@ The full reference (two roles, named keys and the audit trail, client certificat
 ## Draining a backend or shifting weight (live)
 
 Use these for maintenance and canary shifts without editing config or
-restarting `rivorad`. Backend IDs come from `rivoractl backends` on a node with one VIP, and from
-`rivoractl vips --format json` (each VIP lists its backends' IDs) on a node with several, such as a
-Kubernetes node.
+restarting `rivorad`. Backend IDs come from `rivoractl backends`, which lists every VIP's backends (a backend serving
+several VIPs has one row per VIP; the ID is the same).
 
 ```bash
 rivoractl backends                 # ID, address, weight, STATE, counters
