@@ -230,10 +230,25 @@ for _ in $(seq 1 20); do
 done
 sleep 1.3
 lb 'exec:bpftool map delete pinned /sys/fs/bpf/rivora-lb/backend_map key hex 00 00 00 00'
+DEL_OUT=$(cat "${WORK}/exec-${CMDN}.out" 2>/dev/null)
+# The whole scenario rests on that delete having worked. If it hadn't, "unserved"
+# would stay 0 and the check below would read as a product bug when it is not; so
+# prove the precondition first, and report it as such.
+lb 'exec:bpftool map lookup pinned /sys/fs/bpf/rivora-lb/backend_map key hex 00 00 00 00'
+LOOK_OUT=$(cat "${WORK}/exec-${CMDN}.out" 2>/dev/null)
+if echo "$LOOK_OUT" | grep -qiE 'not found|no such|ENOENT|error'; then
+    pass "precondition: the backend's map entry is really gone"
+else
+    fail "precondition: the backend_map entry still exists after the delete (delete said: '${DEL_OUT}'; lookup said: '${LOOK_OUT}')"
+fi
 UN0=$(D_UN "$VIP1")
 for _ in 1 2 3; do probe "$VIP1" 0.3 >/dev/null; sleep 1.3; done
 UN=$(D_UN "$VIP1")
 check_ge "unserved counted the packets that bypassed the load balancer" "$((UN - UN0))" 1
+if [ "$((UN - UN0))" -lt 1 ]; then
+    echo "    diagnostics: bpftool $(bpftool version 2>&1 | head -1); kernel $(uname -r); cpus $(nproc)"
+    echo "    diagnostics: $(metrics | grep -E '^rivora_(vip_unserved|vip_dropped|backend_healthy)' | tr '\n' ' ')"
+fi
 
 section "4. invariant: per-reason drops == node-wide drops; unserved excluded"
 RLT=$(( $(D_RL $VIP1) + $(D_RL $VIP2) )); NBT=$(( $(D_NB $VIP1) + $(D_NB $VIP2) ))
