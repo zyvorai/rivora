@@ -28,7 +28,11 @@ rules:
     resources: ["gatewayclasses", "gateways"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["tcproutes", "udproutes"]
+    resources: ["tcproutes", "udproutes", "referencegrants"]
+    verbs: ["get", "list", "watch"]
+  # allowedRoutes namespace selectors match on namespace labels.
+  - apiGroups: [""]
+    resources: ["namespaces"]
     verbs: ["get", "list", "watch"]
 {{- end }}
 ---

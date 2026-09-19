@@ -357,9 +357,14 @@ instead of `Service.Status.LoadBalancer.Ingress[].IP`. A `TCPRoute`/
 `EndpointSlice`s the same way the Service reconciler does; `backendRef.weight`
 (Gateway API's native traffic-split field) maps onto the existing weighted-
 Maglev backend selection, divided evenly across that backend's ready
-endpoints. Same-namespace `backendRefs` only in this version — cross-
-namespace references (which Gateway API gates behind a `ReferenceGrant`)
-aren't implemented yet.
+endpoints. Routes may attach from other namespaces where a listener's
+`allowedRoutes` says so (`Same` by default, `All`, or a namespace `Selector`,
+and `kinds`), and a `backendRef` into another namespace is used only when a
+`ReferenceGrant` there permits it. A `TCPRoute` attaches only to a `TCP`
+listener and a `UDPRoute` to a `UDP` one. `rivora-controller` reports the result
+on the objects: per-parent `Accepted` and `ResolvedRefs` conditions on each
+route, and `attachedRoutes`/`supportedKinds` on each listener. See the
+[Gateway API guide](website/docs/kubernetes/gateway-api.md).
 
 The [Helm chart](deploy/helm/rivora) wires both flags behind a
 `gatewayApi.enabled` value and can optionally create a matching
