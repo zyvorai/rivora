@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
 
+	"github.com/zyvorai/rivora/api/v1alpha1"
 	"github.com/zyvorai/rivora/internal/api"
 	"github.com/zyvorai/rivora/internal/bgp"
 	"github.com/zyvorai/rivora/internal/bpfmaps"
@@ -375,8 +376,15 @@ func main() {
 		}
 
 		if *servicePolicyOn {
-			reconciler.EnableServicePolicies(clients.Dynamic)
-			logger.Info("ServicePolicy objects are honoured")
+			// The chart turns this on by default, but Helm installs CRDs only on first install: after an
+			// upgrade from before ServicePolicy existed the CRD may be missing, and an informer on it
+			// would never sync and stall every Service. So check, and carry on without policies.
+			if perr := k8s.CheckResource(ctx, clients.Dynamic, v1alpha1.ServicePolicyResource); perr != nil {
+				logger.Error("ServicePolicy is disabled: the CRD is not installed or not readable; apply deploy/helm/rivora/crds/servicepolicy-crd.yaml and restart", "err", perr)
+			} else {
+				reconciler.EnableServicePolicies(clients.Dynamic)
+				logger.Info("ServicePolicy objects are honoured")
+			}
 		}
 
 		var gwReconciler *gatewayapi.Reconciler
