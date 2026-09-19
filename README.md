@@ -88,6 +88,9 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
   A `ServicePolicy` (CRD) sets a Service's health probe, per-source SYN rate limit and
   endpoint weights; a VIP's `rateLimit` block does the same for static configs
   (see the [ServicePolicy guide](website/docs/kubernetes/service-policy.md)).
+  VLAN-tagged (802.1Q/QinQ) traffic, IPv4 options and IPv4 fragments are balanced, and ICMP
+  path-MTU errors reach the backend that owns the connection they quote (see the
+  [runbook](website/docs/operations/runbook.md#vlans-fragments-ip-options-and-icmp)).
   A VIP can own a port range (`portRange: "30000-30100"`) or list several ports
   (`ports: [80, 443]`); see the [runbook](website/docs/operations/runbook.md#port-ranges-and-multiple-ports).
   `rivorad -persist-datapath` keeps

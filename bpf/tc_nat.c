@@ -34,13 +34,39 @@ struct {
     __type(value, struct nat_reverse_val6);
 } nat_reverse_map6 SEC(".maps");
 
-static __always_inline int handle_ipv4(void *data_end, struct ethhdr *eth)
+/* Reverse tracking of fragmented replies (see struct frag_rev_val in rivora_common.h). Same
+ * name as in xdp_ingress.o, so the loader shares one map between the two objects. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct frag_key);
+    __type(value, struct frag_rev_val);
+} frag_rev_map SEC(".maps");
+
+/* A later fragment of a backend's reply has no L4 header, so it cannot be looked up by port.
+ * It gets the source rewrite its datagram's first fragment got. Only the IP header changes:
+ * the L4 checksum lives in the first fragment, which already accounted for the new source. */
+static __always_inline int handle_v4_later_fragment(struct iphdr *iph)
 {
-    struct iphdr *iph = (void *)(eth + 1);
+    struct frag_key fk = {.saddr = iph->saddr, .daddr = iph->daddr, .id = iph->id, .proto = iph->protocol};
+    struct frag_rev_val *fv = bpf_map_lookup_elem(&frag_rev_map, &fk);
+    if (!fv)
+        return TC_ACT_OK;
+    __u32 old_saddr = iph->saddr;
+    __u32 new_saddr = fv->vip_addr;
+    csum_replace(&iph->check, &old_saddr, &new_saddr, 4);
+    iph->saddr = new_saddr;
+    return TC_ACT_OK;
+}
+
+static __always_inline int handle_ipv4(void *data_end, struct iphdr *iph)
+{
     if ((void *)(iph + 1) > data_end)
         return TC_ACT_OK;
-    if (iph->ihl != 5)
+    if (iph->ihl < 5) /* options are fine: the L4 header is found via ihl */
         return TC_ACT_OK;
+    if (iph->frag_off & __constant_htons(RIVORA_IP_OFFSET))
+        return handle_v4_later_fragment(iph);
     if (iph->protocol != IPPROTO_TCP_ && iph->protocol != IPPROTO_UDP_)
         return TC_ACT_OK;
 
@@ -75,6 +101,13 @@ static __always_inline int handle_ipv4(void *data_end, struct ethhdr *eth)
     __u16 old_sport = sport;
     __u16 new_sport = rv->vip_port;
 
+    /* First fragment of a fragmented reply: remember the rewrite for the rest of it. */
+    if (iph->frag_off & __constant_htons(RIVORA_IP_MF)) {
+        struct frag_key fk = {.saddr = iph->saddr, .daddr = iph->daddr, .id = iph->id, .proto = iph->protocol};
+        struct frag_rev_val fv = {.vip_addr = new_saddr};
+        bpf_map_update_elem(&frag_rev_map, &fk, &fv, BPF_ANY);
+    }
+
     /* Re-derive the L4 pointer fresh here too — see xdp_ingress.c's NAT
      * block for why reusing tcph/udph from much earlier doesn't reliably
      * satisfy the verifier this far into the function. */
@@ -108,9 +141,8 @@ static __always_inline int handle_ipv4(void *data_end, struct ethhdr *eth)
  * handle_ipv6 documents: no IP-header checksum to touch at all (IPv6
  * dropped it), and a UDP checksum is never "unset" over IPv6 so it's
  * always updated unconditionally, unlike v4's "if (u->check != 0)" skip. */
-static __always_inline int handle_ipv6(void *data_end, struct ethhdr *eth)
+static __always_inline int handle_ipv6(void *data_end, struct ipv6hdr *iph)
 {
-    struct ipv6hdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end)
         return TC_ACT_OK;
     if (iph->nexthdr != IPPROTO_TCP_ && iph->nexthdr != IPPROTO_UDP_)
@@ -180,10 +212,16 @@ int rivora_tc_nat_egress(struct __sk_buff *skb)
     if ((void *)(eth + 1) > data_end)
         return TC_ACT_OK;
 
-    if (eth->h_proto == __constant_htons(ETH_P_IP))
-        return handle_ipv4(data_end, eth);
-    if (eth->h_proto == __constant_htons(ETH_P_IPV6))
-        return handle_ipv6(data_end, eth);
+    /* Step over VLAN tags that are in the frame (a tag the driver offloads is not). */
+    void *l3;
+    __be16 proto;
+    if (rivora_skip_vlan(eth + 1, eth->h_proto, data_end, &l3, &proto) < 0)
+        return TC_ACT_OK;
+
+    if (proto == __constant_htons(ETH_P_IP))
+        return handle_ipv4(data_end, l3);
+    if (proto == __constant_htons(ETH_P_IPV6))
+        return handle_ipv6(data_end, l3);
     return TC_ACT_OK;
 }
 
