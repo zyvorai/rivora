@@ -76,12 +76,14 @@ func newDynamicClient() *dynamicfake.FakeDynamicClient {
 	register(gwapi.GatewayResource, "Gateway", "GatewayList")
 	register(gwapi.TCPRouteResource, "TCPRoute", "TCPRouteList")
 	register(gwapi.UDPRouteResource, "UDPRoute", "UDPRouteList")
+	register(gwapi.ReferenceGrantResource, "ReferenceGrant", "ReferenceGrantList")
 
 	gvrToListKind := map[schema.GroupVersionResource]string{
-		gwapi.GatewayClassResource: "GatewayClassList",
-		gwapi.GatewayResource:      "GatewayList",
-		gwapi.TCPRouteResource:     "TCPRouteList",
-		gwapi.UDPRouteResource:     "UDPRouteList",
+		gwapi.GatewayClassResource:   "GatewayClassList",
+		gwapi.GatewayResource:        "GatewayList",
+		gwapi.TCPRouteResource:       "TCPRouteList",
+		gwapi.UDPRouteResource:       "UDPRouteList",
+		gwapi.ReferenceGrantResource: "ReferenceGrantList",
 	}
 	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, gvrToListKind)
 }
@@ -199,6 +201,8 @@ func startSynced(t *testing.T, dyn *dynamicfake.FakeDynamicClient, plane datapla
 		dynFactory.ForResource(gwapi.GatewayResource).Informer().HasSynced,
 		dynFactory.ForResource(gwapi.TCPRouteResource).Informer().HasSynced,
 		dynFactory.ForResource(gwapi.UDPRouteResource).Informer().HasSynced,
+		factory.Core().V1().Namespaces().Informer().HasSynced,
+		dynFactory.ForResource(gwapi.ReferenceGrantResource).Informer().HasSynced,
 	) {
 		cancel()
 		t.Fatal("caches never synced")

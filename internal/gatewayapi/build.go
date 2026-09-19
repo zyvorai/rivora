@@ -44,12 +44,16 @@ func (r *Reconciler) buildDesiredVIPs(gw *gwapi.Gateway, routes []attachedRoute)
 			var backends, draining []config.Backend
 			seen := map[string]bool{}
 			for _, rt := range routes {
-				if !attachesToListener(rt.spec, l.Name) {
+				if !r.attaches(gw, l, rt.ref) {
 					continue
 				}
-				for _, rule := range rt.spec.Rules {
+				for _, rule := range rt.ref.Spec.Rules {
 					for _, br := range rule.BackendRefs {
-						bs, bsDraining, err := r.resolveBackendRef(rt.namespace, br)
+						if out := CheckBackendRef(rt.ref, br, r); !out.Resolved {
+							r.logger.Warn("backendRef not used", "route", rt.ref.Namespace+"/"+rt.ref.Name, "backendRef", br.Name, "reason", out.Reason, "why", out.Message)
+							continue
+						}
+						bs, bsDraining, err := r.resolveBackendRef(rt.ref.Namespace, br)
 						if err != nil {
 							r.logger.Error("resolve backendRef", "backendRef", br.Name, "err", err)
 							continue // one bad backendRef shouldn't drop the whole listener
@@ -126,13 +130,10 @@ func listenerProtocol(p string) (config.Protocol, bool) {
 	}
 }
 
-// attachesToListener reports whether route attaches to the listener
-// named listenerName: a parentRef with no sectionName attaches to every
-// listener on the Gateway it names; one with a sectionName attaches only
-// to that specific listener.
-func attachesToListener(spec gwapi.RouteSpec, listenerName string) bool {
-	for _, pr := range spec.ParentRefs {
-		if pr.SectionName == nil || *pr.SectionName == listenerName {
+// attaches reports whether route rr attaches to listener l of gw through any of its parentRefs.
+func (r *Reconciler) attaches(gw *gwapi.Gateway, l gwapi.GatewayListener, rr RouteRef) bool {
+	for _, pr := range rr.Spec.ParentRefs {
+		if attachToListener(gw, l, rr, pr, r).Attached {
 			return true
 		}
 	}
@@ -153,8 +154,10 @@ func attachesToListener(spec gwapi.RouteSpec, listenerName string) bool {
 // weights individual backend IPs, so the intended aggregate split is only
 // reached exactly when compared backendRefs have similar endpoint counts.
 func (r *Reconciler) resolveBackendRef(routeNamespace string, br gwapi.BackendRef) (backends, draining []config.Backend, err error) {
-	if br.Namespace != nil {
-		return nil, nil, fmt.Errorf("cross-namespace backendRef %q not supported (v1 scope)", br.Name)
+	// CheckBackendRef has already established that a cross-namespace reference is permitted.
+	svcNamespace := routeNamespace
+	if br.Namespace != nil && *br.Namespace != "" {
+		svcNamespace = *br.Namespace
 	}
 	if br.Kind != nil && *br.Kind != "Service" {
 		return nil, nil, fmt.Errorf("unsupported backendRef kind %q", *br.Kind)
@@ -163,7 +166,7 @@ func (r *Reconciler) resolveBackendRef(routeNamespace string, br gwapi.BackendRe
 		return nil, nil, fmt.Errorf("backendRef %s: port is required", br.Name)
 	}
 
-	svc, err := r.serviceLister.Services(routeNamespace).Get(br.Name)
+	svc, err := r.serviceLister.Services(svcNamespace).Get(br.Name)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -178,7 +181,7 @@ func (r *Reconciler) resolveBackendRef(routeNamespace string, br gwapi.BackendRe
 		return nil, nil, fmt.Errorf("service %s has no port %d", br.Name, *br.Port)
 	}
 
-	slices, err := r.sliceLister.EndpointSlices(routeNamespace).List(labels.SelectorFromSet(labels.Set{
+	slices, err := r.sliceLister.EndpointSlices(svcNamespace).List(labels.SelectorFromSet(labels.Set{
 		serviceNameLabel: br.Name,
 	}))
 	if err != nil {

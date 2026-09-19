@@ -24,9 +24,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic/dynamicinformer"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 
+	"github.com/zyvorai/rivora/internal/gatewayapi"
 	"github.com/zyvorai/rivora/internal/ipamctrl"
 	"github.com/zyvorai/rivora/internal/k8s"
 	"github.com/zyvorai/rivora/internal/logging"
@@ -79,6 +82,15 @@ func main() {
 	defer stop()
 
 	reconciler, factory, dynFactory := ipamctrl.New(clients.Clientset, clients.Dynamic, *lbClass, *gatewayAPI, logger)
+	// With the Gateway API on, also report route and listener status (Accepted, ResolvedRefs,
+	// attachedRoutes). One leader-elected writer: the per-node rivorad reconcilers only program the
+	// dataplane. It makes the same attach and ReferenceGrant decisions rivorad does.
+	var gwStatus *gatewayapi.StatusReconciler
+	var gwStatusFactory informers.SharedInformerFactory
+	var gwStatusDynFactory dynamicinformer.DynamicSharedInformerFactory
+	if *gatewayAPI {
+		gwStatus, gwStatusFactory, gwStatusDynFactory = gatewayapi.NewStatusReconciler(clients.Clientset, clients.Dynamic, logger)
+	}
 
 	leaderGauge := prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: "rivora", Subsystem: "controller", Name: "leader",
@@ -117,6 +129,13 @@ func main() {
 			OnStartedLeading: func(ctx context.Context) {
 				logger.Info("acquired leadership", "identity", identity)
 				leaderGauge.Set(1)
+				if gwStatus != nil {
+					go func() {
+						if err := gwStatus.Run(ctx, gwStatusFactory, gwStatusDynFactory, *workers); err != nil {
+							logger.Error("gateway status writer exited", "err", err)
+						}
+					}()
+				}
 				if err := reconciler.Run(ctx, factory, dynFactory, *workers); err != nil {
 					logger.Error("reconciler exited", "err", err)
 				}
