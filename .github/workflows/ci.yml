@@ -317,6 +317,9 @@ jobs:
     - name: Port range selftest (TCP/UDP, NAT/DSR, IPv4 + IPv6, reload, adoption)
       if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-portrange.sh
+    - name: Edge-case selftest (VLAN/QinQ, IP options, fragments, ICMP path-MTU)
+      if: ${{ !cancelled() }}
+      run: sudo bash scripts/selftest-edgecases.sh
     - name: NAT checksum selftest (TCP/UDP over IPv4 and IPv6, checksum offload off)
       if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-checksum.sh

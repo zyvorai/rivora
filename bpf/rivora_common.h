@@ -29,8 +29,66 @@ static long (*bpf_map_delete_elem)(void *map, const void *key) = (void *)BPF_FUN
 static __u64 (*bpf_ktime_get_ns)(void) = (void *)BPF_FUNC_ktime_get_ns;
 static __s64 (*bpf_csum_diff)(__be32 *from, __u32 from_size, __be32 *to, __u32 to_size, __u32 seed) = (void *)BPF_FUNC_csum_diff;
 
+#define IPPROTO_ICMP_ 1
 #define IPPROTO_TCP_ 6
 #define IPPROTO_UDP_ 17
+#define IPPROTO_ICMPV6_ 58
+
+/* IPv4 flags/offset field (network order): MF and the fragment offset. */
+#define RIVORA_IP_MF     0x2000
+#define RIVORA_IP_OFFSET 0x1fff
+
+/* ICMP / ICMPv6 error types that quote the packet that caused them. */
+#define RIVORA_ICMP_DEST_UNREACH  3  /* includes "fragmentation needed" (code 4), i.e. PMTUD */
+#define RIVORA_ICMP_TIME_EXCEEDED 11
+#define RIVORA_ICMP_PARAM_PROB    12
+#define RIVORA_ICMP6_DEST_UNREACH 1
+#define RIVORA_ICMP6_PKT_TOO_BIG  2  /* IPv6 PMTUD */
+#define RIVORA_ICMP6_TIME_EXCEEDED 3
+#define RIVORA_ICMP6_PARAM_PROB   4
+
+/* The 8-byte header of an ICMP or ICMPv6 message (type, code, checksum, 4 bytes that vary by
+ * type). Declared here rather than taken from <linux/icmp.h>, which pulls in libc headers
+ * this freestanding BPF build does not have. */
+struct rivora_icmp {
+    __u8    type;
+    __u8    code;
+    __sum16 checksum;
+    __u32   rest;
+};
+_Static_assert(sizeof(struct rivora_icmp) == 8, "icmp header");
+
+/* 802.1Q / 802.1ad tags between the Ethernet header and the network header. */
+#define RIVORA_ETH_P_8021Q  0x8100
+#define RIVORA_ETH_P_8021AD 0x88a8
+struct rivora_vlan_hdr {
+    __be16 tci;
+    __be16 encap_proto;
+};
+
+/* Skip up to two VLAN tags (802.1Q, or 802.1ad + 802.1Q for QinQ) after the Ethernet
+ * header. On success *l3 points at the network header and *proto is its EtherType
+ * (network order). Fails only if a tag is cut short. Unrolled: the verifier will not
+ * prove an open-ended loop terminates. */
+static __always_inline int rivora_skip_vlan(void *l2_payload, __be16 ethertype, void *data_end,
+                                            void **l3, __be16 *proto)
+{
+    void *p = l2_payload;
+    __be16 t = ethertype;
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+        if (t != __constant_htons(RIVORA_ETH_P_8021Q) && t != __constant_htons(RIVORA_ETH_P_8021AD))
+            break;
+        struct rivora_vlan_hdr *vh = p;
+        if ((void *)(vh + 1) > data_end)
+            return -1;
+        t = vh->encap_proto;
+        p = vh + 1;
+    }
+    *l3 = p;
+    *proto = t;
+    return 0;
+}
 
 /* Rivora ABI structs, mirrored byte-for-byte in internal/bpfmaps (Go). */
 
@@ -188,6 +246,38 @@ struct addr6_key {
     __u8 addr[16];
 };
 _Static_assert(sizeof(struct addr6_key) == 16, "addr6_key ABI");
+
+/* IPv4 fragment tracking. Only the first fragment of a datagram carries the L4 header,
+ * so only it can be matched to a VIP and given a backend; the later fragments carry just
+ * an IP header. The first fragment records (saddr, daddr, ip id, proto) -> backend here,
+ * and each later fragment of the same datagram looks that up and follows it. Fragments
+ * that arrive before their first fragment are not steered (they take the normal PASS
+ * path); the datagram is then lost, as it would be with any stateless per-packet balancer.
+ * LRU, so an abandoned datagram's entry ages out on its own. */
+struct frag_key {
+    __u32 saddr;
+    __u32 daddr;
+    __u16 id;
+    __u8  proto;
+    __u8  pad;
+};
+_Static_assert(sizeof(struct frag_key) == 12, "frag_key ABI");
+
+struct frag_val {
+    __u32 backend_id;
+    __u32 service_id;
+};
+_Static_assert(sizeof(struct frag_val) == 8, "frag_val ABI");
+
+/* The reply direction of full-NAT: a backend's fragmented reply has its source rewritten
+ * to the VIP on egress (tc_nat). The first reply fragment does that from nat_reverse_map
+ * and records (backend, client, id, proto) -> VIP here so its later fragments get the
+ * same rewrite. Shared between xdp_ingress.o and tc_nat.o by name, like nat_reverse_map. */
+struct frag_rev_val {
+    __u32 vip_addr;
+    __u32 pad;
+};
+_Static_assert(sizeof(struct frag_rev_val) == 8, "frag_rev_val ABI");
 
 struct lb_stats {
     __u64 packets;

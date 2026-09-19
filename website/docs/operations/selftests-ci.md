@@ -17,6 +17,7 @@ runs `rivorad` (or a focused Go test) as root.
 | `make selftest-vipratelimit` | Per-VIP limits: own limit, per-VIP buckets, override of the node-wide limit, reload lifts it; IPv4 + IPv6 |
 | `make selftest-portrange` | Port-range VIPs: TCP/UDP, NAT/DSR, IPv4 + IPv6, exact-port precedence, reload, adoption after a restart |
 | `make selftest-checksum` | Full-NAT leaves TCP/UDP checksums valid (IPv4 + IPv6), with checksum offload off so every packet is really verified |
+| `make selftest-edgecases` | VLAN/QinQ, IP options, IPv4 fragments (NAT + DSR), ICMP path-MTU steering (IPv4 + IPv6) |
 | `make selftest-ipv6` | Same as first over all-IPv6 |
 | `make selftest-ndp` | NS → NA for NAT IPv6 VIP |
 | `make selftest-all` | All of the above |

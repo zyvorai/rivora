@@ -178,6 +178,14 @@ struct {
     __type(value, struct rl_bucket);
 } svc_rl_buckets_map6 SEC(".maps");
 
+/* IPv4 fragment steering (see struct frag_key). */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct frag_key);
+    __type(value, struct frag_val);
+} frag_map SEC(".maps");
+
 /* Port-range VIPs (see struct vip_range_key). BPF_F_NO_PREALLOC is mandatory for an LPM
  * trie. Room for MaxVIPs ranges of a few blocks each. */
 struct {
@@ -312,16 +320,205 @@ static __always_inline int pick_backend(__u32 offset, __u32 size, __u32 local_sl
     return -1;
 }
 
+/* DSR: send the frame back out the interface it came in on, addressed to the backend. The
+ * VIP stays the destination IP, so the backend must have the VIP bound locally. */
+static __always_inline int dsr_forward(struct xdp_md *ctx, struct ethhdr *eth, const __u8 mac[6])
+{
+    __u32 ifindex = ctx->ingress_ifindex;
+    struct mac_addr *self_mac = bpf_map_lookup_elem(&iface_mac_map, &ifindex);
+    if (self_mac)
+        __builtin_memcpy(eth->h_source, self_mac->addr, 6);
+    __builtin_memcpy(eth->h_dest, mac, 6);
+    return XDP_TX;
+}
+
+/* The service a v4 (addr, port, proto) belongs to: an exact-port VIP, else a port range. */
+static __always_inline __u32 *v4_service(__u32 addr, __u16 port, __u8 proto)
+{
+    struct vip_key vk = {.addr = addr, .port = port, .proto = proto};
+    __u32 *sid = bpf_map_lookup_elem(&vip_map, &vk);
+    if (sid)
+        return sid;
+    struct vip_range_key rgk = {
+        .prefixlen = RIVORA_RANGE_FULL_PREFIX_V4,
+        .addr = addr, .proto = proto, .port = port,
+    };
+    return bpf_map_lookup_elem(&vip_range_map, &rgk);
+}
+
+static __always_inline __u32 *v6_service(const __u8 addr[16], __u16 port, __u8 proto)
+{
+    struct vip_key6 vk = {.port = port, .proto = proto};
+    __builtin_memcpy(vk.addr, addr, 16);
+    __u32 *sid = bpf_map_lookup_elem(&vip_map6, &vk);
+    if (sid)
+        return sid;
+    struct vip_range_key6 rgk = {
+        .prefixlen = RIVORA_RANGE_FULL_PREFIX_V6,
+        .proto = proto, .port = port,
+    };
+    __builtin_memcpy(rgk.addr, addr, 16);
+    return bpf_map_lookup_elem(&vip_range_map6, &rgk);
+}
+
+/* A later IPv4 fragment (offset > 0) has no L4 header, so it can't be matched to a VIP by
+ * port. It follows the backend its datagram's first fragment was given. In full-NAT only the
+ * destination address changes: the L4 header, and the checksum in it, live in the first
+ * fragment, which already accounted for the rewrite. */
+static __always_inline int handle_v4_later_fragment(struct xdp_md *ctx, void *data, void *data_end,
+                                                    struct ethhdr *eth, struct iphdr *iph)
+{
+    struct frag_key fk = {.saddr = iph->saddr, .daddr = iph->daddr, .id = iph->id, .proto = iph->protocol};
+    struct frag_val *fv = bpf_map_lookup_elem(&frag_map, &fk);
+    if (!fv)
+        return XDP_PASS; /* not ours, or its first fragment hasn't been seen */
+
+    __u32 backend_id = fv->backend_id;
+    struct service_config *cfg = bpf_map_lookup_elem(&service_config_map, &fv->service_id);
+    if (!cfg)
+        return XDP_PASS;
+    __u8 *healthy = bpf_map_lookup_elem(&backend_health_map, &backend_id);
+    if (!healthy || !*healthy) {
+        bump_stats(RIVORA_STATS_GLOBAL, 0, 1);
+        return XDP_DROP; /* the first fragment went to a backend that has since died */
+    }
+    struct backend_info *be = bpf_map_lookup_elem(&backend_map, &backend_id);
+    if (!be)
+        return XDP_PASS;
+
+    __u32 pkt_len = (__u32)(data_end - data);
+    bump_stats(RIVORA_STATS_GLOBAL, pkt_len, 0);
+    bump_stats(1 + backend_id, pkt_len, 0);
+
+    if (cfg->mode == RIVORA_MODE_DSR)
+        return dsr_forward(ctx, eth, be->mac);
+
+    __u32 old_daddr = iph->daddr;
+    __u32 new_daddr = be->addr;
+    csum_replace(&iph->check, &old_daddr, &new_daddr, 4);
+    iph->daddr = new_daddr;
+    return XDP_PASS;
+}
+
+/* An ICMP error addressed to a VIP (typically "fragmentation needed", i.e. path-MTU
+ * discovery, or "time exceeded") quotes the packet that provoked it: the reply the backend
+ * sent, which left as VIP:vport -> client:cport. Without help it lands on whichever node owns
+ * the VIP, not on the backend whose connection it is about, so that backend never learns the
+ * path MTU. Recover the connection from the quoted header and send the error to its backend:
+ * unchanged under DSR (the backend owns the VIP), and under full-NAT with the destination
+ * rewritten and the quoted source rewritten to match (VIP:vport -> backend:bport), so the
+ * backend sees a packet it actually sent. Anything unrecognised passes untouched. */
+static __always_inline int handle_v4_icmp(struct xdp_md *ctx, void *data, void *data_end,
+                                          struct ethhdr *eth, struct iphdr *iph)
+{
+    if (iph->ihl != 5)
+        return XDP_PASS;
+    struct rivora_icmp *ic = (void *)(iph + 1);
+    if ((void *)(ic + 1) > data_end)
+        return XDP_PASS;
+    if (ic->type != RIVORA_ICMP_DEST_UNREACH && ic->type != RIVORA_ICMP_TIME_EXCEEDED &&
+        ic->type != RIVORA_ICMP_PARAM_PROB)
+        return XDP_PASS;
+
+    struct iphdr *in = (void *)(ic + 1);
+    if ((void *)(in + 1) > data_end)
+        return XDP_PASS;
+    if (in->ihl != 5 || (in->protocol != IPPROTO_TCP_ && in->protocol != IPPROTO_UDP_))
+        return XDP_PASS;
+    if (in->saddr != iph->daddr) /* the quoted packet must have left from the VIP this is addressed to */
+        return XDP_PASS;
+    __u16 *ports = (void *)(in + 1);
+    if ((void *)(ports + 2) > data_end)
+        return XDP_PASS;
+    __u16 in_sport = ports[0]; /* the VIP's port */
+    __u16 in_dport = ports[1]; /* the client's port */
+
+    __u32 *sid = v4_service(in->saddr, in_sport, in->protocol);
+    if (!sid)
+        return XDP_PASS;
+    struct service_config *cfg = bpf_map_lookup_elem(&service_config_map, sid);
+    if (!cfg)
+        return XDP_PASS;
+
+    /* The connection is keyed by the request direction: client -> VIP. */
+    struct conn_key ck = {
+        .saddr = in->daddr, .daddr = in->saddr,
+        .sport = in_dport, .dport = in_sport, .proto = in->protocol,
+    };
+    __u32 *bid = bpf_map_lookup_elem(&connection_affinity_map, &ck);
+    if (!bid)
+        return XDP_PASS;
+    __u32 backend_id = *bid;
+    __u8 *healthy = bpf_map_lookup_elem(&backend_health_map, &backend_id);
+    if (!healthy || !*healthy)
+        return XDP_PASS;
+    struct backend_info *be = bpf_map_lookup_elem(&backend_map, &backend_id);
+    if (!be)
+        return XDP_PASS;
+
+    bump_stats(RIVORA_STATS_GLOBAL, (__u32)(data_end - data), 0);
+    bump_stats(1 + backend_id, (__u32)(data_end - data), 0);
+
+    if (cfg->mode == RIVORA_MODE_DSR)
+        return dsr_forward(ctx, eth, be->mac);
+
+    /* Full NAT. Re-derive every pointer fresh next to its write. */
+    __u32 vip_addr = in->saddr;
+    __u32 be_addr = be->addr;
+    __u16 new_sport = (cfg->flags & RIVORA_SVC_RANGE) ? in_sport : be->port;
+
+    if ((void *)(iph + 1) > data_end)
+        return XDP_PASS;
+    csum_replace(&iph->check, &vip_addr, &be_addr, 4); /* the outer header: destination */
+    iph->daddr = be_addr;
+
+    struct rivora_icmp *ic2 = (void *)(iph + 1);
+    if ((void *)(ic2 + 1) > data_end)
+        return XDP_PASS;
+    struct iphdr *in2 = (void *)(ic2 + 1);
+    if ((void *)(in2 + 1) > data_end)
+        return XDP_PASS;
+    __u16 *ports2 = (void *)(in2 + 1);
+    if ((void *)(ports2 + 2) > data_end)
+        return XDP_PASS;
+
+    /* The ICMP checksum covers the quoted packet, so every field changed inside it,
+     * including the quoted IP header's own checksum, is folded into it. */
+    __u16 old_in_check = in2->check;
+    csum_replace(&in2->check, &vip_addr, &be_addr, 4);
+    __u16 new_in_check = in2->check;
+    csum_replace(&ic2->checksum, &vip_addr, &be_addr, 4);
+    csum_replace(&ic2->checksum, &old_in_check, &new_in_check, 2);
+    if (new_sport != in_sport) {
+        csum_replace(&ic2->checksum, &in_sport, &new_sport, 2);
+        ports2[0] = new_sport;
+    }
+    in2->saddr = be_addr;
+    return XDP_PASS;
+}
+
 /* IPv4 path — split out of rivora_xdp_ingress unchanged (a verbatim move,
  * not a rewrite) so the v6 branch below can sit alongside it as its own
  * named function instead of growing one already-long function further. */
-static __always_inline int handle_ipv4(struct xdp_md *ctx, void *data, void *data_end, struct ethhdr *eth)
+static __always_inline int handle_ipv4(struct xdp_md *ctx, void *data, void *data_end, struct ethhdr *eth,
+                                       struct iphdr *iph)
 {
-    struct iphdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end)
         return XDP_PASS;
-    if (iph->ihl != 5) /* v0.1: no IP options */
+    if (iph->ihl < 5) /* malformed; options (ihl > 5) are fine, the L4 header is found via ihl */
         return XDP_PASS;
+
+    /* Fragments: the first one (offset 0, MF set) carries the L4 header and is balanced like
+     * any packet, then remembered; later ones (offset > 0) have no L4 header and follow it. */
+    __u16 frag = iph->frag_off;
+    __u8 first_fragment = 0;
+    if (frag & __constant_htons(RIVORA_IP_OFFSET))
+        return handle_v4_later_fragment(ctx, data, data_end, eth, iph);
+    if (frag & __constant_htons(RIVORA_IP_MF))
+        first_fragment = 1;
+
+    if (iph->protocol == IPPROTO_ICMP_)
+        return handle_v4_icmp(ctx, data, data_end, eth, iph);
     if (iph->protocol != IPPROTO_TCP_ && iph->protocol != IPPROTO_UDP_)
         return XDP_PASS;
 
@@ -344,18 +541,9 @@ static __always_inline int handle_ipv4(struct xdp_md *ctx, void *data, void *dat
         dport = udph->dest;
     }
 
-    struct vip_key vk = {.addr = iph->daddr, .port = dport, .proto = iph->protocol};
-    __u32 *service_id = bpf_map_lookup_elem(&vip_map, &vk);
-    if (!service_id) {
-        /* Not an exact-port VIP: maybe it falls in a port range. */
-        struct vip_range_key rgk = {
-            .prefixlen = RIVORA_RANGE_FULL_PREFIX_V4,
-            .addr = iph->daddr, .proto = iph->protocol, .port = dport,
-        };
-        service_id = bpf_map_lookup_elem(&vip_range_map, &rgk);
-        if (!service_id)
-            return XDP_PASS; /* not a VIP we own */
-    }
+    __u32 *service_id = v4_service(iph->daddr, dport, iph->protocol);
+    if (!service_id)
+        return XDP_PASS; /* not a VIP we own */
     __u32 sid = *service_id;
 
     /* SYN-flood mitigation: only new-connection attempts (SYN packets)
@@ -414,15 +602,18 @@ static __always_inline int handle_ipv4(struct xdp_md *ctx, void *data, void *dat
     bump_stats(RIVORA_STATS_GLOBAL, pkt_len, 0);
     bump_stats(1 + backend_id, pkt_len, 0);
 
+    /* The first fragment of a fragmented datagram: remember its backend, keyed by the
+     * ORIGINAL addresses (before any NAT rewrite), so the later fragments follow it. */
+    if (first_fragment) {
+        struct frag_key fk = {.saddr = iph->saddr, .daddr = iph->daddr, .id = iph->id, .proto = iph->protocol};
+        struct frag_val fv = {.backend_id = backend_id, .service_id = sid};
+        bpf_map_update_elem(&frag_map, &fk, &fv, BPF_ANY);
+    }
+
     if (cfg->mode == RIVORA_MODE_DSR) {
-        __u32 ifindex = ctx->ingress_ifindex;
-        struct mac_addr *self_mac = bpf_map_lookup_elem(&iface_mac_map, &ifindex);
-        if (self_mac)
-            __builtin_memcpy(eth->h_source, self_mac->addr, 6);
-        __builtin_memcpy(eth->h_dest, be->mac, 6);
         /* DSR: VIP stays the destination IP — the backend must have the VIP
          * bound locally (loopback/dummy) so it accepts and replies directly. */
-        return XDP_TX;
+        return dsr_forward(ctx, eth, be->mac);
     }
 
     /* Full NAT: rewrite destination IP/port to the backend; record the
@@ -475,17 +666,103 @@ static __always_inline int handle_ipv4(struct xdp_md *ctx, void *data, void *dat
     return XDP_PASS;
 }
 
+/* IPv6 sibling of handle_v4_icmp: Packet Too Big (path-MTU discovery, which IPv6 relies on
+ * far more than IPv4 does since routers never fragment) and the other errors that quote the
+ * offending packet. Differences from v4: the checksum of an ICMPv6 message includes a
+ * pseudo-header of the outer addresses, so rewriting the outer destination changes it too, and
+ * there is no IP header checksum inside the quoted packet. */
+static __always_inline int handle_v6_icmp(struct xdp_md *ctx, void *data, void *data_end,
+                                          struct ethhdr *eth, struct ipv6hdr *iph)
+{
+    struct rivora_icmp *ic = (void *)(iph + 1);
+    if ((void *)(ic + 1) > data_end)
+        return XDP_PASS;
+    if (ic->type != RIVORA_ICMP6_DEST_UNREACH && ic->type != RIVORA_ICMP6_PKT_TOO_BIG &&
+        ic->type != RIVORA_ICMP6_TIME_EXCEEDED && ic->type != RIVORA_ICMP6_PARAM_PROB)
+        return XDP_PASS;
+
+    struct ipv6hdr *in = (void *)(ic + 1);
+    if ((void *)(in + 1) > data_end)
+        return XDP_PASS;
+    if (in->nexthdr != IPPROTO_TCP_ && in->nexthdr != IPPROTO_UDP_)
+        return XDP_PASS;
+    if (__builtin_memcmp(&in->saddr, &iph->daddr, 16) != 0) /* must have left from the VIP this is addressed to */
+        return XDP_PASS;
+    __u16 *ports = (void *)(in + 1);
+    if ((void *)(ports + 2) > data_end)
+        return XDP_PASS;
+    __u16 in_sport = ports[0];
+    __u16 in_dport = ports[1];
+
+    __u32 *sid = v6_service((__u8 *)&in->saddr, in_sport, in->nexthdr);
+    if (!sid)
+        return XDP_PASS;
+    struct service_config *cfg = bpf_map_lookup_elem(&service_config_map, sid);
+    if (!cfg)
+        return XDP_PASS;
+
+    struct conn_key6 ck = {.sport = in_dport, .dport = in_sport, .proto = in->nexthdr};
+    __builtin_memcpy(ck.saddr, &in->daddr, 16);
+    __builtin_memcpy(ck.daddr, &in->saddr, 16);
+    __u32 *bid = bpf_map_lookup_elem(&connection_affinity_map6, &ck);
+    if (!bid)
+        return XDP_PASS;
+    __u32 backend_id = *bid;
+    __u8 *healthy = bpf_map_lookup_elem(&backend_health_map, &backend_id);
+    if (!healthy || !*healthy)
+        return XDP_PASS;
+    struct backend_info6 *be = bpf_map_lookup_elem(&backend_map6, &backend_id);
+    if (!be)
+        return XDP_PASS;
+
+    bump_stats(RIVORA_STATS_GLOBAL, (__u32)(data_end - data), 0);
+    bump_stats(1 + backend_id, (__u32)(data_end - data), 0);
+
+    if (cfg->mode == RIVORA_MODE_DSR)
+        return dsr_forward(ctx, eth, be->mac);
+
+    __u8 vip_addr[16], be_addr[16];
+    __builtin_memcpy(vip_addr, &in->saddr, 16);
+    __builtin_memcpy(be_addr, be->addr, 16);
+    __u16 new_sport = (cfg->flags & RIVORA_SVC_RANGE) ? in_sport : be->port;
+
+    if ((void *)(iph + 1) > data_end)
+        return XDP_PASS;
+    struct rivora_icmp *ic2 = (void *)(iph + 1);
+    if ((void *)(ic2 + 1) > data_end)
+        return XDP_PASS;
+    struct ipv6hdr *in2 = (void *)(ic2 + 1);
+    if ((void *)(in2 + 1) > data_end)
+        return XDP_PASS;
+    __u16 *ports2 = (void *)(in2 + 1);
+    if ((void *)(ports2 + 2) > data_end)
+        return XDP_PASS;
+
+    /* Outer destination (pseudo-header) and quoted source (payload) both fold into the checksum. */
+    csum_replace(&ic2->checksum, vip_addr, be_addr, 16);
+    csum_replace(&ic2->checksum, vip_addr, be_addr, 16);
+    if (new_sport != in_sport) {
+        csum_replace(&ic2->checksum, &in_sport, &new_sport, 2);
+        ports2[0] = new_sport;
+    }
+    __builtin_memcpy(&iph->daddr, be_addr, 16);
+    __builtin_memcpy(&in2->saddr, be_addr, 16);
+    return XDP_PASS;
+}
+
 /* IPv6 path. Structurally mirrors handle_ipv4 closely (same VIP-match ->
  * rate-limit -> connection-affinity/Maglev -> DSR-or-NAT shape), reusing
  * every address-family-agnostic map (service_config_map, maglev_table,
  * backend_health_map, stats_map, iface_mac_map, rl_config_map,
  * pick_backend()) as-is — only the address-keyed maps and a few checksum
  * details differ from v4, noted inline below. */
-static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *data_end, struct ethhdr *eth)
+static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *data_end, struct ethhdr *eth,
+                                       struct ipv6hdr *iph)
 {
-    struct ipv6hdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end)
         return XDP_PASS;
+    if (iph->nexthdr == IPPROTO_ICMPV6_)
+        return handle_v6_icmp(ctx, data, data_end, eth, iph);
     /* v0.3: no extension headers, mirroring handle_ipv4's "no IP options"
      * scope limitation — nexthdr must be TCP/UDP directly. A packet with a
      * Hop-by-Hop/Routing/Fragment/etc. extension header before the L4
@@ -512,19 +789,9 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
         dport = udph->dest;
     }
 
-    struct vip_key6 vk = {.port = dport, .proto = iph->nexthdr};
-    __builtin_memcpy(vk.addr, &iph->daddr, 16);
-    __u32 *service_id = bpf_map_lookup_elem(&vip_map6, &vk);
-    if (!service_id) {
-        struct vip_range_key6 rgk = {
-            .prefixlen = RIVORA_RANGE_FULL_PREFIX_V6,
-            .proto = iph->nexthdr, .port = dport,
-        };
-        __builtin_memcpy(rgk.addr, &iph->daddr, 16);
-        service_id = bpf_map_lookup_elem(&vip_range_map6, &rgk);
-        if (!service_id)
-            return XDP_PASS; /* not a VIP we own */
-    }
+    __u32 *service_id = v6_service((__u8 *)&iph->daddr, dport, iph->nexthdr);
+    if (!service_id)
+        return XDP_PASS; /* not a VIP we own */
     __u32 sid = *service_id;
 
     if (is_syn && rate_limit_exceeded_v6(sid, (__u8 *)&iph->saddr)) {
@@ -578,14 +845,9 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
     bump_stats(1 + backend_id, pkt_len, 0);
 
     if (cfg->mode == RIVORA_MODE_DSR) {
-        __u32 ifindex = ctx->ingress_ifindex;
-        struct mac_addr *self_mac = bpf_map_lookup_elem(&iface_mac_map, &ifindex);
-        if (self_mac)
-            __builtin_memcpy(eth->h_source, self_mac->addr, 6);
-        __builtin_memcpy(eth->h_dest, be->mac, 6);
         /* DSR: VIP stays the destination IP — the backend must have the VIP
          * bound locally so it accepts and replies directly. */
-        return XDP_TX;
+        return dsr_forward(ctx, eth, be->mac);
     }
 
     /* Full NAT (IPv6). Two real differences from handle_ipv4's NAT block,
@@ -647,10 +909,17 @@ int rivora_xdp_ingress(struct xdp_md *ctx)
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
 
-    if (eth->h_proto == __constant_htons(ETH_P_IP))
-        return handle_ipv4(ctx, data, data_end, eth);
-    if (eth->h_proto == __constant_htons(ETH_P_IPV6))
-        return handle_ipv6(ctx, data, data_end, eth);
+    /* Step over up to two VLAN tags (802.1Q, or QinQ). A DSR rewrite only touches the MACs, so
+     * the tags go through unchanged. */
+    void *l3;
+    __be16 proto;
+    if (rivora_skip_vlan(eth + 1, eth->h_proto, data_end, &l3, &proto) < 0)
+        return XDP_PASS;
+
+    if (proto == __constant_htons(ETH_P_IP))
+        return handle_ipv4(ctx, data, data_end, eth, l3);
+    if (proto == __constant_htons(ETH_P_IPV6))
+        return handle_ipv6(ctx, data, data_end, eth, l3);
     return XDP_PASS;
 }
 

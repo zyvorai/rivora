@@ -204,6 +204,39 @@ FTP, RTP media, game servers), and can list several ports at once
   ports work as they always did. Kubernetes has no port-range Service, so ranges are for
   static configs.
 
+## VLANs, fragments, IP options and ICMP
+
+Traffic that is not a plain, untagged, unfragmented packet is handled, with the limits
+below stated plainly. `scripts/selftest-edgecases.sh` exercises all of it.
+
+- **VLAN tags.** 802.1Q and QinQ (802.1ad + 802.1Q, up to two tags) are stepped over, in
+  full-NAT and DSR, IPv4 and IPv6. A DSR rewrite only changes the MACs, so tags go through
+  unchanged. Attach to the parent interface. The tag must be **in the frame** XDP sees: a NIC
+  that strips it into metadata (RX VLAN offload) hides it, and a DSR `XDP_TX` would then send
+  the frame back out untagged. If VLAN traffic misbehaves, turn RX/TX VLAN offload off
+  (`ethtool -K <if> rxvlan off txvlan off`); the selftest does this on its veths.
+- **IPv4 options.** A packet with IP options (header longer than 20 bytes) is balanced; it
+  used to be passed through untouched.
+- **IPv4 fragments.** Only a datagram's first fragment carries the port, so only it can be
+  matched to a VIP. It is balanced normally and its backend remembered (keyed by source,
+  destination, IP ID and protocol; LRU, so an abandoned datagram ages out); the later
+  fragments follow it, in DSR and NAT. In NAT the backend's reply fragments are un-NATed the
+  same way on the way out. **Not handled:** a later fragment that arrives *before* its first
+  (reordering) is not steered, and that datagram is lost, as with any stateless per-packet
+  balancer.
+- **ICMP errors (path-MTU discovery).** An ICMP "destination unreachable" (including
+  "fragmentation needed"), "time exceeded" or "parameter problem" addressed to a VIP quotes
+  the reply the backend sent. Left alone it lands on whichever node owns the VIP and the
+  backend never learns the path MTU. It is now sent to the backend that owns the connection it
+  quotes: unchanged under DSR (the backend owns the VIP), and under NAT with its destination
+  rewritten and the quoted packet rewritten to the backend's address (checksums fixed). An
+  ICMP quoting a connection that does not exist is **not** steered. IPv6 "packet too big" and
+  the other ICMPv6 errors are handled the same way. Echo (ping) to a VIP is untouched. Only
+  TCP and UDP flows are matched, and only where the quoted header has no IP options.
+- **Not handled:** IPv6 extension headers (hop-by-hop, routing, destination options) and IPv6
+  fragments. A packet whose IPv6 next header is not TCP or UDP is passed through untouched,
+  as before.
+
 ## Kubernetes Service semantics: session affinity and `externalTrafficPolicy`
 
 For `type: LoadBalancer` Services, `rivorad` reads two Service fields.
