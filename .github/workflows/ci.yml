@@ -254,15 +254,14 @@ jobs:
     - uses: actions/setup-go@v5
       with: {go-version: '1.27.1', cache: true}
     - name: Install build deps
-      # bpftool itself — not just its postinst hook — prints "bpftool not
-      # found for kernel X" and exits nonzero on this runner's kernel even
-      # though it's fully present and functional (confirmed: `command -v
-      # bpftool` resolves it, and it works fine for the actual map
-      # show/dump/update calls the selftest scripts make) — it's warning
-      # about missing supplementary kernel-debug artifacts, not reporting
-      # itself broken. So: `|| true` every install attempt, and don't gate
-      # on `bpftool version`'s exit code either — the selftest scripts'
-      # actual bpftool usage is the real, meaningful check.
+      # bpftool does NOT reliably work on this runner. Its kernel has no matching
+      # linux-tools package, so the Ubuntu wrapper prints "WARNING: bpftool not found
+      # for kernel X ... install linux-tools-X" and does nothing (measured: a
+      # `map lookup`/`map delete` through it silently doesn't happen). Any selftest
+      # that needs to touch a map must therefore NOT depend on it: selftest-multivip
+      # skips its bpftool step here (and says so), and selftest-drops talks to the map
+      # through the bpf() syscall directly. It is still installed on a best-effort
+      # basis, since on a host where it does work the multivip step then runs.
       run: |
         sudo apt-get update -qq
         sudo apt-get install -y -qq clang llvm libelf-dev
