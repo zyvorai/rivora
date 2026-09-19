@@ -75,8 +75,8 @@ func (sp *Speaker) Snapshot() Snapshot {
 	}
 
 	sp.mu.Lock()
-	for addr := range sp.advertised {
-		if addr.Is6() {
+	for prefix := range sp.advertised {
+		if prefix.Addr().Is6() {
 			snap.AdvertisedIPv6++
 		} else {
 			snap.AdvertisedIPv4++

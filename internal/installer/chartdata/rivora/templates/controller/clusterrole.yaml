@@ -36,5 +36,16 @@ rules:
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["gatewayclasses/status", "gateways/status"]
     verbs: ["get", "update", "patch"]
+  # The status writer reports Accepted/ResolvedRefs on routes and attachedRoutes on listeners, and
+  # reads what decides them: the routes, ReferenceGrants, and namespace labels.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["tcproutes", "udproutes", "referencegrants"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["tcproutes/status", "udproutes/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
 {{- end }}
 {{- end }}

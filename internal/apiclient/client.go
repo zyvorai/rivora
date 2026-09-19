@@ -38,6 +38,18 @@ type Options struct {
 	APIKey      string
 	TLSInsecure bool
 	RootCAs     *x509.CertPool
+	// Certificate is a client certificate presented to rivorad, for a listener that accepts them
+	// (RIVORA_TLS_CLIENT_CA). It implies https, and needs no APIKey.
+	Certificate *tls.Certificate
+}
+
+// LoadClientCert reads a PEM certificate and its private key for Options.Certificate.
+func LoadClientCert(certFile, keyFile string) (*tls.Certificate, error) {
+	c, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load client certificate: %w", err)
+	}
+	return &c, nil
 }
 
 // LoadCAFile reads a PEM file of one or more certificates into a pool for
@@ -70,7 +82,7 @@ type Client struct {
 func New(addr string, opts Options) *Client {
 	base := addr
 	if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
-		if opts.RootCAs != nil || opts.TLSInsecure {
+		if opts.RootCAs != nil || opts.TLSInsecure || opts.Certificate != nil {
 			base = "https://" + base
 		} else {
 			base = "http://" + base
@@ -78,11 +90,20 @@ func New(addr string, opts Options) *Client {
 	}
 
 	transport := http.DefaultTransport
+	var tc *tls.Config
 	switch {
 	case opts.RootCAs != nil:
-		transport = &http.Transport{TLSClientConfig: &tls.Config{RootCAs: opts.RootCAs, MinVersion: tls.VersionTLS12}}
+		tc = &tls.Config{RootCAs: opts.RootCAs, MinVersion: tls.VersionTLS12}
 	case opts.TLSInsecure:
-		transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} //nolint:gosec // explicit opt-in for rivorad's self-signed cert
+		tc = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // explicit opt-in for rivorad's self-signed cert
+	case opts.Certificate != nil:
+		tc = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
+	if tc != nil {
+		if opts.Certificate != nil {
+			tc.Certificates = []tls.Certificate{*opts.Certificate}
+		}
+		transport = &http.Transport{TLSClientConfig: tc}
 	}
 
 	return &Client{

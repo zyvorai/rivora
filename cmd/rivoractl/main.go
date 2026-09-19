@@ -36,6 +36,10 @@ Options:
   --ca-file FILE      Verify rivorad's certificate against this PEM (the certificate it was
                       started with via RIVORA_TLS_CERT, or its CA); default: $RIVORA_CA_FILE.
                       Implies https. Preferred over --tls-insecure.
+  --cert FILE --key FILE
+                      Present this client certificate (PEM), for a rivorad started with
+                      RIVORA_TLS_CLIENT_CA; default: $RIVORA_CLIENT_CERT and $RIVORA_CLIENT_KEY.
+                      Implies https and replaces --api-key.
   --tls-insecure      Skip certificate verification (rivorad's ephemeral self-signed cert);
                       default: $RIVORA_TLS_INSECURE. Implies https.
 
@@ -60,6 +64,7 @@ func main() {
 	tlsInsecure := os.Getenv("RIVORA_TLS_INSECURE") != ""
 	insecureFlag := false // --tls-insecure given explicitly, as opposed to via the environment
 	caFile := os.Getenv("RIVORA_CA_FILE")
+	certFile, keyFile := os.Getenv("RIVORA_CLIENT_CERT"), os.Getenv("RIVORA_CLIENT_KEY")
 	rest := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -90,6 +95,16 @@ func main() {
 			if i < len(args) {
 				caFile = args[i]
 			}
+		case "--cert":
+			i++
+			if i < len(args) {
+				certFile = args[i]
+			}
+		case "--key":
+			i++
+			if i < len(args) {
+				keyFile = args[i]
+			}
 		default:
 			rest = append(rest, args[i])
 		}
@@ -112,6 +127,18 @@ func main() {
 			os.Exit(1)
 		}
 		opts.RootCAs = pool
+	}
+	if certFile != "" || keyFile != "" {
+		if certFile == "" || keyFile == "" {
+			fmt.Fprintln(os.Stderr, "error: --cert and --key go together")
+			os.Exit(1)
+		}
+		cert, err := apiclient.LoadClientCert(certFile, keyFile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		opts.Certificate = cert
 	}
 	client := apiclient.New(apiAddr, opts)
 
@@ -159,7 +186,7 @@ func cmdStatus(c *apiclient.Client, format string) error {
 			healthy++
 		}
 	}
-	fmt.Printf("VIP        %s:%d/%s\n", st.VIPAddress, st.VIPPort, st.Protocol)
+	fmt.Printf("VIP        %s:%s/%s\n", st.VIPAddress, st.PortLabel(), st.Protocol)
 	fmt.Printf("mode       %s\n", st.Mode)
 	fmt.Printf("interface  %s\n", st.Interface)
 	fmt.Printf("backends   %d/%d healthy\n", healthy, len(st.Backends))
@@ -179,7 +206,7 @@ func cmdVIPs(c *apiclient.Client, format string) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 	fmt.Fprintln(w, "VIP\tPORT\tPROTO\tMODE\tBACKENDS\tPACKETS")
 	for _, st := range vips {
-		fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%d\t%d\n", st.VIPAddress, st.VIPPort, st.Protocol, st.Mode, len(st.Backends), st.Packets)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d\n", st.VIPAddress, st.PortLabel(), st.Protocol, st.Mode, len(st.Backends), st.Packets)
 	}
 	return w.Flush()
 }
