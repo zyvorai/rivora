@@ -194,8 +194,8 @@ FTP, RTP media, game servers), and can list several ports at once
   can be carved out to go somewhere else. Two *ranges* on the same address and protocol
   must not overlap; that is rejected when the config loads.
 - The API reports a range as `vipPort` (first) and `vipPortEnd` (last), and metrics label
-  it `vip="192.0.2.20:30000-30100"`, and `rivoractl vips` shows `30000-30100`. The web
-  console still shows a range VIP by its first port only.
+  it `vip="192.0.2.20:30000-30100"`, and both `rivoractl vips` and the web console
+  show `30000-30100`.
 - **How it works:** the range is stored in a BPF LPM trie as a few aligned blocks
   (30000-30100 is five), checked only when no exact-port VIP matched. With
   `-persist-datapath` a restart adopts ranges from the pinned maps like any other VIP.
