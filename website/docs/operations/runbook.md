@@ -102,6 +102,39 @@ rivoractl weight 12 0              # clear the override; configured weight appli
 - Check a config file before deploying it with `rivoractl validate FILE`; it
   runs the same loader `rivorad` starts with and needs no running daemon.
 
+## Reloading the config without a restart
+
+For a static-YAML node, edit `/etc/rivora/config.yaml`, check it, then reload:
+
+```bash
+rivoractl validate /etc/rivora/config.yaml   # same loader rivorad uses; no daemon needed
+sudo systemctl reload rivorad                # sends SIGHUP; watch the log for the result
+```
+
+`rivorad` re-reads the file and makes the programmed VIPs match it: VIPs you
+removed are torn down, new ones added, and changed ones updated. A VIP whose
+definition is identical is not touched at all, so reloading an unchanged file
+rewrites no BPF map and disturbs no flow. Health checking and BGP pick up the
+new backends immediately. Operator drains and weight overrides (see above)
+survive a reload.
+
+What a reload does **not** do:
+
+- **A file that fails validation is rejected whole.** The log says
+  `config reload rejected; keeping the running config`, and nothing changes.
+- **Startup-only settings are ignored, with a warning.** `interface`,
+  `apiListen`, `healthCheck`, `rateLimit` and `bgp` are read once; if you changed
+  any, the log says `NOT applied` and names them. Restart `rivorad` to apply.
+- **The first NAT VIP needs a restart.** The `tc_nat` egress program (which
+  un-NATs replies) is only loaded at startup if some VIP uses `mode: nat`. A
+  reload that would introduce NAT to a node started DSR-only is rejected, since
+  programming the VIP would break its return path.
+- **Partial failure is reported, not hidden.** If one VIP can't be applied (for
+  example the shared Maglev table is full) the others still are, the log says
+  `config reload partly applied` with the error, and the next reload retries it.
+- It is **not available with `-kubernetes`**, where the Service/EndpointSlice
+  reconcilers own the VIP set and there is no file to re-read.
+
 ## The flow tables are filling up
 
 `connection_affinity_map` (sticky per-flow backend choice) and `nat_reverse_map`

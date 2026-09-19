@@ -151,3 +151,50 @@ func TestValidateRejectsIPv6VIPWithIPv4Backend(t *testing.T) {
 		t.Fatal("expected an error for a v6 VIP with a v4 backend")
 	}
 }
+
+func TestHasNATVIP(t *testing.T) {
+	if HasNATVIP(nil) {
+		t.Error("no VIPs cannot need NAT")
+	}
+	if HasNATVIP([]VIP{{Mode: ModeDSR}, {Mode: ModeDSR}}) {
+		t.Error("DSR-only VIPs reported as needing NAT")
+	}
+	if !HasNATVIP([]VIP{{Mode: ModeDSR}, {Mode: ModeNAT}}) {
+		t.Error("a NAT VIP among DSR ones was missed")
+	}
+}
+
+func TestRestartRequired(t *testing.T) {
+	base := Config{
+		Interface: "eth0", APIListen: "127.0.0.1:9870",
+		HealthCheck: HealthCheck{FailThreshold: 2, SuccessThreshold: 2},
+		BGP:         BGP{Enabled: true, ASN: 65001, Peers: []BGPPeer{{Address: "10.0.0.1", ASN: 65000}}},
+	}
+	if got := RestartRequired(base, base); len(got) != 0 {
+		t.Errorf("identical configs reported %v", got)
+	}
+
+	// VIP edits are exactly what a reload applies, so they must not appear.
+	withVIPs := base
+	withVIPs.VIPs = []VIP{{Address: "10.0.0.1", Port: 80}}
+	if got := RestartRequired(base, withVIPs); len(got) != 0 {
+		t.Errorf("VIP-only change reported %v; reload handles those", got)
+	}
+
+	next := base
+	next.Interface = "eth1"
+	next.APIListen = "0.0.0.0:9870"
+	next.HealthCheck.FailThreshold = 5
+	next.RateLimit.Enabled = true
+	next.BGP = BGP{Enabled: true, ASN: 65001, Peers: []BGPPeer{{Address: "10.0.0.2", ASN: 65000}}}
+	got := RestartRequired(base, next)
+	want := []string{"interface", "apiListen", "healthCheck", "rateLimit", "bgp"}
+	if len(got) != len(want) {
+		t.Fatalf("RestartRequired = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("RestartRequired[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}

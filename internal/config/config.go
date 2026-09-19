@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"reflect"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -146,6 +147,43 @@ type Config struct {
 	RateLimit   RateLimit   `yaml:"rateLimit"`
 	BGP         BGP         `yaml:"bgp"`
 	VIPs        []VIP       `yaml:"vips"`
+}
+
+// HasNATVIP reports whether any of vips forwards in full-NAT mode. rivorad
+// loads and attaches the tc_nat egress program only when this is true at
+// startup, so it also decides whether a config reload may introduce NAT VIPs.
+func HasNATVIP(vips []VIP) bool {
+	for _, v := range vips {
+		if v.Mode == ModeNAT {
+			return true
+		}
+	}
+	return false
+}
+
+// RestartRequired names the top-level settings that differ between the running
+// config and a reloaded one but are only read once, at startup: the attached
+// interface, the API listener, health-check parameters, the SYN rate limit and
+// the BGP speaker. A reload applies the VIP set only; callers report these so
+// an operator isn't left believing an edit took effect.
+func RestartRequired(running, next Config) []string {
+	var changed []string
+	if running.Interface != next.Interface {
+		changed = append(changed, "interface")
+	}
+	if running.APIListen != next.APIListen {
+		changed = append(changed, "apiListen")
+	}
+	if running.HealthCheck != next.HealthCheck {
+		changed = append(changed, "healthCheck")
+	}
+	if running.RateLimit != next.RateLimit {
+		changed = append(changed, "rateLimit")
+	}
+	if !reflect.DeepEqual(running.BGP, next.BGP) {
+		changed = append(changed, "bgp")
+	}
+	return changed
 }
 
 func defaults() Config {
