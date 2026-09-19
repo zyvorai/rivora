@@ -194,6 +194,14 @@ struct {
     __type(value, struct frag_val);
 } frag_map SEC(".maps");
 
+/* IPv6 fragment steering (see struct frag_key6). */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct frag_key6);
+    __type(value, struct frag_val);
+} frag_map6 SEC(".maps");
+
 /* Port-range VIPs (see struct vip_range_key). BPF_F_NO_PREALLOC is mandatory for an LPM
  * trie. Room for MaxVIPs ranges of a few blocks each. */
 struct {
@@ -393,6 +401,139 @@ static __always_inline __u16 rivora_ip_csum(void *hdr, __u32 len)
     return (__u16)~sum;
 }
 
+/* Scratch space for building an ICMP reply. The frame's own stack is nearly used up by the tunnel code
+ * it is called from (the verifier caps a call chain at 512 bytes), so the message is staged here. */
+struct scratch {
+    __u8 b[128];
+};
+_Static_assert(sizeof(struct scratch) == 128, "scratch");
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct scratch);
+} scratch_map SEC(".maps");
+
+/* The tunnel adds 20-44 bytes, and XDP cannot fragment, so a packet that fits the client's path
+ * can be too big for the load balancer's path to the backend. bpf_fib_lookup says so
+ * (BPF_FIB_LKUP_RET_FRAG_NEEDED, with the egress MTU). Rather than drop it silently, answer the
+ * client the way a router would, with "fragmentation needed" (IPv4, when the packet had DF set, which
+ * TCP's does) or "packet too big" (IPv6), quoting the packet and advertising the MTU less the
+ * tunnel overhead: its path-MTU discovery then shrinks its segments, and the connection works.
+ *
+ * At this point the frame is [L2][outer header][inner packet]. The reply is built over it in place
+ * and the frame cut down to size, so it goes straight back out the interface it came in on. It is
+ * addressed from the VIP the client was talking to. `l2len` and `encap` are constants at every call
+ * site, for the reasons given at tunnel_v4. */
+/* Both builders lay the reply out in the per-CPU scratch buffer and copy it over the frame with two
+ * helper calls, so they need almost no BPF stack. sc->b[0..11] is the Ethernet header's two MACs,
+ * swapped; the IP header and ICMP message follow at [16..]. */
+static __attribute__((noinline)) int frag_needed_v4(struct xdp_md *ctx, const __u32 l2len, const __u32 encap, __u32 egress_mtu)
+{
+    __u32 zero = 0;
+    struct scratch *sc = bpf_map_lookup_elem(&scratch_map, &zero);
+    if (!sc)
+        return XDP_DROP;
+    __u8 *b = sc->b;
+    __u8 *ip = b + 16;         /* 20-byte IPv4 header */
+    __u8 *msg = b + 36;        /* ICMP: 8 header bytes, then the client's packet (IP header + 8 bytes) */
+
+    if (bpf_xdp_load_bytes(ctx, l2len + encap, msg + 8, 28))
+        return XDP_DROP;
+    if (bpf_xdp_load_bytes(ctx, 0, b, 12))
+        return XDP_DROP;
+    __u8 t[6];
+    __builtin_memcpy(t, b, 6);          /* dst MAC */
+    __builtin_memcpy(b, b + 6, 6);      /* becomes the old source */
+    __builtin_memcpy(b + 6, t, 6);      /* and the old destination becomes our source */
+
+    __u16 mtu = egress_mtu > encap + 68 ? (__u16)(egress_mtu - encap) : 68;
+    __builtin_memset(msg, 0, 8);
+    msg[0] = 3;  /* destination unreachable */
+    msg[1] = 4;  /* fragmentation needed and DF set */
+    msg[6] = mtu >> 8;
+    msg[7] = mtu & 0xff;
+    __u32 sum = (__u32)bpf_csum_diff(0, 0, (__be32 *)msg, 36, 0);
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    *(__u16 *)(msg + 2) = (__u16)~sum;
+
+    __builtin_memset(ip, 0, 20);
+    ip[0] = 0x45;
+    ip[2] = 0; ip[3] = 56;               /* total length: 20 + 36 */
+    __u16 id = (__u16)bpf_get_prandom_u32();
+    ip[4] = id >> 8; ip[5] = id & 0xff;
+    ip[8] = 64;                          /* TTL */
+    ip[9] = 1;                           /* ICMP */
+    __builtin_memcpy(ip + 12, msg + 8 + 16, 4);  /* from the VIP: the quoted packet's destination */
+    __builtin_memcpy(ip + 16, msg + 8 + 12, 4);  /* to the client: its source */
+    *(__u16 *)(ip + 10) = rivora_ip_csum(ip, 20);
+
+    if (bpf_xdp_store_bytes(ctx, 0, b, 12) || bpf_xdp_store_bytes(ctx, l2len, ip, 56))
+        return XDP_DROP;
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    if (bpf_xdp_adjust_tail(ctx, (int)(l2len + 56) - (int)(data_end - data)))
+        return XDP_DROP;
+    return XDP_TX;
+}
+
+static __attribute__((noinline)) int packet_too_big_v6(struct xdp_md *ctx, const __u32 l2len, const __u32 encap, __u32 egress_mtu)
+{
+    __u32 zero = 0;
+    struct scratch *sc = bpf_map_lookup_elem(&scratch_map, &zero);
+    if (!sc)
+        return XDP_DROP;
+    __u8 *b = sc->b;
+
+    /* b[0..11] swapped MACs. Then, staged so one csum_diff covers it: b[16..55] the pseudo-header
+     * (src, dst, length, next header), b[56..63] the ICMPv6 header, b[64..111] the client's packet
+     * (IPv6 header + 8 bytes). The IPv6 header itself is written from the pseudo-header's addresses. */
+    if (bpf_xdp_load_bytes(ctx, 0, b, 12))
+        return XDP_DROP;
+    __u8 t[6];
+    __builtin_memcpy(t, b, 6);
+    __builtin_memcpy(b, b + 6, 6);
+    __builtin_memcpy(b + 6, t, 6);
+
+    __u8 *ps = b + 16;
+    __u8 *msg = b + 56;
+    if (bpf_xdp_load_bytes(ctx, l2len + encap, msg + 8, 48))
+        return XDP_DROP;
+    __builtin_memcpy(ps, msg + 8 + 24, 16);        /* pseudo src = the quoted packet's destination (the VIP) */
+    __builtin_memcpy(ps + 16, msg + 8 + 8, 16);    /* pseudo dst = its source (the client) */
+    __builtin_memset(ps + 32, 0, 8);
+    ps[35] = 56;                                   /* upper-layer length */
+    ps[39] = 58;                                   /* next header: ICMPv6 */
+    __u32 mtu = egress_mtu > encap + 1280 ? egress_mtu - encap : 1280; /* IPv6 never goes below 1280 */
+    __builtin_memset(msg, 0, 8);
+    msg[0] = 2;                                    /* packet too big */
+    msg[4] = mtu >> 24; msg[5] = mtu >> 16; msg[6] = mtu >> 8; msg[7] = mtu;
+    __u32 sum = (__u32)bpf_csum_diff(0, 0, (__be32 *)ps, 96, 0);
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    *(__u16 *)(msg + 2) = (__u16)~sum;
+
+    /* The IPv6 header goes out in three pieces: its first 8 bytes, then the two addresses straight from
+     * the pseudo-header, then the ICMPv6 message. */
+    __u8 hdr[8];
+    __builtin_memset(hdr, 0, 8);
+    hdr[0] = 0x60;
+    hdr[4] = 0; hdr[5] = 56;                       /* payload length */
+    hdr[6] = 58;                                   /* next header */
+    hdr[7] = 64;                                   /* hop limit */
+    if (bpf_xdp_store_bytes(ctx, 0, b, 12))
+        return XDP_DROP;
+    if (bpf_xdp_store_bytes(ctx, l2len, hdr, 8) || bpf_xdp_store_bytes(ctx, l2len + 8, ps, 32) ||
+        bpf_xdp_store_bytes(ctx, l2len + 40, msg, 56))
+        return XDP_DROP;
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    if (bpf_xdp_adjust_tail(ctx, (int)(l2len + 96) - (int)(data_end - data)))
+        return XDP_DROP;
+    return XDP_TX;
+}
+
 static __always_inline int tunnel_v4_l2(struct xdp_md *ctx, struct ethhdr *eth, struct iphdr *iph,
                                         __u8 mode, __u32 be_addr, const __u32 l2len)
 {
@@ -413,6 +554,7 @@ static __always_inline int tunnel_v4_l2(struct xdp_md *ctx, struct ethhdr *eth, 
     __u8 gre = mode == RIVORA_MODE_TUNNEL_GRE;
     __u32 encap = gre ? 24 : 20;
     __u8 tos = iph->tos;
+    __u8 df = (iph->frag_off & __constant_htons(0x4000)) != 0;
     __u16 inner_len = __builtin_bswap16(iph->tot_len);
     __u8 l2buf[22];
     __builtin_memcpy(l2buf, eth, 22);
@@ -462,7 +604,10 @@ static __always_inline int tunnel_v4_l2(struct xdp_md *ctx, struct ethhdr *eth, 
     fib.ifindex = ctx->ingress_ifindex;
     fib.ipv4_src = src4;
     fib.ipv4_dst = be_addr;
-    if (bpf_fib_lookup(ctx, &fib, sizeof(fib), 0) != BPF_FIB_LKUP_RET_SUCCESS)
+    long rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), 0);
+    if (rc == BPF_FIB_LKUP_RET_FRAG_NEEDED && df)
+        return gre ? frag_needed_v4(ctx, l2len, 24, fib.mtu_result) : frag_needed_v4(ctx, l2len, 20, fib.mtu_result);
+    if (rc != BPF_FIB_LKUP_RET_SUCCESS)
         return XDP_PASS;
     __builtin_memcpy(e2->h_dest, fib.dmac, 6);
     __builtin_memcpy(e2->h_source, fib.smac, 6);
@@ -542,7 +687,10 @@ static __always_inline int tunnel_v6_l2(struct xdp_md *ctx, struct ethhdr *eth, 
     fib.ifindex = ctx->ingress_ifindex;
     __builtin_memcpy(fib.ipv6_src, src6, 16);
     __builtin_memcpy(fib.ipv6_dst, be_addr, 16);
-    if (bpf_fib_lookup(ctx, &fib, sizeof(fib), 0) != BPF_FIB_LKUP_RET_SUCCESS)
+    long rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), 0);
+    if (rc == BPF_FIB_LKUP_RET_FRAG_NEEDED)
+        return gre ? packet_too_big_v6(ctx, l2len, 44, fib.mtu_result) : packet_too_big_v6(ctx, l2len, 40, fib.mtu_result);
+    if (rc != BPF_FIB_LKUP_RET_SUCCESS)
         return XDP_PASS;
     __builtin_memcpy(e2->h_dest, fib.dmac, 6);
     __builtin_memcpy(e2->h_source, fib.smac, 6);
@@ -992,6 +1140,44 @@ static __always_inline int handle_v6_icmp(struct xdp_md *ctx, void *data, void *
  * backend_health_map, stats_map, iface_mac_map, rl_config_map,
  * pick_backend()) as-is — only the address-keyed maps and a few checksum
  * details differ from v4, noted inline below. */
+/* A later IPv6 fragment (offset > 0) has no L4 header, so like its IPv4 counterpart it follows the
+ * backend its datagram's first fragment was given. Full-NAT changes only the destination address:
+ * IPv6 has no header checksum, and the L4 checksum lives in the first fragment. */
+static __always_inline int handle_v6_later_fragment(struct xdp_md *ctx, void *data, void *data_end,
+                                                    struct ethhdr *eth, struct ipv6hdr *iph,
+                                                    const struct rivora_v6_l4 *w)
+{
+    struct frag_key6 fk = {.id = w->id, .proto = w->proto};
+    __builtin_memcpy(fk.saddr, &iph->saddr, 16);
+    __builtin_memcpy(fk.daddr, &iph->daddr, 16);
+    struct frag_val *fv = bpf_map_lookup_elem(&frag_map6, &fk);
+    if (!fv)
+        return XDP_PASS; /* not ours, or its first fragment hasn't been seen */
+
+    __u32 backend_id = fv->backend_id;
+    struct service_config *cfg = bpf_map_lookup_elem(&service_config_map, &fv->service_id);
+    if (!cfg)
+        return XDP_PASS;
+    __u8 *healthy = bpf_map_lookup_elem(&backend_health_map, &backend_id);
+    if (!healthy || !*healthy) {
+        bump_stats(RIVORA_STATS_GLOBAL, 0, 1);
+        return XDP_DROP; /* the first fragment went to a backend that has since died */
+    }
+    struct backend_info6 *be = bpf_map_lookup_elem(&backend_map6, &backend_id);
+    if (!be)
+        return XDP_PASS;
+
+    __u32 pkt_len = (__u32)(data_end - data);
+    bump_stats(RIVORA_STATS_GLOBAL, pkt_len, 0);
+    bump_stats(1 + backend_id, pkt_len, 0);
+
+    if (cfg->mode != RIVORA_MODE_NAT)
+        return forward_v6(ctx, eth, iph, cfg->mode, be);
+
+    __builtin_memcpy(&iph->daddr, be->addr, 16);
+    return XDP_PASS;
+}
+
 static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *data_end, struct ethhdr *eth,
                                        struct ipv6hdr *iph)
 {
@@ -999,18 +1185,24 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
         return XDP_PASS;
     if (iph->nexthdr == IPPROTO_ICMPV6_)
         return handle_v6_icmp(ctx, data, data_end, eth, iph);
-    /* v0.3: no extension headers, mirroring handle_ipv4's "no IP options"
-     * scope limitation — nexthdr must be TCP/UDP directly. A packet with a
-     * Hop-by-Hop/Routing/Fragment/etc. extension header before the L4
-     * header is passed through unmodified rather than walked. */
-    if (iph->nexthdr != IPPROTO_TCP_ && iph->nexthdr != IPPROTO_UDP_)
+
+    /* Step over Hop-by-Hop, Destination Options and Fragment headers to the L4 header. A chain the
+     * walk does not cover (Routing, AH, ESP, too long) is passed through unmodified. */
+    struct rivora_v6_l4 w;
+    if (rivora_v6_walk(iph, data_end, &w) < 0)
         return XDP_PASS;
+    const __u8 proto = w.proto;
+    if (proto != IPPROTO_TCP_ && proto != IPPROTO_UDP_)
+        return XDP_PASS;
+    if (w.is_frag && w.frag_off != 0)
+        return handle_v6_later_fragment(ctx, data, data_end, eth, iph, &w);
+    const __u8 first_fragment = w.is_frag && w.more;
 
     __u16 sport, dport;
     __u8 is_syn = 0;
-    void *l4 = (void *)(iph + 1);
+    void *l4 = (void *)(iph + 1) + (w.off & 0xff);
 
-    if (iph->nexthdr == IPPROTO_TCP_) {
+    if (proto == IPPROTO_TCP_) {
         struct tcphdr *tcph = l4;
         if ((void *)(tcph + 1) > data_end)
             return XDP_PASS;
@@ -1025,7 +1217,7 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
         dport = udph->dest;
     }
 
-    __u32 *service_id = v6_service((__u8 *)&iph->daddr, dport, iph->nexthdr);
+    __u32 *service_id = v6_service((__u8 *)&iph->daddr, dport, proto);
     if (!service_id)
         return XDP_PASS; /* not a VIP we own */
     __u32 sid = *service_id;
@@ -1042,7 +1234,7 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
         return XDP_PASS;
     }
 
-    struct conn_key6 ck = {.sport = sport, .dport = dport, .proto = iph->nexthdr};
+    struct conn_key6 ck = {.sport = sport, .dport = dport, .proto = proto};
     __builtin_memcpy(ck.saddr, &iph->saddr, 16);
     __builtin_memcpy(ck.daddr, &iph->daddr, 16);
 
@@ -1060,7 +1252,7 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
     if (!use_affinity) {
         __u32 hash = cfg->affinity == RIVORA_AFFINITY_CLIENT_IP
                          ? rivora_hash_src_v6((__u8 *)&iph->saddr)
-                         : rivora_hash5_v6((__u8 *)&iph->saddr, (__u8 *)&iph->daddr, sport, dport, iph->nexthdr);
+                         : rivora_hash5_v6((__u8 *)&iph->saddr, (__u8 *)&iph->daddr, sport, dport, proto);
         __u32 local_slot = hash % cfg->maglev_size;
         if (pick_backend(cfg->maglev_offset, cfg->maglev_size, local_slot, &backend_id) < 0) {
             bump_stats(RIVORA_STATS_GLOBAL, 0, 1);
@@ -1079,6 +1271,16 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
     __u32 pkt_len = (__u32)(data_end - data);
     bump_stats(RIVORA_STATS_GLOBAL, pkt_len, 0);
     bump_stats(1 + backend_id, pkt_len, 0);
+
+    /* The first fragment of a fragmented datagram: remember its backend, keyed by the ORIGINAL
+     * addresses (before any NAT rewrite), so the later fragments follow it. */
+    if (first_fragment) {
+        struct frag_key6 fk = {.id = w.id, .proto = proto};
+        __builtin_memcpy(fk.saddr, &iph->saddr, 16);
+        __builtin_memcpy(fk.daddr, &iph->daddr, 16);
+        struct frag_val fv = {.backend_id = backend_id, .service_id = sid};
+        bpf_map_update_elem(&frag_map6, &fk, &fv, BPF_ANY);
+    }
 
     if (cfg->mode != RIVORA_MODE_NAT) {
         /* DSR / L3 DSR: the VIP stays the destination IP — the backend must have the VIP
@@ -1106,9 +1308,9 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
     __builtin_memcpy(new_daddr, be->addr, 16);
     __u16 old_dport = dport;
     __u16 new_dport = (cfg->flags & RIVORA_SVC_RANGE) ? dport : be->port;
-    void *l4b = (void *)(iph + 1);
+    void *l4b = (void *)(iph + 1) + (w.off & 0xff);
 
-    if (iph->nexthdr == IPPROTO_TCP_) {
+    if (proto == IPPROTO_TCP_) {
         struct tcphdr *t = l4b;
         if ((void *)(t + 1) > data_end)
             return XDP_PASS;
@@ -1125,7 +1327,7 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
     }
     __builtin_memcpy(&iph->daddr, new_daddr, 16);
 
-    struct nat_reverse_key6 rk = {.backend_port = new_dport, .client_port = sport, .proto = iph->nexthdr};
+    struct nat_reverse_key6 rk = {.backend_port = new_dport, .client_port = sport, .proto = proto};
     __builtin_memcpy(rk.backend_addr, be->addr, 16);
     __builtin_memcpy(rk.client_addr, &iph->saddr, 16); /* saddr untouched by dest-NAT */
     struct nat_reverse_val6 rv = {.vip_port = old_dport};

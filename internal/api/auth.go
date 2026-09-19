@@ -5,9 +5,11 @@ package api
 import (
 	"crypto/subtle"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,15 +19,58 @@ import (
 // enforced: existing deployments use whatever they chose and must keep starting.
 const MinKeyLength = 16
 
-// parseKeys splits a comma-separated key list, trimming whitespace and dropping
-// empty entries. A list is how a key is rotated with no outage: add the new key,
-// move clients to it, then remove the old one.
-func parseKeys(spec string) []string {
-	var keys []string
-	for _, k := range strings.Split(spec, ",") {
-		if k = strings.TrimSpace(k); k != "" {
-			keys = append(keys, k)
+// credential is one API key and the name it is audited under. A key is written either bare
+// ("s3cret") or named ("id:alice=s3cret"); a bare key is named after its position ("key-1"), so the
+// audit trail can always say which of several keys acted, without the key itself.
+type credential struct {
+	name, key string
+}
+
+// namedPrefix marks a named key. It is an explicit prefix, not a bare "name=key", because keys are
+// often base64 and end in "=".
+const namedPrefix = "id:"
+
+// parseCredentials splits a comma-separated list into credentials, trimming whitespace and dropping empty
+// entries. A list is how a key is rotated with no outage: add the new key, move clients to it, then
+// remove the old one. err reports a malformed named entry (its text is never echoed: it holds a secret).
+func parseCredentials(spec string) ([]credential, error) {
+	var out []credential
+	for i, e := range strings.Split(spec, ",") {
+		if e = strings.TrimSpace(e); e == "" {
+			continue
 		}
+		if !strings.HasPrefix(e, namedPrefix) {
+			out = append(out, credential{name: "key-" + strconv.Itoa(len(out)+1), key: e})
+			continue
+		}
+		name, key, ok := strings.Cut(strings.TrimPrefix(e, namedPrefix), "=")
+		if !ok || key == "" || !validKeyName(name) {
+			return nil, fmt.Errorf("entry %d of the key list is malformed: a named key is id:NAME=KEY, with NAME of letters, digits, '.', '_' or '-' (up to 64) and a non-empty KEY", i+1)
+		}
+		out = append(out, credential{name: name, key: key})
+	}
+	return out, nil
+}
+
+func validKeyName(n string) bool {
+	if n == "" || len(n) > 64 {
+		return false
+	}
+	for _, r := range n {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// parseKeys returns just the secrets of a key list. Malformed entries are dropped here; ValidateKeys is
+// what reports them.
+func parseKeys(spec string) []string {
+	creds, _ := parseCredentials(spec)
+	keys := make([]string, len(creds))
+	for i, c := range creds {
+		keys[i] = c.key
 	}
 	return keys
 }
@@ -40,6 +85,21 @@ func parseKeys(spec string) []string {
 //   - a key that is in both lists: which role it gets would be a matter of
 //     lookup order.
 func ValidateKeys(admin, readOnly string) error {
+	ac, aerr := parseCredentials(admin)
+	if aerr != nil {
+		return fmt.Errorf("RIVORA_API_KEY: %w", aerr)
+	}
+	rc, rerr := parseCredentials(readOnly)
+	if rerr != nil {
+		return fmt.Errorf("RIVORA_API_READONLY_KEY: %w", rerr)
+	}
+	names := map[string]bool{}
+	for _, c := range append(append([]credential(nil), ac...), rc...) {
+		if !strings.HasPrefix(c.name, "key-") && names[c.name] {
+			return fmt.Errorf("the key name %q is used twice: audit entries would be ambiguous", c.name)
+		}
+		names[c.name] = true
+	}
 	a, r := parseKeys(admin), parseKeys(readOnly)
 	// A setting that is present but yields no key (say " , ") must not quietly
 	// mean "auth off": that is exactly how a stray character disables security.
@@ -89,6 +149,20 @@ func matchAny(token string, keys []string) bool {
 		match |= subtle.ConstantTimeCompare([]byte(token), []byte(k))
 	}
 	return match == 1
+}
+
+// matchCred is matchAny that also says which credential matched (by name). It too compares against every
+// key, so timing does not reveal the position.
+func matchCred(token string, creds []credential) (string, bool) {
+	name, hit := "", 0
+	for _, c := range creds {
+		eq := subtle.ConstantTimeCompare([]byte(token), []byte(c.key))
+		if eq == 1 {
+			name = c.name
+		}
+		hit |= eq
+	}
+	return name, hit == 1
 }
 
 func bearerToken(header string) (string, bool) {
@@ -143,23 +217,29 @@ func (t *throttle) allow() (bool, int) {
 
 // recordAuthFailure counts a rejected request and, throttled, logs it. The
 // credential is never logged: only where the request came from and what it tried.
-func (s *Server) recordAuthFailure(r *http.Request, reason string) {
+func (s *Server) recordAuthFailure(r *http.Request, reason, user string) {
 	if s.authFailures != nil {
 		s.authFailures.WithLabelValues(reason).Inc()
 	}
 	if s.logger == nil {
 		return
 	}
-	if s.failLog == nil {
-		return
+	// An anonymous failure may be a scanner hammering the port, so it is throttled. One by an authenticated
+	// caller (a read-only key or certificate trying a change) is rare, meaningful, and always worth a line.
+	ok, suppressed := true, 0
+	if user == "" {
+		if s.failLog == nil {
+			return
+		}
+		ok, suppressed = s.failLog.allow()
 	}
-	if ok, suppressed := s.failLog.allow(); ok {
+	if ok {
 		host, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
 			host = r.RemoteAddr
 		}
 		s.logger.Warn("api request rejected",
-			"reason", reason, "remote", host, "method", r.Method, "path", r.URL.Path,
+			"reason", reason, "user", user, "remote", host, "method", r.Method, "path", r.URL.Path,
 			"similar_suppressed", suppressed)
 	}
 }

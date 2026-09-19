@@ -59,6 +59,9 @@ type Datapath struct {
 
 	pinned []string // names of links this run pinned or adopted
 
+	// ownedMaps are maps LoadMapsOnly created (nothing else closes them).
+	ownedMaps []*ebpf.Map
+
 	Maps map[string]*ebpf.Map
 }
 
@@ -86,6 +89,34 @@ func Load(ingressObj, natObj string) (*Datapath, error) {
 		dp.natColl = natColl
 	}
 
+	return dp, nil
+}
+
+// LoadMapsOnly creates fresh, unpinned copies of every map the given objects declare, and loads no
+// program. Nothing under PinDir is read or written, so it is safe next to a running rivorad. It is
+// for tests that exercise the control plane against real kernel maps; the maps disappear on Close.
+func LoadMapsOnly(objs ...string) (*Datapath, error) {
+	dp := &Datapath{Maps: map[string]*ebpf.Map{}}
+	for _, obj := range objs {
+		spec, err := ebpf.LoadCollectionSpec(obj)
+		if err != nil {
+			dp.Close()
+			return nil, fmt.Errorf("load %s: %w", obj, err)
+		}
+		for name, ms := range spec.Maps {
+			if _, dup := dp.Maps[name]; dup {
+				continue // a map both objects declare (nat_reverse_map) is one map
+			}
+			ms.Pinning = ebpf.PinNone
+			m, err := ebpf.NewMap(ms)
+			if err != nil {
+				dp.Close()
+				return nil, fmt.Errorf("create map %s: %w", name, err)
+			}
+			dp.Maps[name] = m
+			dp.ownedMaps = append(dp.ownedMaps, m)
+		}
+	}
 	return dp, nil
 }
 
@@ -441,5 +472,8 @@ func (d *Datapath) Close() {
 	}
 	if d.ingressColl != nil {
 		d.ingressColl.Close()
+	}
+	for _, m := range d.ownedMaps {
+		_ = m.Close()
 	}
 }

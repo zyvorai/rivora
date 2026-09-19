@@ -88,7 +88,8 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
   A `ServicePolicy` (CRD) sets a Service's health probe, per-source SYN rate limit and
   endpoint weights; a VIP's `rateLimit` block does the same for static configs
   (see the [ServicePolicy guide](website/docs/kubernetes/service-policy.md)).
-  VLAN-tagged (802.1Q/QinQ) traffic, IPv4 options and IPv4 fragments are balanced, and ICMP
+  VLAN-tagged (802.1Q/QinQ) traffic, IPv4 options, IPv4 and IPv6 fragments and IPv6
+  Hop-by-Hop/Destination Options headers are balanced, and ICMP
   path-MTU errors reach the backend that owns the connection they quote (see the
   [runbook](website/docs/operations/runbook.md#vlans-fragments-ip-options-and-icmp)).
   `mode: dsr-ipip` / `dsr-gre` (L3 DSR) tunnels to backends any number of routed hops away
@@ -191,8 +192,9 @@ this is opt-in, same env-var-driven shape as netra's `netrad`:
 
 | Env var                    | Effect                                              |
 | --------------------------- | ---------------------------------------------------- |
-| `RIVORA_API_KEY`            | Admin key: require this bearer token on every request; full access (including `drain`/`weight`). Setting it is what turns authentication on. |
+| `RIVORA_API_KEY`            | Admin key (write `id:NAME=KEY` to name it in the audit log of changes): require this bearer token on every request; full access (including `drain`/`weight`). Setting it is what turns authentication on. |
 | `RIVORA_API_READONLY_KEY`   | Read-only key: may read the API and console, gets `403` on anything that changes state. Needs `RIVORA_API_KEY` too. |
+| `RIVORA_TLS_CLIENT_CA`      | Accept client certificates signed by this CA (mutual TLS); needs TLS on. Names in `RIVORA_API_CERT_ADMIN_CNS` are admins, any other verified certificate is read-only. `RIVORA_TLS_CLIENT_REQUIRED=1` demands one. |
 | `RIVORA_TLS_CERT` / `_KEY`  | Serve HTTPS with this certificate                     |
 | `RIVORA_TLS_SELF_SIGNED`    | Serve HTTPS with an auto-generated self-signed cert (no cert files needed) |
 
@@ -357,9 +359,14 @@ instead of `Service.Status.LoadBalancer.Ingress[].IP`. A `TCPRoute`/
 `EndpointSlice`s the same way the Service reconciler does; `backendRef.weight`
 (Gateway API's native traffic-split field) maps onto the existing weighted-
 Maglev backend selection, divided evenly across that backend's ready
-endpoints. Same-namespace `backendRefs` only in this version — cross-
-namespace references (which Gateway API gates behind a `ReferenceGrant`)
-aren't implemented yet.
+endpoints. Routes may attach from other namespaces where a listener's
+`allowedRoutes` says so (`Same` by default, `All`, or a namespace `Selector`,
+and `kinds`), and a `backendRef` into another namespace is used only when a
+`ReferenceGrant` there permits it. A `TCPRoute` attaches only to a `TCP`
+listener and a `UDPRoute` to a `UDP` one. `rivora-controller` reports the result
+on the objects: per-parent `Accepted` and `ResolvedRefs` conditions on each
+route, and `attachedRoutes`/`supportedKinds` on each listener. See the
+[Gateway API guide](website/docs/kubernetes/gateway-api.md).
 
 The [Helm chart](deploy/helm/rivora) wires both flags behind a
 `gatewayApi.enabled` value and can optionally create a matching

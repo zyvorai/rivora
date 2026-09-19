@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api';
 import type { BackendStatus, VIPStatus } from '../types';
-import { fmtBytes } from '../types';
+import { fmtBytes, vipPortLabel } from '../types';
 
 type Row = BackendStatus & { vip: string };
 
@@ -27,7 +27,7 @@ export default function Backends() {
           const next: Row[] = [];
           for (const v of list) {
             for (const b of v.backends || []) {
-              next.push({ ...b, vip: `${v.vipAddress}:${v.vipPort}` });
+              next.push({ ...b, vip: `${v.vipAddress}:${vipPortLabel(v)}` });
             }
           }
           setRows(next);

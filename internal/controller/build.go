@@ -75,6 +75,7 @@ func buildDesiredVIPs(svc *corev1.Service, slices []*discoveryv1.EndpointSlice, 
 					HealthCheck:     opts.Policy.probeSpec(),
 					RateLimit:       opts.Policy.vipRateLimit(),
 					BGPCommunities:  opts.Policy.bgpCommunities(),
+					BGPPeers:        opts.Policy.bgpPeerList(),
 				},
 				DrainingBackends: draining,
 			})

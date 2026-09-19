@@ -13,7 +13,8 @@ export type BackendStatus = {
 
 export type VIPStatus = {
   vipAddress: string;
-  vipPort: number;
+  vipPort: number; // the port, or a port range's first port
+  vipPortEnd?: number; // a port range's last port; absent for a single-port VIP
   protocol: string;
   mode: string;
   interface: string;
@@ -23,6 +24,11 @@ export type VIPStatus = {
   bytes: number;
   dropped: number;
 };
+
+// "443", or "30000-30100" for a range VIP.
+export function vipPortLabel(v: { vipPort: number; vipPortEnd?: number }): string {
+  return v.vipPortEnd ? `${v.vipPort}-${v.vipPortEnd}` : String(v.vipPort);
+}
 
 export function fmtBytes(n: number): string {
   const u = ['B', 'KB', 'MB', 'GB', 'TB'];

@@ -190,6 +190,11 @@ bgp:
   # REPLACES asn, routerId, ipv6NextHop and peers above. Keeping passwords in a Secret keeps them
   # off the command line and out of `helm get values`. See website/docs/operations/bgp.md.
   configSecret: ""
+  # peerResources also reads BGPPeer resources (crds/bgppeer-crd.yaml): each adds a neighbour, with
+  # password (from a Secret in this release's namespace), multihop, graceful restart and a node
+  # selector, to the peers above. It grants rivorad read access to BGPPeers, to its own Node and to
+  # Secrets in the release namespace. With it on, `peers` may be empty. Only used when enabled.
+  peerResources: true
 
 # addressPools seeds AddressPool custom resources on install, e.g.:
 #   --set addressPools[0].name=default \
