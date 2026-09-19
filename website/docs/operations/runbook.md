@@ -172,6 +172,38 @@ Things to know:
   at start-up, so a reload (SIGHUP) that changes it logs `NOT applied`.
 - **Multiple interfaces** are still not supported: one `interface` per node.
 
+## Port ranges and multiple ports
+
+A static-config VIP can own a **range** of ports, for protocols that use many (passive
+FTP, RTP media, game servers), and can list several ports at once
+(`config/examples/port-ranges.yaml`):
+
+```yaml
+- {address: 192.0.2.20, portRange: "30000-30100", protocol: tcp, mode: nat,
+   healthCheck: {port: 21}, backends: [{address: 10.0.0.21}, {address: 10.0.0.22}]}
+- {address: 192.0.2.22, ports: [80, 443], protocol: tcp, mode: nat,
+   backends: [{address: 10.0.0.25, port: 8080}]}
+```
+
+- **A range VIP keeps the port the client used**: a connection to `:30042` reaches the
+  backend on `:30042`, in NAT and DSR alike. So its backends carry no `port`, and because
+  there is then no single backend port to probe, `healthCheck.port` is **required**.
+- **`ports: [a, b]` is shorthand** for one VIP per port sharing the rest of the entry
+  (each port gets its own counters and Maglev table, as if you had written them out).
+- **An exact-port VIP inside a range takes precedence** for its one port, so a single port
+  can be carved out to go somewhere else. Two *ranges* on the same address and protocol
+  must not overlap; that is rejected when the config loads.
+- The API reports a range as `vipPort` (first) and `vipPortEnd` (last), and metrics label
+  it `vip="192.0.2.20:30000-30100"`, and `rivoractl vips` shows `30000-30100`. The web
+  console still shows a range VIP by its first port only.
+- **How it works:** the range is stored in a BPF LPM trie as a few aligned blocks
+  (30000-30100 is five), checked only when no exact-port VIP matched. With
+  `-persist-datapath` a restart adopts ranges from the pinned maps like any other VIP.
+  A range VIP is limited to about 16k trie blocks in total across all ranges.
+- **Kubernetes:** a Service already gets one VIP per entry in `spec.ports`, so several
+  ports work as they always did. Kubernetes has no port-range Service, so ranges are for
+  static configs.
+
 ## Kubernetes Service semantics: session affinity and `externalTrafficPolicy`
 
 For `type: LoadBalancer` Services, `rivorad` reads two Service fields.

@@ -43,11 +43,25 @@ type Backend struct {
 }
 
 type VIP struct {
-	Address  string    `yaml:"address"`
-	Port     uint16    `yaml:"port"`
-	Protocol Protocol  `yaml:"protocol"`
-	Mode     Mode      `yaml:"mode"`
-	Backends []Backend `yaml:"backends"`
+	Address string `yaml:"address"`
+	// Port is the VIP's port, or the first port of a range when PortEnd is set.
+	Port uint16 `yaml:"port"`
+	// PortEnd, when set, makes this VIP own every port from Port to PortEnd inclusive
+	// (a "range VIP"), for things like passive FTP, RTP or game servers. A range VIP
+	// keeps the destination port the client used, so its backends listen on the same
+	// ports and their own port is left 0; because there is then no backend port to
+	// probe, healthCheck.port is required. An exact-port VIP on the same address may
+	// sit inside a range and takes precedence over it for that one port.
+	PortEnd uint16 `yaml:"portEnd,omitempty"`
+	// Ports and PortRange are conveniences read only from a config file: Ports
+	// ([80, 443]) becomes one VIP per port sharing the rest of this entry, and
+	// PortRange ("30000-30100") becomes Port/PortEnd. Load expands and clears them,
+	// so nothing after Load ever sees either.
+	Ports     []uint16  `yaml:"ports,omitempty"`
+	PortRange string    `yaml:"portRange,omitempty"`
+	Protocol  Protocol  `yaml:"protocol"`
+	Mode      Mode      `yaml:"mode"`
+	Backends  []Backend `yaml:"backends"`
 	// SessionAffinity says whether one client sticks to one backend. Unset (or
 	// "none") spreads a client's connections across backends; "clientIP" sends
 	// every connection from a source address to the same backend, for as long as
@@ -79,6 +93,25 @@ func (r VIPRateLimit) Validate() error {
 		return fmt.Errorf("rateLimit: perSourcePacketsPerSecond and burst must both be > 0")
 	}
 	return nil
+}
+
+// IsRange reports whether v owns a port range rather than one port.
+func (v VIP) IsRange() bool { return v.PortEnd != 0 }
+
+// PortLabel is the VIP's port as text: "443" or, for a range, "30000-30100".
+func (v VIP) PortLabel() string {
+	if v.IsRange() {
+		return fmt.Sprintf("%d-%d", v.Port, v.PortEnd)
+	}
+	return strconv.Itoa(int(v.Port))
+}
+
+// Contains reports whether port falls inside the VIP's port or port range.
+func (v VIP) Contains(port uint16) bool {
+	if v.IsRange() {
+		return port >= v.Port && port <= v.PortEnd
+	}
+	return port == v.Port
 }
 
 // SessionAffinity is how a VIP chooses a backend for a new connection.
@@ -417,10 +450,76 @@ func Load(path string) (Config, error) {
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return cfg, fmt.Errorf("parse config: %w", err)
 	}
+	if err := cfg.expandPorts(); err != nil {
+		return cfg, err
+	}
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
 	}
 	return cfg, nil
+}
+
+// expandPorts turns the file-only conveniences into plain VIPs: portRange
+// ("30000-30100") into Port/PortEnd, and ports ([80, 443]) into one VIP per port
+// that shares the rest of the entry. The expanded VIPs share nothing mutable.
+func (c *Config) expandPorts() error {
+	var out []VIP
+	for i, v := range c.VIPs {
+		if len(v.Ports) == 0 && v.PortRange == "" {
+			out = append(out, v)
+			continue
+		}
+		where := fmt.Sprintf("vip #%d (%s)", i+1, v.Address)
+		if len(v.Ports) > 0 && v.PortRange != "" {
+			return fmt.Errorf("%s: ports and portRange are mutually exclusive", where)
+		}
+		if v.Port != 0 || v.PortEnd != 0 {
+			return fmt.Errorf("%s: port/portEnd cannot be combined with ports or portRange", where)
+		}
+		if v.PortRange != "" {
+			lo, hi, err := parsePortRange(v.PortRange)
+			if err != nil {
+				return fmt.Errorf("%s: %w", where, err)
+			}
+			v.Port, v.PortEnd, v.PortRange = lo, hi, ""
+			out = append(out, v)
+			continue
+		}
+		seen := map[uint16]bool{}
+		for _, p := range v.Ports {
+			if p == 0 {
+				return fmt.Errorf("%s: ports must be 1-65535", where)
+			}
+			if seen[p] {
+				return fmt.Errorf("%s: port %d is listed twice", where, p)
+			}
+			seen[p] = true
+			one := v
+			one.Ports = nil
+			one.Port = p
+			one.Backends = append([]Backend(nil), v.Backends...)
+			out = append(out, one)
+		}
+	}
+	c.VIPs = out
+	return nil
+}
+
+// parsePortRange reads "lo-hi" with 1 <= lo < hi <= 65535.
+func parsePortRange(s string) (lo, hi uint16, err error) {
+	a, b, ok := strings.Cut(s, "-")
+	if !ok {
+		return 0, 0, fmt.Errorf("portRange %q: want first-last, e.g. 30000-30100", s)
+	}
+	l, err1 := strconv.ParseUint(strings.TrimSpace(a), 10, 16)
+	h, err2 := strconv.ParseUint(strings.TrimSpace(b), 10, 16)
+	if err1 != nil || err2 != nil || l == 0 || h == 0 {
+		return 0, 0, fmt.Errorf("portRange %q: ports must be numbers from 1 to 65535", s)
+	}
+	if l >= h {
+		return 0, 0, fmt.Errorf("portRange %q: the first port must be below the last (use port for a single port)", s)
+	}
+	return uint16(l), uint16(h), nil
 }
 
 func (c Config) Validate() error {
@@ -441,11 +540,17 @@ func (c Config) Validate() error {
 	}
 	seen := make(map[string]bool, len(c.VIPs))
 	for _, v := range c.VIPs {
-		key := fmt.Sprintf("%s:%d:%s", v.Address, v.Port, v.Protocol)
+		if len(v.Ports) > 0 || v.PortRange != "" {
+			return fmt.Errorf("vip %s: ports/portRange are only read from a config file (Load expands them)", v.Address)
+		}
+		key := fmt.Sprintf("%s:%s:%s", v.Address, v.PortLabel(), v.Protocol)
 		if seen[key] {
-			return fmt.Errorf("vip %s:%d/%s: duplicate VIP", v.Address, v.Port, v.Protocol)
+			return fmt.Errorf("vip %s:%s/%s: duplicate VIP", v.Address, v.PortLabel(), v.Protocol)
 		}
 		seen[key] = true
+	}
+	if err := c.checkRanges(); err != nil {
+		return err
 	}
 	for _, v := range c.VIPs {
 		vipIP := net.ParseIP(v.Address)
@@ -460,6 +565,19 @@ func (c Config) Validate() error {
 		}
 		if len(v.Backends) == 0 {
 			return fmt.Errorf("vip %s:%d: at least one backend is required", v.Address, v.Port)
+		}
+		if v.IsRange() {
+			if v.PortEnd <= v.Port || v.Port == 0 {
+				return fmt.Errorf("vip %s:%s: a port range needs 1 <= port < portEnd", v.Address, v.PortLabel())
+			}
+			if v.HealthCheck.Port == 0 {
+				return fmt.Errorf("vip %s:%s: healthCheck.port is required for a port range (its backends have no single port to probe)", v.Address, v.PortLabel())
+			}
+			for _, b := range v.Backends {
+				if b.Port != 0 {
+					return fmt.Errorf("vip %s:%s: backend %s must not set a port: a port range reaches the backend on the port the client used", v.Address, v.PortLabel(), b.Address)
+				}
+			}
 		}
 		if err := v.SessionAffinity.Validate(); err != nil {
 			return fmt.Errorf("vip %s:%d: %w", v.Address, v.Port, err)
@@ -521,6 +639,35 @@ func (c Config) checkSharedBackendProbes() error {
 				return fmt.Errorf("backend %s is used by vip %s and vip %s with different healthCheck settings; a backend is probed once, so they must agree", key, prev.vip, vipName)
 			}
 		}
+	}
+	return nil
+}
+
+// checkRanges rejects two range VIPs on the same address and protocol whose ports
+// overlap: which one owns an overlapping port would be a coin toss. An exact-port
+// VIP inside a range is fine and intentional, and takes precedence.
+func (c Config) checkRanges() error {
+	type span struct {
+		lo, hi uint16
+		name   string
+	}
+	byAddr := map[string][]span{}
+	for _, v := range c.VIPs {
+		if !v.IsRange() {
+			continue
+		}
+		ip := net.ParseIP(v.Address)
+		if ip == nil {
+			continue // reported by the per-VIP checks
+		}
+		k := ip.String() + "/" + string(v.Protocol)
+		name := v.Address + ":" + v.PortLabel()
+		for _, o := range byAddr[k] {
+			if v.Port <= o.hi && o.lo <= v.PortEnd {
+				return fmt.Errorf("vip %s overlaps vip %s/%s on the same address; port ranges must not overlap", name, o.name, v.Protocol)
+			}
+		}
+		byAddr[k] = append(byAddr[k], span{v.Port, v.PortEnd, name})
 	}
 	return nil
 }

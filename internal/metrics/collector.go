@@ -200,7 +200,7 @@ func (c *DataplaneCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(c.scrapeErrors, prometheus.GaugeValue, 0)
 
 	for i, st := range statuses {
-		vip := vipLabel(st.VIPAddress, st.VIPPort)
+		vip := st.VIPAddress + ":" + st.PortLabel() // a range VIP reads "addr:first-last", so it never collides with an exact-port VIP at its first port
 		ch <- prometheus.MustNewConstMetric(c.vipInfo, prometheus.GaugeValue, 1, vip, st.Protocol, st.Mode)
 		ch <- prometheus.MustNewConstMetric(c.vipBackends, prometheus.GaugeValue, float64(len(st.Backends)), vip, st.Protocol, st.Mode)
 		ch <- prometheus.MustNewConstMetric(c.vipPackets, prometheus.CounterValue, float64(st.Packets), vip, st.Protocol, st.Mode)

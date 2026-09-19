@@ -178,6 +178,24 @@ struct {
     __type(value, struct rl_bucket);
 } svc_rl_buckets_map6 SEC(".maps");
 
+/* Port-range VIPs (see struct vip_range_key). BPF_F_NO_PREALLOC is mandatory for an LPM
+ * trie. Room for MaxVIPs ranges of a few blocks each. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 16384); /* bpfmaps.MaxRangeBlocks */
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct vip_range_key);
+    __type(value, __u32); /* service_id */
+} vip_range_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 16384); /* bpfmaps.MaxRangeBlocks */
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct vip_range_key6);
+    __type(value, __u32); /* service_id */
+} vip_range_map6 SEC(".maps");
+
 static __always_inline void bump_drop(__u32 service_id, __u32 reason)
 {
     struct drop_stats *d = bpf_map_lookup_elem(&drop_stats_map, &service_id);
@@ -328,8 +346,16 @@ static __always_inline int handle_ipv4(struct xdp_md *ctx, void *data, void *dat
 
     struct vip_key vk = {.addr = iph->daddr, .port = dport, .proto = iph->protocol};
     __u32 *service_id = bpf_map_lookup_elem(&vip_map, &vk);
-    if (!service_id)
-        return XDP_PASS; /* not a VIP we own */
+    if (!service_id) {
+        /* Not an exact-port VIP: maybe it falls in a port range. */
+        struct vip_range_key rgk = {
+            .prefixlen = RIVORA_RANGE_FULL_PREFIX_V4,
+            .addr = iph->daddr, .proto = iph->protocol, .port = dport,
+        };
+        service_id = bpf_map_lookup_elem(&vip_range_map, &rgk);
+        if (!service_id)
+            return XDP_PASS; /* not a VIP we own */
+    }
     __u32 sid = *service_id;
 
     /* SYN-flood mitigation: only new-connection attempts (SYN packets)
@@ -412,7 +438,8 @@ static __always_inline int handle_ipv4(struct xdp_md *ctx, void *data, void *dat
     __u32 old_daddr = iph->daddr;
     __u32 new_daddr = be->addr;
     __u16 old_dport = dport;
-    __u16 new_dport = be->port;
+    /* A range VIP keeps the client's port; a single-port VIP goes to the backend's. */
+    __u16 new_dport = (cfg->flags & RIVORA_SVC_RANGE) ? dport : be->port;
     void *l4b = (void *)iph + (iph->ihl * 4);
 
     if (iph->protocol == IPPROTO_TCP_) {
@@ -438,7 +465,7 @@ static __always_inline int handle_ipv4(struct xdp_md *ctx, void *data, void *dat
 
     struct nat_reverse_key rk = {
         .backend_addr = be->addr, .client_addr = iph->saddr,
-        .backend_port = be->port, .client_port = sport, .proto = iph->protocol,
+        .backend_port = new_dport, .client_port = sport, .proto = iph->protocol,
     };
     struct nat_reverse_val rv = {.vip_addr = old_daddr, .vip_port = old_dport};
     bpf_map_update_elem(&nat_reverse_map, &rk, &rv, BPF_ANY);
@@ -488,8 +515,16 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
     struct vip_key6 vk = {.port = dport, .proto = iph->nexthdr};
     __builtin_memcpy(vk.addr, &iph->daddr, 16);
     __u32 *service_id = bpf_map_lookup_elem(&vip_map6, &vk);
-    if (!service_id)
-        return XDP_PASS; /* not a VIP we own */
+    if (!service_id) {
+        struct vip_range_key6 rgk = {
+            .prefixlen = RIVORA_RANGE_FULL_PREFIX_V6,
+            .proto = iph->nexthdr, .port = dport,
+        };
+        __builtin_memcpy(rgk.addr, &iph->daddr, 16);
+        service_id = bpf_map_lookup_elem(&vip_range_map6, &rgk);
+        if (!service_id)
+            return XDP_PASS; /* not a VIP we own */
+    }
     __u32 sid = *service_id;
 
     if (is_syn && rate_limit_exceeded_v6(sid, (__u8 *)&iph->saddr)) {
@@ -572,7 +607,7 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
     __builtin_memcpy(old_daddr, &iph->daddr, 16);
     __builtin_memcpy(new_daddr, be->addr, 16);
     __u16 old_dport = dport;
-    __u16 new_dport = be->port;
+    __u16 new_dport = (cfg->flags & RIVORA_SVC_RANGE) ? dport : be->port;
     void *l4b = (void *)(iph + 1);
 
     if (iph->nexthdr == IPPROTO_TCP_) {
@@ -592,7 +627,7 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
     }
     __builtin_memcpy(&iph->daddr, new_daddr, 16);
 
-    struct nat_reverse_key6 rk = {.backend_port = be->port, .client_port = sport, .proto = iph->nexthdr};
+    struct nat_reverse_key6 rk = {.backend_port = new_dport, .client_port = sport, .proto = iph->nexthdr};
     __builtin_memcpy(rk.backend_addr, be->addr, 16);
     __builtin_memcpy(rk.client_addr, &iph->saddr, 16); /* saddr untouched by dest-NAT */
     struct nat_reverse_val6 rv = {.vip_port = old_dport};

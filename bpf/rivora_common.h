@@ -51,9 +51,15 @@ struct service_config {
                            * reads zero-initialized (backend_id=0) slots */
     __u8  mode;           /* 0 = DSR, 1 = full NAT */
     __u8  affinity;       /* RIVORA_AFFINITY_*: what the Maglev slot is chosen from */
-    __u8  pad[2];
+    __u8  flags;          /* RIVORA_SVC_* */
+    __u8  pad;
 };
 _Static_assert(sizeof(struct service_config) == 16, "service_config ABI");
+
+/* service_config.flags. RANGE marks a VIP that owns a whole port range: the destination
+ * port is not rewritten (a backend is reached on the same port the client used), so
+ * the backend's own port in backend_info is ignored. */
+#define RIVORA_SVC_RANGE 0x1
 
 struct backend_info {
     __u32 addr;   /* network byte order */
@@ -113,12 +119,39 @@ struct vip_key6 {
 };
 _Static_assert(sizeof(struct vip_key6) == 20, "vip_key6 ABI");
 
+/* A VIP that owns a port range is kept in an LPM trie, because a range is not a key. The
+ * trie's key is (address, protocol, port) with a prefix length that covers the address,
+ * protocol, pad and the leading bits of the port; a range decomposes into a handful of
+ * aligned blocks (30000-30100 is five), each one entry, and a full-length lookup returns
+ * the block containing the port. The port is in network byte order, so its high bits come
+ * first, which is what the trie's bit ordering needs. Exact ports stay in vip_map and are
+ * checked first, so a single port can be carved out of a range. */
+struct vip_range_key {
+    __u32 prefixlen; /* 48 + (0..16 bits of the port) */
+    __u32 addr;      /* network byte order */
+    __u8  proto;
+    __u8  pad;       /* always 0: part of the bits the prefix covers */
+    __u16 port;      /* network byte order */
+};
+_Static_assert(sizeof(struct vip_range_key) == 12, "vip_range_key ABI");
+#define RIVORA_RANGE_FULL_PREFIX_V4 64u
+
 struct backend_info6 {
     __u8  addr[16]; /* network byte order */
     __u16 port;     /* network byte order */
     __u8  mac[6];
 };
 _Static_assert(sizeof(struct backend_info6) == 24, "backend_info6 ABI");
+
+struct vip_range_key6 {
+    __u32 prefixlen; /* 144 + (0..16 bits of the port) */
+    __u8  addr[16];  /* network byte order */
+    __u8  proto;
+    __u8  pad;
+    __u16 port;      /* network byte order */
+};
+_Static_assert(sizeof(struct vip_range_key6) == 24, "vip_range_key6 ABI");
+#define RIVORA_RANGE_FULL_PREFIX_V6 160u
 
 struct conn_key6 {
     __u8  saddr[16];

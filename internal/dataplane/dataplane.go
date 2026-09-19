@@ -64,9 +64,19 @@ type BackendStatus struct {
 	Bytes         uint64 `json:"bytes"`
 }
 
+// PortLabel is the VIP's port as text: "443", or "30000-30100" for a range.
+func (s Status) PortLabel() string {
+	if s.VIPPortEnd != 0 {
+		return fmt.Sprintf("%d-%d", s.VIPPort, s.VIPPortEnd)
+	}
+	return fmt.Sprintf("%d", s.VIPPort)
+}
+
 type Status struct {
-	VIPAddress string          `json:"vipAddress"`
-	VIPPort    uint16          `json:"vipPort"`
+	VIPAddress string `json:"vipAddress"`
+	VIPPort    uint16 `json:"vipPort"` // the port, or a port range's first port
+	// VIPPortEnd is a port range's last port; 0 for a single-port VIP.
+	VIPPortEnd uint16          `json:"vipPortEnd,omitempty"`
 	Protocol   string          `json:"protocol"`
 	Mode       string          `json:"mode"`
 	Interface  string          `json:"interface"`
@@ -373,6 +383,9 @@ func (d *Dataplane) upsertVIPLocked(spec config.VIP) error {
 		MaglevSize:   entry.extent.size,
 		Mode:         mode,
 		Affinity:     affinityByte(vip.SessionAffinity),
+	}
+	if vip.IsRange() {
+		sc.Flags |= bpfmaps.SvcRange
 	}
 	if err := d.dp.Maps[bpfmaps.MapServiceConfig].Update(&entry.serviceID, &sc, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update service_config_map: %w", err)
@@ -899,6 +912,7 @@ func (d *Dataplane) Statuses() ([]Status, error) {
 		st := Status{
 			VIPAddress: vip.Address,
 			VIPPort:    vip.Port,
+			VIPPortEnd: vip.PortEnd,
 			Protocol:   string(vip.Protocol),
 			Mode:       string(vip.Mode),
 			Interface:  d.cfg.Interface,
@@ -1033,7 +1047,7 @@ func sumStats(m *ebpf.Map, idx uint32) (bpfmaps.LBStats, error) {
 }
 
 func vipKeyString(vip config.VIP) string {
-	return fmt.Sprintf("%s:%d:%s", vip.Address, vip.Port, vip.Protocol)
+	return fmt.Sprintf("%s:%s:%s", vip.Address, vip.PortLabel(), vip.Protocol)
 }
 
 func backendName(b config.Backend) string {
@@ -1058,6 +1072,9 @@ func (d *Dataplane) vipMapWrite(vip config.VIP, serviceID uint32) error {
 		return fmt.Errorf("vip %s: invalid address", vip.Address)
 	}
 	proto := protoByte(vip.Protocol)
+	if vip.IsRange() {
+		return d.rangeMapWrite(ip, vip, proto, serviceID)
+	}
 	if ip4 := ip.To4(); ip4 != nil {
 		vk := bpfmaps.VipKey{Addr: ip4ToBE32(ip4), Port: htons(vip.Port), Proto: proto}
 		if err := d.dp.Maps[bpfmaps.MapVIP].Update(&vk, serviceID, ebpf.UpdateAny); err != nil {
@@ -1082,6 +1099,9 @@ func (d *Dataplane) vipMapDelete(vip config.VIP) error {
 		return fmt.Errorf("vip %s: invalid address", vip.Address)
 	}
 	proto := protoByte(vip.Protocol)
+	if vip.IsRange() {
+		return d.rangeMapDelete(ip, vip, proto)
+	}
 	if ip4 := ip.To4(); ip4 != nil {
 		vk := bpfmaps.VipKey{Addr: ip4ToBE32(ip4), Port: htons(vip.Port), Proto: proto}
 		return d.dp.Maps[bpfmaps.MapVIP].Delete(&vk)

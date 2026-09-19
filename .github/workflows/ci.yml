@@ -314,3 +314,6 @@ jobs:
     - name: Per-VIP rate limit selftest (own limit, isolation, override, reload, IPv4 + IPv6)
       if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-vipratelimit.sh
+    - name: Port range selftest (TCP/UDP, NAT/DSR, IPv4 + IPv6, reload, adoption)
+      if: ${{ !cancelled() }}
+      run: sudo bash scripts/selftest-portrange.sh
