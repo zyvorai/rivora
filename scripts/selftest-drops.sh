@@ -15,8 +15,10 @@
 #                          (spaced past the rate limit) reach backend selection
 #                          and have nowhere to go.
 #   3. unserved            the backend's map entry is deleted behind rivorad's
-#                          back, so the VIP matches but can't be served and the
-#                          packet passes to the kernel stack instead.
+#                          back (through the bpf() syscall directly, not bpftool,
+#                          which does not work on every CI runner kernel), so the
+#                          VIP matches but can't be served and the packet passes to
+#                          the kernel stack instead.
 #   4. invariant           the per-reason drops sum to exactly the node-wide
 #                          rivora_dropped_packets_total (both are bumped at every
 #                          drop), and "unserved" is not part of that sum.
@@ -49,7 +51,6 @@ fi
 for f in "$RIVORAD" "${BPF_DIR}/xdp_ingress.o" "${BPF_DIR}/tc_nat.o"; do
     [ -e "$f" ] || { echo "missing: $f" >&2; exit 1; }
 done
-command -v bpftool >/dev/null || { echo "bpftool is required (to delete a backend map entry)" >&2; exit 1; }
 
 SUFFIX="$$"
 BR="brdrp${SUFFIX}"
@@ -133,6 +134,72 @@ write_config() {   # write_config <vip>...
     } > "$CONFIG"
 }
 
+# A minimal bpf() map client, so the test can inspect and delete a pinned map entry
+# WITHOUT bpftool. On some CI runner kernels bpftool is a wrapper that prints "not
+# found for kernel X" and does nothing; worse, that message contains "not found", so
+# grepping its output for "entry not found" passes for the wrong reason. This prints
+# an explicit PRESENT / ABSENT / DELETED / ENOENT instead.
+write_bpfmap_helper() {
+    cat > "${WORK}/bpfmap.py" <<'PYEOF'
+import ctypes, os, platform, struct, sys
+NR = {"x86_64": 321, "aarch64": 280}.get(platform.machine())
+if NR is None:
+    print("UNSUPPORTED-ARCH " + platform.machine()); sys.exit(3)
+libc = ctypes.CDLL(None, use_errno=True)
+def bpf(cmd, attr):
+    buf = ctypes.create_string_buffer(attr, 128)
+    r = libc.syscall(NR, cmd, buf, 128)
+    return r, ctypes.get_errno()
+def addr(b): return ctypes.addressof(b)
+def obj_get(path):
+    p = ctypes.create_string_buffer(path.encode())
+    r, e = bpf(7, struct.pack("=QII", addr(p), 0, 0))       # BPF_OBJ_GET
+    if r < 0: print("OBJ_GET-FAILED " + os.strerror(e)); sys.exit(2)
+    return r
+def lookup(fd, key, vsize):
+    k = ctypes.create_string_buffer(struct.pack("=I", key)); v = ctypes.create_string_buffer(vsize)
+    r, e = bpf(1, struct.pack("=IIQQQ", fd, 0, addr(k), addr(v), 0))   # BPF_MAP_LOOKUP_ELEM
+    return (v.raw if r == 0 else None), e
+def delete(fd, key):
+    k = ctypes.create_string_buffer(struct.pack("=I", key))
+    return bpf(3, struct.pack("=IIQ", fd, 0, addr(k)))                  # BPF_MAP_DELETE_ELEM
+def possible_cpus():
+    lo, _, hi = open("/sys/devices/system/cpu/possible").read().strip().partition("-")
+    return int(hi or lo) + 1
+cmd, path = sys.argv[1], sys.argv[2]
+fd = obj_get(path)
+if cmd in ("present", "delete"):
+    key = int(sys.argv[3])
+    if cmd == "present":
+        v, e = lookup(fd, key, 12)                 # backend_map value is 12 bytes
+        print("PRESENT" if v is not None else "ABSENT")
+    else:
+        r, e = delete(fd, key)
+        print("DELETED" if r == 0 else ("ENOENT" if e == 2 else "ERROR " + os.strerror(e)))
+elif cmd == "keys":
+    # every u32 key in a hash map, via BPF_MAP_GET_NEXT_KEY
+    keys, cur = [], None
+    while True:
+        nk = ctypes.create_string_buffer(4)
+        if cur is None: attr = struct.pack("=IIQQQ", fd, 0, 0, addr(nk), 0)
+        else:
+            ck = ctypes.create_string_buffer(struct.pack("=I", cur)); attr = struct.pack("=IIQQQ", fd, 0, addr(ck), addr(nk), 0)
+        r, e = bpf(4, attr)
+        if r != 0: break
+        cur = struct.unpack("=I", nk.raw)[0]; keys.append(cur)
+        if len(keys) > 100000: break
+    print("KEYS " + " ".join(map(str, keys)))
+elif cmd == "dropsum":
+    # drop_stats_map[key] is a per-CPU array of {rate_limited, no_backend, unserved}
+    n = possible_cpus(); v, e = lookup(fd, int(sys.argv[3]), 24 * n)
+    if v is None: print("LOOKUP-FAILED " + os.strerror(e)); sys.exit(2)
+    tot = [0, 0, 0]
+    for c in range(n):
+        for i, x in enumerate(struct.unpack_from("=QQQ", v, 24 * c)): tot[i] += x
+    print("DROPS rate_limited=%d no_backend=%d unserved=%d (cpus=%d)" % (tot[0], tot[1], tot[2], n))
+PYEOF
+}
+
 write_inner() {
     cat > "${WORK}/inner.sh" <<'INNER'
 #!/usr/bin/env bash
@@ -188,6 +255,7 @@ check_eq() { [ "$2" = "$3" ] && pass "$1 ($2)" || fail "$1: got '$2', want '$3'"
 setup_topology
 write_config "$VIP1" "$VIP2"
 write_inner
+write_bpfmap_helper
 export RIVORAD CONFIG BPF_DIR WORK LOG
 ip netns exec "$NS_LB" "${WORK}/inner.sh" >/dev/null 2>&1 &
 INNER_PID=$!
@@ -229,11 +297,31 @@ for _ in $(seq 1 20); do
     [ "$(metrics | grep '^rivora_backend_healthy' | head -1 | awk '{print $NF}')" = "1" ] && break
 done
 sleep 1.3
-lb 'exec:bpftool map delete pinned /sys/fs/bpf/rivora-lb/backend_map key hex 00 00 00 00'
+# Find the backend's real ID from the API rather than assuming it is 0 (deleting a key
+# that never existed "succeeds" and looks absent afterwards). /api/v1/backends refuses to
+# answer with more than one VIP configured, so read it from /api/v1/vips.
+lbx() { lb "exec:$1"; LBX_OUT=$(cat "${WORK}/exec-${CMDN}.out" 2>/dev/null); }   # see the note above: call directly
+BM=/sys/fs/bpf/rivora-lb/backend_map
+BID=$(ip netns exec "$NS_LB" curl -s --max-time 3 http://127.0.0.1:9870/api/v1/vips | python3 -c 'import sys,json; v=json.load(sys.stdin); print(v[0]["backends"][0]["id"])' 2>/dev/null)
+if [ -z "$BID" ]; then fail "could not read the backend id from /api/v1/vips"; BID=0; fi
+lbx "python3 ${WORK}/bpfmap.py present ${BM} ${BID}"
+[ "$LBX_OUT" = PRESENT ] && pass "precondition: backend id ${BID} is in backend_map before the delete" \
+    || fail "precondition: backend id ${BID} should be in backend_map before the delete, helper said '${LBX_OUT}'"
+lbx "python3 ${WORK}/bpfmap.py delete ${BM} ${BID}"; DEL_OUT="$LBX_OUT"
+[ "$DEL_OUT" = DELETED ] && pass "the delete succeeded" || fail "the delete did not succeed: '${DEL_OUT}'"
+lbx "python3 ${WORK}/bpfmap.py present ${BM} ${BID}"
+[ "$LBX_OUT" = ABSENT ] && pass "precondition: backend id ${BID}'s map entry is really gone" \
+    || fail "precondition: the entry is still present after the delete: '${LBX_OUT}'"
 UN0=$(D_UN "$VIP1")
 for _ in 1 2 3; do probe "$VIP1" 0.3 >/dev/null; sleep 1.3; done
 UN=$(D_UN "$VIP1")
 check_ge "unserved counted the packets that bypassed the load balancer" "$((UN - UN0))" 1
+if [ "$((UN - UN0))" -lt 1 ]; then
+    echo "    diagnostics: kernel $(uname -r); cpus $(nproc); backend id ${BID}; unserved before=${UN0} after=${UN}"
+    echo "    diagnostics: vip metrics: $(metrics | grep -E '^rivora_vip_(unserved|dropped)' | grep "$VIP1" | tr '\n' ' ')"
+    lbx "python3 ${WORK}/bpfmap.py keys ${BM}";                       echo "    diagnostics: backend_map ${LBX_OUT}"
+    lbx "python3 ${WORK}/bpfmap.py dropsum /sys/fs/bpf/rivora-lb/drop_stats_map 0"; echo "    diagnostics: drop_stats_map[0] ${LBX_OUT}"
+fi
 
 section "4. invariant: per-reason drops == node-wide drops; unserved excluded"
 RLT=$(( $(D_RL $VIP1) + $(D_RL $VIP2) )); NBT=$(( $(D_NB $VIP1) + $(D_NB $VIP2) ))
