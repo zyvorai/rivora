@@ -12,7 +12,9 @@ EnvironmentFile=-/etc/rivora/rivorad.env
 # in /etc/rivora/config.yaml when you wire real VIPs.
 ExecStartPre=-/usr/sbin/ip link add rivora0 type dummy
 ExecStartPre=-/usr/sbin/ip link set rivora0 up
-ExecStart=/usr/local/bin/rivorad -config /etc/rivora/config.yaml -bpf-dir /usr/local/share/rivora/bpf
+# RIVORAD_ARGS (from rivorad.env) carries optional flags such as
+# -persist-datapath; unset, it expands to nothing.
+ExecStart=/usr/local/bin/rivorad -config /etc/rivora/config.yaml -bpf-dir /usr/local/share/rivora/bpf $RIVORAD_ARGS
 Restart=on-failure
 RestartSec=2
 AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN

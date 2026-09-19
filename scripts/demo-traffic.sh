@@ -47,6 +47,43 @@ MAGENTA=$'\033[95m'
 RED=$'\033[91m'
 WHITE=$'\033[97m'
 
+# The API requires a key (install-systemd.sh refuses to expose it without one), so
+# the dashboard's poll must send it, or it just reads 401s. Take it from the
+# environment, else from the service's env file (this script runs as root); if
+# RIVORA_API_KEY is a rotation list (new,old) the first key is used.
+resolve_api_key() {
+    local key="${RIVORA_API_KEY:-}"
+    if [ -z "$key" ] && [ -r /etc/rivora/rivorad.env ]; then
+        key=$(sed -n 's/^[[:space:]]*RIVORA_API_KEY=//p' /etc/rivora/rivorad.env | tail -1)
+    fi
+    key="${key%%,*}"
+    key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
+    printf '%s' "$key"
+}
+
+# poll_vips <url>: GET the VIP list, sending the API key when there is one. The key
+# goes to curl on stdin as a config line, never on the command line, so it can't be
+# read from `ps`. Sets POLL_BODY on success or POLL_ERR to something an operator can
+# act on (a 401 is not "unreachable"). It sets globals, so call it directly: run
+# inside $(...) it would set them in a subshell and the caller would never see them.
+POLL_BODY=""; POLL_ERR=""
+poll_vips() {
+    local key out code hdr=""
+    key=$(resolve_api_key)
+    if [ -n "$key" ]; then
+        key=${key//\\/\\\\}; key=${key//\"/\\\"}     # escape for curl's config syntax
+        hdr=$(printf 'header = "Authorization: Bearer %s"' "$key")
+    fi
+    out=$(printf '%s\n' "$hdr" | curl -sk --max-time 5 -K - -w '\n%{http_code}' "$1" 2>/dev/null)
+    code="${out##*$'\n'}"
+    POLL_BODY=""; POLL_ERR=""
+    case "$code" in
+        200) POLL_BODY="${out%$'\n'*}" ;;
+        401|403) POLL_ERR="rivorad rejected the API key (HTTP ${code}) — set RIVORA_API_KEY, or check /etc/rivora/rivorad.env" ;;
+        *) POLL_ERR="rivorad API unreachable on :9870" ;;
+    esac
+}
+
 need_root() { [ "$(id -u)" -eq 0 ] || { echo "must run as root" >&2; exit 1; }; }
 
 teardown_topology() {
@@ -167,7 +204,8 @@ render_dashboard() {
     # lab-remote-access deployment shape, so :9870 is HTTPS with a
     # self-signed cert — hence -k, same as the deploy summary already tells
     # operators ("curl -k for API").
-    status=$(curl -sfk "https://127.0.0.1:9870/api/v1/vips" 2>/dev/null) || err="rivorad API unreachable on :9870"
+    poll_vips "https://127.0.0.1:9870/api/v1/vips"
+    status="$POLL_BODY"; err="$POLL_ERR"
     vips_json="$status"
 
     printf '%s%s' "$CLR" "$BG"

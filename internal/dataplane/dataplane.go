@@ -74,10 +74,16 @@ type Status struct {
 	Backends   []BackendStatus `json:"backends"`
 	Packets    uint64          `json:"packets"`
 	Bytes      uint64          `json:"bytes"`
-	// Dropped is node-wide (stats_map's global slot isn't attributable to a
-	// specific VIP — some drops, like "no healthy backend", happen before
-	// backend/VIP-specific accounting), not this VIP's own drop count.
+	// Dropped is node-wide (stats_map's global slot), the sum of every VIP's
+	// drops, not this VIP's own count — the fields below are this VIP's own.
 	Dropped uint64 `json:"dropped"`
+
+	// This VIP's own drops by reason, plus packets that matched the VIP but
+	// bypassed the load balancer (drop_stats_map, summed across CPUs). Like the
+	// other counters they run from when the BPF maps were pinned.
+	DroppedRateLimited uint64 `json:"droppedRateLimited"` // SYNs over the per-source rate limit
+	DroppedNoBackend   uint64 `json:"droppedNoBackend"`   // no healthy backend in the probe window
+	Unserved           uint64 `json:"unserved"`           // XDP_PASS: VIP matched but couldn't be served
 }
 
 // serviceEntry is a node's live state for one VIP.
@@ -103,6 +109,10 @@ type backendState struct {
 	isV4         bool // which of backend_map/backend_map6 this ID lives in (v0.3)
 	probeHealthy bool // from internal/healthcheck's active TCP probes
 	draining     bool // from a Kubernetes reconciler's EndpointSlice terminating state (v0.2+)
+	// probe is how the health checker should check this backend, taken from the
+	// VIP that lists it. A backend shared by several VIPs is probed once, and
+	// config validation guarantees those VIPs agree, so any of them will do.
+	probe config.ProbeSpec
 	// adminDraining is an operator's drain (rivoractl drain). Tracked apart
 	// from draining so a reconciler clearing its own terminating state can't
 	// silently undo an operator's drain, and vice versa.
@@ -122,6 +132,8 @@ type Dataplane struct {
 	serviceAlloc  *idAllocator
 	backendAlloc  *idAllocator
 	maglevAlloc   *extentAllocator
+
+	startup StartupSummary
 }
 
 func New(cfg config.Config, dp *loader.Datapath) *Dataplane {
@@ -156,12 +168,42 @@ func (d *Dataplane) Apply(iface *net.Interface) error {
 		return err
 	}
 
-	for _, vip := range d.cfg.VIPs {
-		if err := d.UpsertVIP(vip); err != nil {
-			return fmt.Errorf("vip %s:%d: %w", vip.Address, vip.Port, err)
-		}
+	// Static-YAML mode: the file is the whole desired VIP set, so recover what
+	// a previous run left in the pinned maps and reconcile it against the file
+	// (see adopt.go) instead of programming on top of leftovers. Kubernetes mode
+	// also calls Apply, but with no VIPs — its reconcilers supply them later, so
+	// there is nothing to reconcile against, and adopting-then-reloading to an
+	// empty set would tear down every persisted VIP. It keeps the old path.
+	if len(d.cfg.VIPs) == 0 {
+		return nil
 	}
-	return nil
+	d.mu.Lock()
+	sum, err := d.adoptLocked()
+	d.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("adopt existing datapath state: %w", err)
+	}
+	res, err := d.ReloadVIPs(d.cfg.VIPs)
+	d.mu.Lock()
+	d.startup = StartupSummary{AdoptSummary: sum, ReloadResult: res}
+	d.mu.Unlock()
+	return err
+}
+
+// StartupSummary is what Apply found already programmed and what it did about
+// it: Adopted VIPs recovered from the pinned maps, Dropped entries it couldn't
+// trust, and the add/update/remove/unchanged split of reconciling them against
+// the config (Removed are VIPs left over from a previous config).
+type StartupSummary struct {
+	AdoptSummary
+	ReloadResult
+}
+
+// Startup returns the summary of the last Apply. Zero in Kubernetes mode.
+func (d *Dataplane) Startup() StartupSummary {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.startup
 }
 
 func (d *Dataplane) writeIfaceMAC(iface *net.Interface) error {
@@ -237,6 +279,9 @@ func (d *Dataplane) upsertVIPLocked(spec config.VIP) error {
 		}
 		entry = &serviceEntry{serviceID: id, backendIDs: map[string]uint32{}}
 		d.services[key] = entry
+		// drop_stats_map is pinned and outlives VIPs, so a freed ID may still
+		// carry the previous VIP's counts; a new VIP starts from zero.
+		d.resetDropStatsLocked(id)
 	}
 
 	vip := entry.applyWeightOverrides(spec)
@@ -269,6 +314,8 @@ func (d *Dataplane) upsertVIPLocked(spec config.VIP) error {
 		backendSetChanged = true
 	}
 
+	d.applyProbeLocked(entry, vip.HealthCheck)
+
 	oldWeights := make(map[string]uint32, len(entry.vip.Backends))
 	for _, b := range entry.vip.Backends {
 		oldWeights[backendName(b)] = maglev.NormalizeWeight(b.Weight)
@@ -296,6 +343,7 @@ func (d *Dataplane) upsertVIPLocked(spec config.VIP) error {
 		MaglevOffset: entry.extent.offset,
 		MaglevSize:   entry.extent.size,
 		Mode:         mode,
+		Affinity:     affinityByte(vip.SessionAffinity),
 	}
 	if err := d.dp.Maps[bpfmaps.MapServiceConfig].Update(&entry.serviceID, &sc, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update service_config_map: %w", err)
@@ -308,6 +356,17 @@ func (d *Dataplane) upsertVIPLocked(spec config.VIP) error {
 	entry.vipSpec = spec
 	entry.vip = vip
 	return nil
+}
+
+// applyProbeLocked records probe as the health-check spec of every backend entry
+// lists, so a probe edit in the config (or a reload) reaches the checker on its
+// next Targets() call.
+func (d *Dataplane) applyProbeLocked(entry *serviceEntry, probe config.ProbeSpec) {
+	for _, id := range entry.backendIDs {
+		if st := d.backendStates[id]; st != nil {
+			st.probe = probe
+		}
+	}
 }
 
 // applyWeightOverrides returns spec with each operator-overridden backend's
@@ -621,6 +680,7 @@ func (d *Dataplane) removeVIPLocked(key string) error {
 	_ = d.vipMapDelete(entry.vip)
 	var zero bpfmaps.ServiceConfig
 	_ = d.dp.Maps[bpfmaps.MapServiceConfig].Update(&entry.serviceID, &zero, ebpf.UpdateAny)
+	d.resetDropStatsLocked(entry.serviceID)
 
 	if entry.extent.size > 0 {
 		d.maglevAlloc.Free(entry.extent)
@@ -764,6 +824,7 @@ func (d *Dataplane) Targets() []struct {
 	ID      uint32
 	Address string
 	Port    uint16
+	Probe   config.ProbeSpec
 } {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -771,13 +832,15 @@ func (d *Dataplane) Targets() []struct {
 		ID      uint32
 		Address string
 		Port    uint16
+		Probe   config.ProbeSpec
 	}, 0, len(d.backendStates))
 	for id, st := range d.backendStates {
 		out = append(out, struct {
 			ID      uint32
 			Address string
 			Port    uint16
-		}{ID: id, Address: st.address, Port: st.port})
+			Probe   config.ProbeSpec
+		}{ID: id, Address: st.address, Port: st.port, Probe: st.probe})
 	}
 	return out
 }
@@ -790,6 +853,7 @@ func (d *Dataplane) Statuses() ([]Status, error) {
 
 	healthMap := d.dp.Maps[bpfmaps.MapBackendHealth]
 	statsMap := d.dp.Maps[bpfmaps.MapStats]
+	dropMap := d.dp.Maps[bpfmaps.MapDropStats] // nil for an object built before per-reason drops existed
 
 	var globalDropped uint64
 	if s, err := sumStats(statsMap, bpfmaps.StatsGlobalIdx); err == nil {
@@ -807,6 +871,13 @@ func (d *Dataplane) Statuses() ([]Status, error) {
 			Interface:  d.cfg.Interface,
 			StartedAt:  d.startedAt,
 			Dropped:    globalDropped,
+		}
+		if dropMap != nil {
+			if ds, err := sumDropStats(dropMap, entry.serviceID); err == nil {
+				st.DroppedRateLimited = ds.ByReason[bpfmaps.DropRateLimited]
+				st.DroppedNoBackend = ds.ByReason[bpfmaps.DropNoBackend]
+				st.Unserved = ds.ByReason[bpfmaps.Unserved]
+			}
 		}
 		weightByName := make(map[string]uint32, len(vip.Backends))
 		for _, b := range vip.Backends {
@@ -862,6 +933,14 @@ func (d *Dataplane) Status() (Status, error) {
 	}
 }
 
+// affinityByte is the service_config value for a VIP's session affinity.
+func affinityByte(a config.SessionAffinity) uint8 {
+	if a.Effective() == config.AffinityClientIP {
+		return bpfmaps.AffinityClientIP
+	}
+	return bpfmaps.AffinityNone
+}
+
 // healthStateName maps a backend_health_map value to the label the API and
 // CLI show. Anything unrecognised reads as "down" — the safe interpretation,
 // since the dataplane only routes new flows to HealthHealthy.
@@ -874,6 +953,36 @@ func healthStateName(v uint8) string {
 	default:
 		return "down"
 	}
+}
+
+// sumDropStats reads service id's per-CPU drop counters and sums them.
+func sumDropStats(m *ebpf.Map, id uint32) (bpfmaps.DropStats, error) {
+	var perCPU []bpfmaps.DropStats
+	if err := m.Lookup(&id, &perCPU); err != nil {
+		return bpfmaps.DropStats{}, err
+	}
+	var total bpfmaps.DropStats
+	for _, s := range perCPU {
+		for i := range total.ByReason {
+			total.ByReason[i] += s.ByReason[i]
+		}
+	}
+	return total, nil
+}
+
+// resetDropStatsLocked zeroes service id's drop counters on every CPU. A
+// PERCPU map takes one value per possible CPU on update. Best-effort, like the
+// other teardown writes: a failure leaves stale counts, not a broken dataplane.
+func (d *Dataplane) resetDropStatsLocked(id uint32) {
+	m := d.dp.Maps[bpfmaps.MapDropStats]
+	if m == nil {
+		return
+	}
+	n, err := ebpf.PossibleCPU()
+	if err != nil {
+		n = runtime.NumCPU()
+	}
+	_ = m.Update(&id, make([]bpfmaps.DropStats, n), ebpf.UpdateAny)
 }
 
 func sumStats(m *ebpf.Map, idx uint32) (bpfmaps.LBStats, error) {

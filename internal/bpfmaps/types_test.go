@@ -26,6 +26,7 @@ func TestStructSizesMatchCABI(t *testing.T) {
 		{"NATReverseKey", unsafe.Sizeof(NATReverseKey{}), 16},
 		{"NATReverseVal", unsafe.Sizeof(NATReverseVal{}), 8},
 		{"LBStats", unsafe.Sizeof(LBStats{}), 24},
+		{"DropStats", unsafe.Sizeof(DropStats{}), 24},
 		{"RLConfig", unsafe.Sizeof(RLConfig{}), 24},
 		{"RLBucket", unsafe.Sizeof(RLBucket{}), 16},
 		{"VipKey6", unsafe.Sizeof(VipKey6{}), 20},
@@ -67,5 +68,28 @@ func TestHealthValuesAreDistinct(t *testing.T) {
 	}
 	if len(values) != 3 {
 		t.Errorf("HealthDown/HealthHealthy/HealthDraining must be pairwise distinct, got %v", values)
+	}
+}
+
+// TestServiceConfigFieldOffsetsMatchCABI pins WHERE each ServiceConfig field sits, not
+// just the total size. Affinity was added into former padding, so the struct is still
+// 16 bytes; if it were at the wrong offset, an older pinned service_config would be
+// misread (its mode taken for affinity, or the reverse) and TestStructSizesMatchCABI
+// would still pass.
+func TestServiceConfigFieldOffsetsMatchCABI(t *testing.T) {
+	var sc ServiceConfig
+	for name, c := range map[string]struct{ got, want uintptr }{
+		"BackendCount": {unsafe.Offsetof(sc.BackendCount), 0},
+		"MaglevOffset": {unsafe.Offsetof(sc.MaglevOffset), 4},
+		"MaglevSize":   {unsafe.Offsetof(sc.MaglevSize), 8},
+		"Mode":         {unsafe.Offsetof(sc.Mode), 12},
+		"Affinity":     {unsafe.Offsetof(sc.Affinity), 13},
+	} {
+		if c.got != c.want {
+			t.Errorf("ServiceConfig.%s at offset %d, want %d (struct service_config in bpf/rivora_common.h)", name, c.got, c.want)
+		}
+	}
+	if AffinityNone != 0 {
+		t.Error("AffinityNone must be 0: an older pinned service_config has zero there and must mean no affinity")
 	}
 }

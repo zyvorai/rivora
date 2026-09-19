@@ -1,0 +1,26 @@
+# Session affinity: send every connection from one client to the same backend.
+#
+# By default a client's connections are spread across backends (the Maglev slot is
+# chosen from the whole 5-tuple). sessionAffinity: clientIP hashes the source address
+# only, so one client sticks to one backend for as long as the backend set is stable.
+# It is the equivalent of Kubernetes' Service.spec.sessionAffinity: ClientIP, which the
+# controller maps automatically for Services.
+#
+# Unlike Kubernetes there is no timeout: stickiness is a function of the source address
+# and the current backend set. When that set changes, Maglev moves only a small share
+# of clients rather than reshuffling everyone.
+
+interface: eth0
+apiListen: 127.0.0.1:9870
+
+vips:
+  - address: 10.0.0.100
+    port: 80
+    protocol: tcp
+    mode: nat
+    sessionAffinity: clientIP   # none (default) | clientIP
+    backends:
+      - address: 10.0.1.11
+        port: 8080
+      - address: 10.0.1.12
+        port: 8080
