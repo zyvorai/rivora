@@ -3,13 +3,18 @@
 package apiclient
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/zyvorai/rivora/internal/dataplane"
+	"github.com/zyvorai/rivora/internal/tlsutil"
 )
 
 func TestNewDefaultsToHTTPScheme(t *testing.T) {
@@ -175,5 +180,148 @@ func TestUnreachableServerGivesFriendlyError(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "is it running?") {
 			t.Errorf("%s: err = %v, want the 'cannot reach rivorad ... is it running?' hint", name, err)
 		}
+	}
+}
+
+// ---- TLS trust: pinning a certificate instead of skipping verification ----
+
+// tlsServer starts a TLS server with its OWN freshly generated certificate.
+// (httptest.NewTLSServer hands every server the same built-in certificate, which
+// would make "trust some other server's certificate" trivially succeed.)
+func tlsServer(t *testing.T) (*httptest.Server, *x509.Certificate) {
+	t.Helper()
+	cert, err := tlsutil.GenerateSelfSigned()
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(dataplane.Status{VIPAddress: "10.0.0.1"})
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	return srv, leaf
+}
+
+func poolOf(cert *x509.Certificate) *x509.CertPool {
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+	return pool
+}
+
+func TestPinnedCertificateIsVerified(t *testing.T) {
+	srv, cert := tlsServer(t)
+	if _, err := New(srv.URL, Options{RootCAs: poolOf(cert)}).Status(); err != nil {
+		t.Errorf("a client pinned to the server's own certificate failed: %v", err)
+	}
+}
+
+func TestAWrongPinnedCertificateIsRejected(t *testing.T) {
+	// Verification must actually happen: trusting a *different* certificate has to
+	// fail, or "pinning" is just a slower InsecureSkipVerify.
+	srv, _ := tlsServer(t)
+	_, otherCert := tlsServer(t)
+	_, err := New(srv.URL, Options{RootCAs: poolOf(otherCert)}).Status()
+	if err == nil {
+		t.Fatal("a client pinned to some other certificate accepted this server")
+	}
+	if !strings.Contains(err.Error(), "--ca-file") {
+		t.Errorf("the error should say how to fix it, got: %v", err)
+	}
+}
+
+func TestPinningTakesPrecedenceOverInsecure(t *testing.T) {
+	// If a caller sets both, verification wins: the safer reading. This server's
+	// cert is NOT in the pool, so it must be rejected even though Insecure is set.
+	srv, _ := tlsServer(t)
+	_, otherCert := tlsServer(t)
+	if _, err := New(srv.URL, Options{RootCAs: poolOf(otherCert), TLSInsecure: true}).Status(); err == nil {
+		t.Error("TLSInsecure overrode a configured CA pool; verification must win")
+	}
+}
+
+func TestDefaultClientStillRejectsAnUnknownCertificate(t *testing.T) {
+	srv, _ := tlsServer(t)
+	_, err := New(srv.URL, Options{}).Status()
+	if err == nil || !strings.Contains(err.Error(), "not trusted") {
+		t.Errorf("err = %v, want a 'not trusted' explanation", err)
+	}
+}
+
+func TestTLSOptionsImplyHTTPSForABareAddress(t *testing.T) {
+	// "host:port" with --tls-insecure or a CA must mean https, not plain HTTP to a
+	// TLS listener (which answers with an unexplained 400).
+	srv, cert := tlsServer(t)
+	bare := strings.TrimPrefix(srv.URL, "https://")
+	if _, err := New(bare, Options{TLSInsecure: true}).Status(); err != nil {
+		t.Errorf("bare address with TLSInsecure: %v", err)
+	}
+	if _, err := New(bare, Options{RootCAs: poolOf(cert)}).Status(); err != nil {
+		t.Errorf("bare address with a CA pool: %v", err)
+	}
+}
+
+func TestPlainHTTPToATLSServerExplainsItself(t *testing.T) {
+	srv, _ := tlsServer(t)
+	plain := "http://" + strings.TrimPrefix(srv.URL, "https://")
+	_, err := New(plain, Options{}).Status()
+	if err == nil || !strings.Contains(err.Error(), "speaks HTTPS") || !strings.Contains(err.Error(), "https://") {
+		t.Errorf("err = %v, want a hint that the server speaks HTTPS", err)
+	}
+}
+
+func TestAnErrorBodyIsStillReportedAfterTheHTTPSCheck(t *testing.T) {
+	// The HTTPS-mismatch check reads the body; a normal JSON error must survive it.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "backend id must be a non-negative integer"})
+	}))
+	defer srv.Close()
+	err := New(srv.URL, Options{}).Drain(1)
+	if err == nil || !strings.Contains(err.Error(), "non-negative integer") {
+		t.Errorf("err = %v, want the server's own message", err)
+	}
+}
+
+func TestReadOnlyKeyForbiddenSurfacesTheServersExplanation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "forbidden: this key is read-only and cannot change state"})
+	}))
+	defer srv.Close()
+	err := New(srv.URL, Options{APIKey: "reader"}).Drain(1)
+	if err == nil || !strings.Contains(err.Error(), "read-only") {
+		t.Errorf("err = %v, want the read-only explanation", err)
+	}
+}
+
+func TestLoadCAFile(t *testing.T) {
+	srv, cert := tlsServer(t)
+	dir := t.TempDir()
+
+	good := dir + "/ca.pem"
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+	if err := os.WriteFile(good, pemBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := LoadCAFile(good)
+	if err != nil {
+		t.Fatalf("a valid PEM was rejected: %v", err)
+	}
+	if _, err := New(srv.URL, Options{RootCAs: pool}).Status(); err != nil {
+		t.Errorf("a client using the loaded pool failed: %v", err)
+	}
+
+	junk := dir + "/junk.pem"
+	_ = os.WriteFile(junk, []byte("not a certificate"), 0o600)
+	if _, err := LoadCAFile(junk); err == nil || !strings.Contains(err.Error(), "no PEM certificate") {
+		t.Errorf("garbage accepted or unclear error: %v", err)
+	}
+	if _, err := LoadCAFile(dir + "/missing.pem"); err == nil {
+		t.Error("a missing file was accepted")
 	}
 }

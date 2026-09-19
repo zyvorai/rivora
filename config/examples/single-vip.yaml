@@ -2,6 +2,7 @@
 # See README.md for how "mode" affects backend requirements.
 
 interface: eth0
+# xdpMode: generic  # generic (default) | native | auto — see the runbook, "XDP attach mode"
 apiListen: 127.0.0.1:9870
 
 healthCheck:

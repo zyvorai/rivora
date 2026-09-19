@@ -36,10 +36,13 @@ section() { echo ""; echo "=== $1 ==="; }
 
 # Both overridable so the test can run a freshly built binary without
 # installing it over a running rivorad service.
-RIVORAD="${RIVORAD:-$(command -v rivorad || echo "${ROOT}/bin/rivorad")}"
+# Prefer this checkout's build over anything installed system-wide, which may predate
+# the feature under test (see selftest-ratelimit.sh).
+RIVORAD="${RIVORAD:-${ROOT}/bin/rivorad}"
+[ -x "$RIVORAD" ] || RIVORAD="$(command -v rivorad || echo "$RIVORAD")"
 if [ -z "${BPF_DIR:-}" ]; then
-    BPF_DIR="/usr/local/share/rivora/bpf"
-    [ -f "${BPF_DIR}/xdp_ingress.o" ] || BPF_DIR="${ROOT}/bpf"
+    BPF_DIR="${ROOT}/bpf"
+    [ -f "${BPF_DIR}/xdp_ingress.o" ] || BPF_DIR="/usr/local/share/rivora/bpf"
 fi
 for f in "$RIVORAD" "${BPF_DIR}/xdp_ingress.o" "${BPF_DIR}/tc_nat.o"; do
     [ -e "$f" ] || { echo "missing: $f" >&2; exit 1; }
@@ -236,7 +239,7 @@ run_scenario() {
         [ "$(probe_once)" = ok ] && pass "${label}: datapath still forwards while rivorad is stopped" \
                                   || fail "${label}: datapath stopped forwarding when rivorad exited"
         local links; links=$(cat "${WORK}/links-after-stop" 2>/dev/null)
-        [[ "$links" == *xdp-rst-lb* && "$links" == *tcx-egress-rst-lb* ]] \
+        [[ "$links" == *xdp-generic-rst-lb* && "$links" == *tcx-egress-rst-lb* ]] \
             && pass "${label}: both links pinned after exit (${links})" || fail "${label}: expected xdp + tcx links pinned, got '${links}'"
         touch "${WORK}/DETACH"
         wait_for DETACHED 200 || fail "${label}: -detach did not complete"
@@ -274,7 +277,7 @@ elif [ "$LAST_FAILS" -eq 0 ]; then
 else
     fail "persisted: ${LAST_FAILS} connections failed across the restart (control: ${CONTROL_FAILS})"
 fi
-if grep -q 'hot_swapped=' "${WORK}/rivorad-persisted.log" && grep 'hot_swapped=' "${WORK}/rivorad-persisted.log" | tail -1 | grep -q 'xdp-rst-lb' \
+if grep -q 'hot_swapped=' "${WORK}/rivorad-persisted.log" && grep 'hot_swapped=' "${WORK}/rivorad-persisted.log" | tail -1 | grep -q 'xdp-generic-rst-lb' \
    && grep 'hot_swapped=' "${WORK}/rivorad-persisted.log" | tail -1 | grep -q 'tcx-egress-rst-lb'; then
     pass "persisted: the restart hot-swapped both the XDP and TCX programs in place"
 else

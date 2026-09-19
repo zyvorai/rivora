@@ -196,3 +196,42 @@ func TestConntrackWalkIsCached(t *testing.T) {
 		t.Errorf("flow tables walked %d times after TTL expiry, want 2", src.calls)
 	}
 }
+
+func TestVIPDropReasonMetrics(t *testing.T) {
+	src := fakeSource{statuses: []dataplane.Status{
+		{
+			VIPAddress: "10.0.0.1", VIPPort: 80, Protocol: "tcp", Mode: "nat", Dropped: 12,
+			DroppedRateLimited: 9, DroppedNoBackend: 3, Unserved: 5,
+		},
+		{
+			VIPAddress: "10.0.0.2", VIPPort: 443, Protocol: "tcp", Mode: "nat", Dropped: 12,
+			DroppedRateLimited: 0, DroppedNoBackend: 0, Unserved: 0,
+		},
+	}}
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(NewDataplaneCollector(src))
+
+	wantDrops := `
+# HELP rivora_vip_dropped_packets_total Packets dropped for a VIP, by reason: rate_limited (a SYN over the per-source limit) or no_healthy_backend (nothing to send it to). Their sum across VIPs equals rivora_dropped_packets_total.
+# TYPE rivora_vip_dropped_packets_total counter
+rivora_vip_dropped_packets_total{mode="nat",protocol="tcp",reason="no_healthy_backend",vip="10.0.0.1:80"} 3
+rivora_vip_dropped_packets_total{mode="nat",protocol="tcp",reason="no_healthy_backend",vip="10.0.0.2:443"} 0
+rivora_vip_dropped_packets_total{mode="nat",protocol="tcp",reason="rate_limited",vip="10.0.0.1:80"} 9
+rivora_vip_dropped_packets_total{mode="nat",protocol="tcp",reason="rate_limited",vip="10.0.0.2:443"} 0
+`
+	if err := testutil.GatherAndCompare(reg, strings.NewReader(wantDrops), "rivora_vip_dropped_packets_total"); err != nil {
+		t.Errorf("rivora_vip_dropped_packets_total: %v", err)
+	}
+
+	// Unserved is not a drop: it is its own series, so summing drop reasons never
+	// includes packets that actually reached the kernel stack.
+	wantUnserved := `
+# HELP rivora_vip_unserved_packets_total Packets that matched a VIP but could not be served (no service configuration or backend entry), so they passed to the kernel stack instead of being load-balanced. Not drops.
+# TYPE rivora_vip_unserved_packets_total counter
+rivora_vip_unserved_packets_total{mode="nat",protocol="tcp",vip="10.0.0.1:80"} 5
+rivora_vip_unserved_packets_total{mode="nat",protocol="tcp",vip="10.0.0.2:443"} 0
+`
+	if err := testutil.GatherAndCompare(reg, strings.NewReader(wantUnserved), "rivora_vip_unserved_packets_total"); err != nil {
+		t.Errorf("rivora_vip_unserved_packets_total: %v", err)
+	}
+}

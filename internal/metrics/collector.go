@@ -49,6 +49,8 @@ type DataplaneCollector struct {
 	ctCached []dataplane.MapUsage
 
 	backendDraining *prometheus.Desc
+	vipDropped      *prometheus.Desc
+	vipUnserved     *prometheus.Desc
 	ctEntries       *prometheus.Desc
 	ctCapacity      *prometheus.Desc
 
@@ -122,6 +124,16 @@ func NewDataplaneCollector(src StatusSource) *DataplaneCollector {
 			"Whether the last scrape of the dataplane's BPF maps failed (1) or succeeded (0).",
 			nil, nil,
 		),
+		vipDropped: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "vip", "dropped_packets_total"),
+			"Packets dropped for a VIP, by reason: rate_limited (a SYN over the per-source limit) or no_healthy_backend (nothing to send it to). Their sum across VIPs equals rivora_dropped_packets_total.",
+			append(append([]string{}, vipLabels...), "reason"), nil,
+		),
+		vipUnserved: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "vip", "unserved_packets_total"),
+			"Packets that matched a VIP but could not be served (no service configuration or backend entry), so they passed to the kernel stack instead of being load-balanced. Not drops.",
+			vipLabels, nil,
+		),
 		backendDraining: prometheus.NewDesc(
 			prometheus.BuildFQName(ns, "backend", "draining"),
 			"Whether a backend is draining (1): it takes no new flows but established ones continue. Set by an operator drain or a terminating Kubernetes endpoint.",
@@ -173,6 +185,8 @@ func (c *DataplaneCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.backendWeight
 	ch <- c.scrapeErrors
 	ch <- c.backendDraining
+	ch <- c.vipDropped
+	ch <- c.vipUnserved
 	ch <- c.ctEntries
 	ch <- c.ctCapacity
 }
@@ -191,6 +205,9 @@ func (c *DataplaneCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.vipBackends, prometheus.GaugeValue, float64(len(st.Backends)), vip, st.Protocol, st.Mode)
 		ch <- prometheus.MustNewConstMetric(c.vipPackets, prometheus.CounterValue, float64(st.Packets), vip, st.Protocol, st.Mode)
 		ch <- prometheus.MustNewConstMetric(c.vipBytes, prometheus.CounterValue, float64(st.Bytes), vip, st.Protocol, st.Mode)
+		ch <- prometheus.MustNewConstMetric(c.vipDropped, prometheus.CounterValue, float64(st.DroppedRateLimited), vip, st.Protocol, st.Mode, "rate_limited")
+		ch <- prometheus.MustNewConstMetric(c.vipDropped, prometheus.CounterValue, float64(st.DroppedNoBackend), vip, st.Protocol, st.Mode, "no_healthy_backend")
+		ch <- prometheus.MustNewConstMetric(c.vipUnserved, prometheus.CounterValue, float64(st.Unserved), vip, st.Protocol, st.Mode)
 
 		// Dropped is the same node-wide counter on every Status (see
 		// dataplane.Status's Dropped field doc) — report it once, not once

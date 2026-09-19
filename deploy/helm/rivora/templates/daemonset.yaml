@@ -38,6 +38,7 @@ spec:
           args:
             - -kubernetes
             - -interface={{ .Values.rivorad.interface }}
+            - -xdp-mode={{ .Values.rivorad.xdpMode }}
             - -bpf-dir={{ .Values.rivorad.bpfDir }}
             - -loadbalancer-class={{ .Values.rivorad.loadBalancerClass }}
             - -workers={{ .Values.rivorad.workers }}
@@ -57,6 +58,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # The node this pod runs on: rivorad needs it to honour a Service's
+            # externalTrafficPolicy: Local (BGP with speaker: false); harmless otherwise.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           envFrom:
             - secretRef:
                 name: {{ include "rivora.fullname" . }}-rivorad

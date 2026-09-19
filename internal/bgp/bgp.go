@@ -69,6 +69,13 @@ type Speaker struct {
 	mu         sync.Mutex
 	advertised map[netip.Addr]uuid.UUID // VIP address -> the gobgp path UUID currently advertised for it
 
+	// Counters for Snapshot, under their own lock so a scrape never waits on a
+	// resync pass (which holds mu across gobgp calls).
+	statMu          sync.Mutex
+	stateChanges    map[string]uint64 // peer address -> session-state transitions seen
+	advertiseErrors uint64
+	withdrawErrors  uint64
+
 	resyncNow chan struct{}
 }
 
@@ -131,12 +138,13 @@ func newSpeaker(cfg config.BGP, source vipSource, logger *slog.Logger, listenPor
 	}
 
 	return &Speaker{
-		cfg:        cfg,
-		server:     s,
-		source:     source,
-		logger:     logger,
-		advertised: map[netip.Addr]uuid.UUID{},
-		resyncNow:  make(chan struct{}, 1),
+		cfg:          cfg,
+		server:       s,
+		source:       source,
+		logger:       logger,
+		advertised:   map[netip.Addr]uuid.UUID{},
+		stateChanges: map[string]uint64{},
+		resyncNow:    make(chan struct{}, 1),
 	}, nil
 }
 
@@ -212,6 +220,7 @@ func (sp *Speaker) resync() {
 		id, err := sp.advertise(addr)
 		if err != nil {
 			sp.logger.Error("advertise bgp route", "vip", addr, "err", err)
+			sp.countAdvertiseError()
 			continue
 		}
 		sp.advertised[addr] = id
@@ -224,6 +233,7 @@ func (sp *Speaker) resync() {
 		}
 		if err := sp.withdraw(id); err != nil {
 			sp.logger.Error("withdraw bgp route", "vip", addr, "err", err)
+			sp.countWithdrawError()
 			continue
 		}
 		delete(sp.advertised, addr)
@@ -307,6 +317,7 @@ func (sp *Speaker) watchPeerEvents(ctx context.Context) {
 			if ev.Type != apiutil.PEER_EVENT_STATE {
 				return
 			}
+			sp.countStateChange(ev.Peer.State.NeighborAddress.String())
 			sp.logger.Info("bgp peer state changed",
 				"peer", ev.Peer.State.NeighborAddress,
 				"state", ev.Peer.State.SessionState.String(),
@@ -316,4 +327,22 @@ func (sp *Speaker) watchPeerEvents(ctx context.Context) {
 	if err != nil && ctx.Err() == nil {
 		sp.logger.Error("watch bgp peer events", "err", err)
 	}
+}
+
+func (sp *Speaker) countStateChange(peer string) {
+	sp.statMu.Lock()
+	sp.stateChanges[peer]++
+	sp.statMu.Unlock()
+}
+
+func (sp *Speaker) countAdvertiseError() {
+	sp.statMu.Lock()
+	sp.advertiseErrors++
+	sp.statMu.Unlock()
+}
+
+func (sp *Speaker) countWithdrawError() {
+	sp.statMu.Lock()
+	sp.withdrawErrors++
+	sp.statMu.Unlock()
 }
