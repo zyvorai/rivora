@@ -295,10 +295,25 @@ static __always_inline int rl_take(const struct rl_config *cfg, const struct rl_
  * bits (each pass can only shrink the high bits), but more importantly the
  * verifier can't prove a `while (sum >> 16)` terminates — its range
  * tracking doesn't reason about convergence, so it reports "infinite loop
- * detected" even though this converges in 2-3 passes in practice. */
+ * detected" even though this converges in 2-3 passes in practice.
+ *
+ * bpf_csum_diff() only accepts sizes that are a multiple of 4: called with 2 it fails with
+ * -EINVAL, and using its result unchecked silently subtracts 22 from the checksum. So a
+ * 16-bit field (a port, or another checksum) is updated by hand, HC' = ~(~HC + ~m + m'),
+ * and only 4- and 16-byte fields (IPv4/IPv6 addresses) go through the helper. `size` is a
+ * compile-time constant at every call site, so the branch is resolved at build time. */
 static __always_inline void csum_replace(__u16 *csum_be, void *old_val, void *new_val, __u32 size)
 {
+    if (size == 2) {
+        __u32 sum = (~(__u32)(*csum_be) & 0xffff) + (~(__u32)(*(__u16 *)old_val) & 0xffff) + *(__u16 *)new_val;
+        sum = (sum & 0xffff) + (sum >> 16);
+        sum = (sum & 0xffff) + (sum >> 16);
+        *csum_be = (__u16)(~sum & 0xffff);
+        return;
+    }
     __s64 diff = bpf_csum_diff((__be32 *)old_val, size, (__be32 *)new_val, size, 0);
+    if (diff < 0 && diff >= -4095)
+        return; /* the helper refused (bad size): leave the checksum alone rather than corrupt it */
     __u32 c = (~(__u32)(*csum_be)) & 0xffff;
     __s64 sum = (__s64)c + diff;
 #pragma unroll
