@@ -229,3 +229,5 @@ jobs:
       run: sudo bash scripts/selftest-xdpmode.sh
     - name: HTTP health check selftest (open port + failing app, reload, bad config, veth/netns)
       run: sudo bash scripts/selftest-httpcheck.sh
+    - name: API auth selftest (roles, key rotation, failure metric, cert pinning, bad key config)
+      run: sudo bash scripts/selftest-apiauth.sh

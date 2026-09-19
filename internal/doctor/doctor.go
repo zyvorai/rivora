@@ -187,9 +187,24 @@ func checkAPISecurity() Check {
 	tlsFile := os.Getenv("RIVORA_TLS_CERT") != "" && os.Getenv("RIVORA_TLS_KEY") != ""
 	selfSigned := os.Getenv("RIVORA_TLS_SELF_SIGNED") != ""
 
+	readOnly := strings.TrimSpace(os.Getenv("RIVORA_API_READONLY_KEY")) != ""
+
 	authDetail := "RIVORA_API_KEY not set — API is unauthenticated"
 	if apiKey {
 		authDetail = "RIVORA_API_KEY set — API requires a bearer token"
+		if readOnly {
+			authDetail += " (a separate RIVORA_API_READONLY_KEY may read but not change anything)"
+		}
+	}
+
+	// rivorad refuses to start in this state: the admin key is what turns
+	// authentication on, so a read-only key alone would protect nothing.
+	if readOnly && !apiKey {
+		return Check{
+			Status: StatusWarn, Title: "API security",
+			Detail:      "RIVORA_API_READONLY_KEY is set but RIVORA_API_KEY is not",
+			Remediation: "set RIVORA_API_KEY (the admin key that enables authentication), or unset RIVORA_API_READONLY_KEY; rivorad will refuse to start as configured",
+		}
 	}
 	tlsDetail := "no TLS env vars set — API serves plain HTTP"
 	switch {

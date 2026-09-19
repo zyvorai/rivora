@@ -9,11 +9,14 @@ package apiclient
 import (
 	"bytes"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -25,9 +28,32 @@ import (
 // token on every request — matching rivorad requiring RIVORA_API_KEY.
 // TLSInsecure skips certificate verification, for rivorad's self-signed
 // cert (RIVORA_TLS_SELF_SIGNED) — matching netractl's NETRA_TLS_INSECURE.
+//
+// RootCAs, when set, is the only trust root: the server's certificate must chain
+// to it. It is how a client verifies a certificate rivorad was given with
+// RIVORA_TLS_CERT (pass that certificate, or the CA that signed it) instead of
+// skipping verification. It takes precedence over TLSInsecure if both are set,
+// since verifying is the safer of the two readings.
 type Options struct {
 	APIKey      string
 	TLSInsecure bool
+	RootCAs     *x509.CertPool
+}
+
+// LoadCAFile reads a PEM file of one or more certificates into a pool for
+// Options.RootCAs. It fails if the file can't be read or holds no certificate,
+// rather than returning an empty pool that would reject every server with a
+// baffling error.
+func LoadCAFile(path string) (*x509.CertPool, error) {
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read CA file: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("CA file %s contains no PEM certificate", path)
+	}
+	return pool, nil
 }
 
 type Client struct {
@@ -36,16 +62,26 @@ type Client struct {
 	hc     *http.Client
 }
 
-// New creates a client for addr, which may be a bare host:port (defaults to
-// http://) or a full http://.../https://... URL.
+// New creates a client for addr, which may be a bare host:port or a full
+// http://.../https://... URL. A bare address defaults to http://, unless the
+// caller asked for TLS handling (RootCAs or TLSInsecure), which only makes sense
+// over https: then it defaults to https://. Otherwise "--tls-insecure host:port"
+// would speak plain HTTP to a TLS listener and get an unexplained 400.
 func New(addr string, opts Options) *Client {
 	base := addr
 	if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
-		base = "http://" + base
+		if opts.RootCAs != nil || opts.TLSInsecure {
+			base = "https://" + base
+		} else {
+			base = "http://" + base
+		}
 	}
 
 	transport := http.DefaultTransport
-	if opts.TLSInsecure {
+	switch {
+	case opts.RootCAs != nil:
+		transport = &http.Transport{TLSClientConfig: &tls.Config{RootCAs: opts.RootCAs, MinVersion: tls.VersionTLS12}}
+	case opts.TLSInsecure:
 		transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} //nolint:gosec // explicit opt-in for rivorad's self-signed cert
 	}
 
@@ -138,6 +174,14 @@ func (c *Client) do(method, path string, body, out any) error {
 		if errors.As(err, &opErr) {
 			return fmt.Errorf("cannot reach rivorad at %s (is it running?): %w", c.base, err)
 		}
+		// A certificate that doesn't verify is the most common TLS stumble, and the
+		// raw error doesn't say what to do about it.
+		var unknownAuth x509.UnknownAuthorityError
+		var certInvalid x509.CertificateInvalidError
+		var hostErr x509.HostnameError
+		if errors.As(err, &unknownAuth) || errors.As(err, &certInvalid) || errors.As(err, &hostErr) {
+			return fmt.Errorf("the server's certificate is not trusted: %w (pass --ca-file with the certificate rivorad was started with, or --tls-insecure to skip verification)", err)
+		}
 		return err
 	}
 	defer resp.Body.Close()
@@ -146,10 +190,17 @@ func (c *Client) do(method, path string, body, out any) error {
 		return fmt.Errorf("rivorad: unauthorized — set RIVORA_API_KEY or pass --api-key")
 	}
 	if resp.StatusCode != http.StatusOK {
+		// Read the (small) error body once; both checks below use the same bytes.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		// Go's TLS server answers a plain-HTTP request with this exact bodyless 400.
+		if resp.StatusCode == http.StatusBadRequest && strings.HasPrefix(c.base, "http://") &&
+			strings.Contains(string(body), "HTTP request to an HTTPS server") {
+			return fmt.Errorf("rivorad at %s speaks HTTPS: use --api https://%s (with --ca-file or --tls-insecure)", c.base, strings.TrimPrefix(c.base, "http://"))
+		}
 		var e struct {
 			Error string `json:"error"`
 		}
-		_ = json.NewDecoder(resp.Body).Decode(&e)
+		_ = json.Unmarshal(body, &e)
 		if e.Error != "" {
 			return fmt.Errorf("rivorad: %s", e.Error)
 		}

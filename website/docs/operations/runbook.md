@@ -71,6 +71,40 @@ they were actually removed, a restart rebuilds them from the current
 config/K8s state (some in-flight NAT connection affinity is lost in that
 case, existing DSR flows are not since the backend owns the reply path).
 
+## API keys: read-only access, rotation, and probing
+
+The API has two roles. `RIVORA_API_KEY` is the **admin** key (full access,
+including the mutating calls below); `RIVORA_API_READONLY_KEY` may read but gets a
+`403` on anything that changes state. Hand the read-only key to dashboards and to
+anyone who only needs to look, so a leaked screen-share can't drain a backend.
+
+**Rotating a key with no outage** (either variable accepts a comma-separated list):
+
+1. Generate the new key: `openssl rand -hex 24`.
+2. Set `RIVORA_API_KEY=<new>,<old>` (in `/etc/rivora/rivorad.env`, or the chart's
+   `rivorad.apiKey`, escaping the comma with `--set`) and restart `rivorad`. Both
+   keys now work.
+3. Move every client to `<new>`.
+4. Set `RIVORA_API_KEY=<new>` and restart. `<old>` now gets `401`.
+
+Rotate a read-only key the same way with `RIVORA_API_READONLY_KEY`.
+
+**Watching for probing.** A publicly bound API attracts scanners. Alert on
+`rate(rivora_api_auth_failures_total{reason="unauthenticated"}[5m])`; a steady
+rise means someone is guessing keys (`forbidden` means a read-only key was used to
+try to change something). Rejections are also logged, throttled to about one line
+per 10 seconds with a count of how many were swallowed, showing the source
+address and path but never a key. Behind a proxy the address is the proxy's.
+
+**Trusting the certificate.** With `RIVORA_TLS_CERT`/`RIVORA_TLS_KEY`, verify it
+rather than skipping verification: `rivoractl --ca-file cert.pem ...`. The
+auto-generated self-signed certificate changes on every start, so it can only be
+skipped with `--tls-insecure`.
+
+`rivorad` refuses to start, before touching the kernel, if the key settings are
+unsafe: a read-only key with no admin key, a key in both roles, or a setting with
+no usable key in it.
+
 ## Draining a backend or shifting weight (live)
 
 Use these for maintenance and canary shifts without editing config or

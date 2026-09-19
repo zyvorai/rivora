@@ -93,6 +93,23 @@ func main() {
 		os.Exit(2)
 	}
 
+	// Validate the API keys before anything touches the kernel: a bad security
+	// configuration should stop rivorad before it has loaded BPF or attached XDP.
+	// RIVORA_API_KEY is the admin credential and, being set, what turns API
+	// authentication on. Either variable may hold a comma-separated list, which is
+	// how a key is rotated with no outage. RIVORA_API_READONLY_KEY grants keys that
+	// can read but not change anything.
+	apiKey := os.Getenv("RIVORA_API_KEY")
+	readOnlyKey := os.Getenv("RIVORA_API_READONLY_KEY")
+	if err := api.ValidateKeys(apiKey, readOnlyKey); err != nil {
+		logger.Error("api key configuration", "err", err)
+		os.Exit(1)
+	}
+	if n := api.WeakKeys(apiKey) + api.WeakKeys(readOnlyKey); n > 0 {
+		logger.Warn("some API keys are shorter than recommended; generate one with `openssl rand -hex 24`",
+			"keys", n, "min_length", api.MinKeyLength)
+	}
+
 	if *detach {
 		removed, err := loader.DetachPersisted()
 		if err != nil {
@@ -382,12 +399,13 @@ func main() {
 		logger.Info("kubernetes mode enabled", "lb_class", *lbClass, "speaker", *speakerOn, "gateway_api", *gatewayAPIOn)
 	}
 
-	apiKey := os.Getenv("RIVORA_API_KEY")
 	tlsCert := os.Getenv("RIVORA_TLS_CERT")
 	tlsKey := os.Getenv("RIVORA_TLS_KEY")
 	selfSigned := os.Getenv("RIVORA_TLS_SELF_SIGNED") != ""
 
 	apiServer := api.New(plane, apiKey)
+	apiServer.SetReadOnlyKeys(readOnlyKey)
+	apiServer.SetLogger(logger)
 	if bgpSpeaker != nil {
 		apiServer.RegisterBGP(bgpSpeaker)
 	}
@@ -417,7 +435,8 @@ func main() {
 	if apiKey != "" {
 		authMode = "on"
 	}
-	logger.Info("api listening", "addr", cfg.APIListen, "tls", tlsMode, "auth", authMode)
+	logger.Info("api listening", "addr", cfg.APIListen, "tls", tlsMode, "auth", authMode,
+		"admin_keys", api.CountKeys(apiKey), "readonly_keys", api.CountKeys(readOnlyKey))
 	logger.Info("metrics listening", "addr", *metricsListen)
 
 	go func() {
