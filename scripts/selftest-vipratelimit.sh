@@ -71,6 +71,7 @@ BACKEND_PIDS=""
 cleanup() {
     [ -n "$RIVORAD_PID" ] && kill "$RIVORAD_PID" 2>/dev/null
     for p in $BACKEND_PIDS; do ip netns exec "$NS_BACKEND" kill "$p" 2>/dev/null; done
+    for ns in "$NS_LB" "$NS_CLIENT" "$NS_BACKEND"; do ip netns pids "$ns" 2>/dev/null | xargs -r kill 2>/dev/null; done
     for ns in "$NS_LB" "$NS_CLIENT" "$NS_BACKEND"; do ip netns del "$ns" 2>/dev/null; done
     ip link del "$BR" 2>/dev/null
     rm -f "$CONFIG" "$RIVORAD_LOG"

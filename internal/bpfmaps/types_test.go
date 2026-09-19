@@ -35,6 +35,7 @@ func TestStructSizesMatchCABI(t *testing.T) {
 		{"NATReverseKey6", unsafe.Sizeof(NATReverseKey6{}), 40},
 		{"NATReverseVal6", unsafe.Sizeof(NATReverseVal6{}), 20},
 		{"Addr6Key", unsafe.Sizeof(Addr6Key{}), 16},
+		{"TunnelConfig", unsafe.Sizeof(TunnelConfig{}), 20},
 		{"VipRangeKey", unsafe.Sizeof(VipRangeKey{}), 12},
 		{"VipRangeKey6", unsafe.Sizeof(VipRangeKey6{}), 24},
 		{"SvcRLKey", unsafe.Sizeof(SvcRLKey{}), 8},

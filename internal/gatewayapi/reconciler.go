@@ -36,6 +36,7 @@ import (
 	gwapi "github.com/zyvorai/rivora/api/gatewayapi"
 	"github.com/zyvorai/rivora/internal/config"
 	"github.com/zyvorai/rivora/internal/dataplane"
+	"github.com/zyvorai/rivora/internal/initsync"
 )
 
 const (
@@ -65,8 +66,7 @@ type routeShape struct {
 // attachedRoute is one Route (TCPRoute or UDPRoute, indistinguishable
 // past this point) known to attach to the Gateway being reconciled.
 type attachedRoute struct {
-	spec      gwapi.RouteSpec
-	namespace string
+	ref RouteRef
 }
 
 // Reconciler is rivorad's GatewayClass/Gateway/TCPRoute/UDPRoute ->
@@ -81,6 +81,10 @@ type Reconciler struct {
 	gatewayLister cache.GenericLister
 	tcpLister     cache.GenericLister
 	udpLister     cache.GenericLister
+	// nsLister and grantLister feed allowedRoutes namespace selectors and cross-namespace
+	// backendRefs (ReferenceGrant); see the Env methods below.
+	nsLister    corelisters.NamespaceLister
+	grantLister cache.GenericLister
 
 	queue      workqueue.TypedRateLimitingInterface[string] // "namespace/name" of a Gateway
 	classQueue workqueue.TypedRateLimitingInterface[string] // trigger-only, mirrors ipamctrl's poolsQueue
@@ -98,7 +102,14 @@ type Reconciler struct {
 	// wires both reconcilers' OnChange to the same health-checker-refresh
 	// callback.
 	OnChange func()
+
+	// init, if set, is told when each Gateway present at start-up has been reconciled once.
+	init *initsync.Tracker
 }
+
+// SetInitTracker makes Run report, through t, when every Gateway that existed once the caches
+// synced has been reconciled successfully. Set before Run.
+func (r *Reconciler) SetInitTracker(t *initsync.Tracker) { r.init = t }
 
 // New builds a Reconciler. Unlike internal/controller there's no lbClass
 // equivalent — a Gateway's "do we manage this" test is entirely
@@ -115,6 +126,8 @@ func New(clientset kubernetes.Interface, dyn dynamic.Interface, plane dataplaner
 	gwInformer := dynFactory.ForResource(gwapi.GatewayResource)
 	tcpInformer := dynFactory.ForResource(gwapi.TCPRouteResource)
 	udpInformer := dynFactory.ForResource(gwapi.UDPRouteResource)
+	nsInformer := factory.Core().V1().Namespaces()
+	grantInformer := dynFactory.ForResource(gwapi.ReferenceGrantResource)
 
 	r := &Reconciler{
 		plane:         plane,
@@ -125,6 +138,8 @@ func New(clientset kubernetes.Interface, dyn dynamic.Interface, plane dataplaner
 		gatewayLister: gwInformer.Lister(),
 		tcpLister:     tcpInformer.Lister(),
 		udpLister:     udpInformer.Lister(),
+		nsLister:      nsInformer.Lister(),
+		grantLister:   grantInformer.Lister(),
 		queue: workqueue.NewTypedRateLimitingQueue[string](
 			workqueue.DefaultTypedControllerRateLimiter[string](),
 		),
@@ -149,6 +164,15 @@ func New(clientset kubernetes.Interface, dyn dynamic.Interface, plane dataplaner
 		UpdateFunc: func(_, obj interface{}) { r.enqueueRoute(obj) },
 		DeleteFunc: func(obj interface{}) { r.enqueueRoute(obj) },
 	})
+	// A namespace's labels or a ReferenceGrant changing can change what is allowed anywhere, and
+	// both are rare, so resync every Gateway (the same trigger a GatewayClass change uses).
+	resync := cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(interface{}) { r.classQueue.Add("resync") },
+		UpdateFunc: func(interface{}, interface{}) { r.classQueue.Add("resync") },
+		DeleteFunc: func(interface{}) { r.classQueue.Add("resync") },
+	}
+	nsInformer.Informer().AddEventHandler(resync)
+	grantInformer.Informer().AddEventHandler(resync)
 	udpInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj interface{}) { r.enqueueRoute(obj) },
 		UpdateFunc: func(_, obj interface{}) { r.enqueueRoute(obj) },
@@ -195,16 +219,16 @@ func decodeRoute(obj interface{}) (*unstructured.Unstructured, routeShape, bool)
 	return u, rt, true
 }
 
-// enqueueRoute resolves a TCPRoute/UDPRoute's parentRefs to Gateway keys
-// — v1 scope is same-namespace attachment only, so the Route's own
-// namespace is always the Gateway's namespace too.
+// enqueueRoute resolves a TCPRoute/UDPRoute's parentRefs to Gateway keys. A parentRef may name a
+// Gateway in another namespace, so the key uses its namespace, defaulting to the route's own.
 func (r *Reconciler) enqueueRoute(obj interface{}) {
 	u, rt, ok := decodeRoute(obj)
 	if !ok {
 		return
 	}
+	rr := RouteRef{Namespace: u.GetNamespace()}
 	for _, pr := range rt.Spec.ParentRefs {
-		r.queue.Add(u.GetNamespace() + "/" + pr.Name)
+		r.queue.Add(parentNamespace(rr, pr) + "/" + pr.Name)
 	}
 }
 
@@ -220,14 +244,13 @@ func (r *Reconciler) enqueueSlice(obj interface{}) {
 	r.enqueueGatewaysForService(slice.Namespace, svcName)
 }
 
-// enqueueGatewaysForService finds every Route in namespace whose
-// backendRefs reference serviceName and enqueues the Gateway(s) it
-// attaches to — the reverse-index an EndpointSlice event needs, since a
-// slice only carries its own Service's name, never which Gateway(s)
-// route to it.
+// enqueueGatewaysForService finds every Route, in any namespace, whose backendRefs reference the
+// Service and enqueues the Gateway(s) it attaches to — the reverse index an EndpointSlice event
+// needs, since a slice only carries its own Service's name. A route may reference a Service in
+// another namespace (through a ReferenceGrant), so all namespaces are scanned.
 func (r *Reconciler) enqueueGatewaysForService(namespace, serviceName string) {
 	for _, lister := range []cache.GenericLister{r.tcpLister, r.udpLister} {
-		objs, err := lister.ByNamespace(namespace).List(labels.Everything())
+		objs, err := lister.List(labels.Everything())
 		if err != nil {
 			continue
 		}
@@ -240,20 +263,26 @@ func (r *Reconciler) enqueueGatewaysForService(namespace, serviceName string) {
 			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.UnstructuredContent(), &rt); err != nil {
 				continue
 			}
-			if !routeReferencesService(rt.Spec, serviceName) {
+			rr := RouteRef{Namespace: u.GetNamespace(), Spec: rt.Spec}
+			if !routeReferencesService(rr, namespace, serviceName) {
 				continue
 			}
 			for _, pr := range rt.Spec.ParentRefs {
-				r.queue.Add(namespace + "/" + pr.Name)
+				r.queue.Add(parentNamespace(rr, pr) + "/" + pr.Name)
 			}
 		}
 	}
 }
 
-func routeReferencesService(spec gwapi.RouteSpec, serviceName string) bool {
-	for _, rule := range spec.Rules {
+// routeReferencesService reports whether rr has a backendRef to Service ns/name.
+func routeReferencesService(rr RouteRef, ns, name string) bool {
+	for _, rule := range rr.Spec.Rules {
 		for _, br := range rule.BackendRefs {
-			if br.Namespace == nil && br.Name == serviceName {
+			bns := rr.Namespace
+			if br.Namespace != nil && *br.Namespace != "" {
+				bns = *br.Namespace
+			}
+			if bns == ns && br.Name == name {
 				return true
 			}
 		}
@@ -288,10 +317,26 @@ func (r *Reconciler) Run(ctx context.Context, factory informers.SharedInformerFa
 		dynFactory.ForResource(gwapi.GatewayResource).Informer().HasSynced,
 		dynFactory.ForResource(gwapi.TCPRouteResource).Informer().HasSynced,
 		dynFactory.ForResource(gwapi.UDPRouteResource).Informer().HasSynced,
+		factory.Core().V1().Namespaces().Informer().HasSynced,
+		dynFactory.ForResource(gwapi.ReferenceGrantResource).Informer().HasSynced,
 	) {
 		return fmt.Errorf("timed out waiting for informer caches to sync")
 	}
 	r.logger.Info("gateway API controller caches synced")
+
+	if r.init != nil {
+		var keys []string
+		if objs, err := r.gatewayLister.List(labels.Everything()); err == nil {
+			for _, obj := range objs {
+				if k, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj); err == nil {
+					keys = append(keys, k)
+				}
+			}
+		} else {
+			r.logger.Error("list gateways for the initial sync", "err", err)
+		}
+		r.init.Arm(keys)
+	}
 
 	go r.classWorker(ctx)
 	for i := 0; i < workers; i++ {
@@ -345,6 +390,9 @@ func (r *Reconciler) processNextItem(ctx context.Context) bool {
 		return true
 	}
 	r.queue.Forget(key)
+	if r.init != nil {
+		r.init.Finished(key)
+	}
 	return true
 }
 
@@ -374,7 +422,7 @@ func (r *Reconciler) reconcile(key string) error {
 		return r.removeAllFor(key, nil)
 	}
 
-	routes, err := r.attachedRoutes(ns, name)
+	routes, err := r.attachedRoutes(&gw)
 	if err != nil {
 		return fmt.Errorf("gateway %s: list attached routes: %w", key, err)
 	}
@@ -404,12 +452,15 @@ func (r *Reconciler) managed(className string) bool {
 	return gwapi.IsManagedClass(&gc)
 }
 
-// attachedRoutes lists every TCPRoute/UDPRoute in gwNamespace whose
-// parentRefs name gwName — v1 scope is same-namespace attachment only.
-func (r *Reconciler) attachedRoutes(gwNamespace, gwName string) ([]attachedRoute, error) {
+// attachedRoutes lists every TCPRoute/UDPRoute, in any namespace, with a parentRef naming gw. Whether
+// a listener actually accepts it (allowedRoutes) is decided per listener in buildDesiredVIPs.
+func (r *Reconciler) attachedRoutes(gw *gwapi.Gateway) ([]attachedRoute, error) {
 	var out []attachedRoute
-	for _, lister := range []cache.GenericLister{r.tcpLister, r.udpLister} {
-		objs, err := lister.ByNamespace(gwNamespace).List(labels.Everything())
+	for _, src := range []struct {
+		lister cache.GenericLister
+		kind   string
+	}{{r.tcpLister, gwapi.KindTCPRoute}, {r.udpLister, gwapi.KindUDPRoute}} {
+		objs, err := src.lister.List(labels.Everything())
 		if err != nil {
 			return nil, err
 		}
@@ -422,9 +473,10 @@ func (r *Reconciler) attachedRoutes(gwNamespace, gwName string) ([]attachedRoute
 			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.UnstructuredContent(), &rt); err != nil {
 				continue
 			}
+			ref := RouteRef{Kind: src.kind, Namespace: u.GetNamespace(), Name: u.GetName(), Spec: rt.Spec}
 			for _, pr := range rt.Spec.ParentRefs {
-				if pr.Name == gwName {
-					out = append(out, attachedRoute{spec: rt.Spec, namespace: gwNamespace})
+				if namesGateway(ref, pr, gw) {
+					out = append(out, attachedRoute{ref: ref})
 					break
 				}
 			}
@@ -432,6 +484,44 @@ func (r *Reconciler) attachedRoutes(gwNamespace, gwName string) ([]attachedRoute
 	}
 	return out, nil
 }
+
+// NamespaceLabels, Grants and ServiceExists make the Reconciler the Env its attach checks read.
+func (r *Reconciler) NamespaceLabels(ns string) (map[string]string, bool) {
+	n, err := r.nsLister.Get(ns)
+	if err != nil {
+		return nil, false
+	}
+	return n.Labels, true
+}
+
+func (r *Reconciler) Grants(ns string) []gwapi.ReferenceGrant { return grantsIn(r.grantLister, ns) }
+
+// grantsIn lists and decodes the ReferenceGrants in namespace ns.
+func grantsIn(lister cache.GenericLister, ns string) []gwapi.ReferenceGrant {
+	objs, err := lister.ByNamespace(ns).List(labels.Everything())
+	if err != nil {
+		return nil
+	}
+	var out []gwapi.ReferenceGrant
+	for _, o := range objs {
+		u, ok := o.(*unstructured.Unstructured)
+		if !ok {
+			continue
+		}
+		var g gwapi.ReferenceGrant
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.UnstructuredContent(), &g); err == nil {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+func (r *Reconciler) ServiceExists(ns, name string) bool {
+	_, err := r.serviceLister.Services(ns).Get(name)
+	return err == nil
+}
+
+var _ Env = (*Reconciler)(nil)
 
 // removeAllFor applies desired's VIP set for key — identical shape and
 // reasoning to internal/controller.Reconciler.removeAllFor.

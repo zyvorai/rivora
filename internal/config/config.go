@@ -8,8 +8,10 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -20,9 +22,24 @@ import (
 type Mode string
 
 const (
+	// ModeDSR rewrites the frame's MAC and sends it straight back out: the backend must be on
+	// the load balancer's own L2 segment and own the VIP locally.
 	ModeDSR Mode = "dsr"
 	ModeNAT Mode = "nat"
+	// ModeDSRIPIP and ModeDSRGRE are "L3 DSR": the packet is tunnelled to the backend
+	// (IP-in-IP, or GRE) and the backend, which owns the VIP locally, unwraps it and answers the
+	// client directly. The backend only has to be routable from the load balancer, not on its L2
+	// segment. IPv4 VIPs get an IPv4 outer header, IPv6 VIPs an IPv6 one. The path to the
+	// backends must carry the extra 20 (24 with GRE, 40/44 for IPv6) bytes.
+	ModeDSRIPIP Mode = "dsr-ipip"
+	ModeDSRGRE  Mode = "dsr-gre"
 )
+
+// IsTunnel reports whether m encapsulates towards the backend.
+func (m Mode) IsTunnel() bool { return m == ModeDSRIPIP || m == ModeDSRGRE }
+
+// Valid reports whether m is a mode rivorad knows.
+func (m Mode) Valid() bool { return m == ModeDSR || m == ModeNAT || m.IsTunnel() }
 
 type Protocol string
 
@@ -74,6 +91,14 @@ type VIP struct {
 	// follows the node-wide rateLimit; set, it replaces that limit for this VIP,
 	// whether or not the node-wide one is enabled.
 	RateLimit VIPRateLimit `yaml:"rateLimit,omitempty"`
+	// BGPCommunities are added to the BGP route advertised for this VIP (see BGP.Communities),
+	// for example to tag an anycast VIP for a different upstream policy.
+	BGPCommunities []string `yaml:"bgpCommunities,omitempty"`
+	// BGPPeers limits the BGP route for this VIP to the named peers (by address). Unset means every
+	// peer. Peers the route is not sent to never see it, so this steers which router (or rack, or
+	// upstream) carries this VIP's traffic. With several VIPs on one address the route is sent to
+	// every peer any of them names, or to all if any of them names none.
+	BGPPeers []string `yaml:"bgpPeers,omitempty"`
 }
 
 // VIPRateLimit is a per-source-IP token bucket on one VIP's new TCP connections
@@ -296,6 +321,35 @@ type BGP struct {
 	// routerId stays the BGP identifier and IPv4 next-hop (always IPv4).
 	IPv6NextHop string    `yaml:"ipv6NextHop,omitempty"`
 	Peers       []BGPPeer `yaml:"peers"`
+
+	// Communities are attached to every route this speaker originates: "65000:100" style
+	// (both halves 0-65535) or the well-known names no-export, no-advertise and
+	// no-export-subconfed. A VIP's own bgpCommunities are added to these for that VIP's route.
+	Communities []string `yaml:"communities,omitempty"`
+	// LocalPref sets the LOCAL_PREF attribute on originated routes. It is only carried to iBGP
+	// peers (peers in this speaker's own AS); an eBGP peer never receives it. Unset sends none.
+	LocalPref *uint32 `yaml:"localPref,omitempty"`
+	// Aggregates advertise a covering prefix (say a /24 of VIPs) while at least one VIP inside it
+	// has a healthy backend, and withdraw it when none does.
+	Aggregates []BGPAggregate `yaml:"aggregates,omitempty"`
+
+	// PeersFromResources says more peers will be supplied at run time (BGPPeer resources, in
+	// Kubernetes), so an empty peers list is not an error. Set by rivorad from
+	// -bgp-peer-resources; it has no use in a static config.
+	PeersFromResources bool `yaml:"-"`
+}
+
+// BGPAggregate is a prefix advertised in place of, or alongside, the /32 (/128) host routes of the
+// VIPs it covers.
+type BGPAggregate struct {
+	Prefix string `yaml:"prefix"`
+	// SuppressSpecifics stops the covered VIPs' host routes being advertised while this aggregate
+	// is. Off, the aggregate is advertised in addition to them.
+	SuppressSpecifics bool `yaml:"suppressSpecifics,omitempty"`
+	// Communities are attached to the aggregate route (on top of the global ones).
+	Communities []string `yaml:"communities,omitempty"`
+	// Peers limits the aggregate to the named peers (by address); unset means every peer.
+	Peers []string `yaml:"peers,omitempty"`
 }
 
 type BGPPeer struct {
@@ -305,6 +359,142 @@ type BGPPeer struct {
 	// for sub-second down detection, instead of relying solely on BGP's
 	// own (much slower) hold-timer expiry.
 	BFD bool `yaml:"bfd,omitempty"`
+
+	// Password enables TCP MD5 authentication (RFC 2385) on the session; the peer must be
+	// configured with the same one. PasswordFile reads it from a file instead (a mounted Secret),
+	// so it need not sit in a config that gets committed or logged. Set one or neither.
+	Password     string `yaml:"password,omitempty"`
+	PasswordFile string `yaml:"passwordFile,omitempty"`
+	// Multihop is the TTL for an eBGP session to a peer more than one hop away, 2-255. Unset
+	// keeps the default, where an eBGP peer must be directly connected.
+	Multihop uint32 `yaml:"multihop,omitempty"`
+	// GracefulRestart negotiates BGP graceful restart (RFC 4724) so the peer keeps forwarding to
+	// this node's routes for RestartTime seconds if the session drops, instead of withdrawing them
+	// at once: a rivorad restart then does not black-hole its VIPs.
+	GracefulRestart *BGPGracefulRestart `yaml:"gracefulRestart,omitempty"`
+	// Nodes limits the peer to the named nodes (by -node-name / hostname). Unset applies it
+	// everywhere, so one shared config can give each node its own top-of-rack peer.
+	Nodes []string `yaml:"nodes,omitempty"`
+}
+
+// BGPGracefulRestart configures graceful restart on one peer.
+type BGPGracefulRestart struct {
+	Enabled bool `yaml:"enabled"`
+	// RestartTime is how long, in seconds, the peer should hold this node's routes while it
+	// restarts. Default 120; at most 4095 (the protocol's 12-bit field).
+	RestartTime uint32 `yaml:"restartTime,omitempty"`
+}
+
+// Well-known BGP communities (RFC 1997 and RFC 8326-era names) accepted by name.
+var wellKnownCommunities = map[string]uint32{
+	"no-export":           0xFFFFFF01,
+	"no-advertise":        0xFFFFFF02,
+	"no-export-subconfed": 0xFFFFFF03,
+}
+
+// ParsePeerAddrs validates a list of BGP peer addresses and returns it normalised (each in its
+// canonical text form, sorted, without repeats), so that "2001:DB8::1" and "2001:db8::1" name the
+// same peer. Empty in, nil out: no restriction.
+func ParsePeerAddrs(in []string) ([]string, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, a := range in {
+		addr, err := netip.ParseAddr(a)
+		if err != nil {
+			return nil, fmt.Errorf("peer %q: not an IP address", a)
+		}
+		n := addr.Unmap().String()
+		if !seen[n] {
+			seen[n] = true
+			out = append(out, n)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// ParseCommunities converts "asn:value" (both 0-65535) and well-known names to their 32-bit
+// values, in order. It is the single parser for every place a community is written.
+func ParseCommunities(in []string) ([]uint32, error) {
+	out := make([]uint32, 0, len(in))
+	for _, c := range in {
+		c = strings.TrimSpace(c)
+		if v, ok := wellKnownCommunities[strings.ToLower(c)]; ok {
+			out = append(out, v)
+			continue
+		}
+		a, b, ok := strings.Cut(c, ":")
+		hi, err1 := strconv.ParseUint(a, 10, 16)
+		lo, err2 := strconv.ParseUint(b, 10, 16)
+		if !ok || err1 != nil || err2 != nil {
+			return nil, fmt.Errorf("community %q: want asn:value (0-65535 each) or one of no-export, no-advertise, no-export-subconfed", c)
+		}
+		out = append(out, uint32(hi)<<16|uint32(lo))
+	}
+	return out, nil
+}
+
+// ForNode returns b with only the peers that apply to node: a peer with no Nodes applies
+// everywhere, one with Nodes only on those. With no node name known, a peer restricted to
+// particular nodes is left out rather than guessed at.
+func (b BGP) ForNode(node string) BGP {
+	out := b
+	out.Peers = nil
+	for _, p := range b.Peers {
+		if len(p.Nodes) == 0 {
+			out.Peers = append(out.Peers, p)
+			continue
+		}
+		for _, n := range p.Nodes {
+			if node != "" && n == node {
+				out.Peers = append(out.Peers, p)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// Validate checks one peer on its own: address, AS number and options. localASN is the speaker's
+// AS. It is what BGP.Validate applies to each peer, exposed for peers that arrive one at a time
+// (the BGPPeer resource) rather than inside a bgp section.
+func (p BGPPeer) Validate(localASN uint32) error {
+	if net.ParseIP(p.Address) == nil {
+		return fmt.Errorf("bgp peer %q: invalid address", p.Address)
+	}
+	if p.ASN == 0 {
+		return fmt.Errorf("bgp peer %s: asn must be > 0", p.Address)
+	}
+	if err := p.validateOptions(localASN); err != nil {
+		return fmt.Errorf("bgp peer %s: %w", p.Address, err)
+	}
+	return nil
+}
+
+// validateOptions checks a peer's optional settings. localASN is this speaker's own AS: multihop is an
+// eBGP setting, so it is refused on a peer in the same AS.
+func (p BGPPeer) validateOptions(localASN uint32) error {
+	if p.Password != "" && p.PasswordFile != "" {
+		return fmt.Errorf("set password or passwordFile, not both")
+	}
+	if len(p.Password) > 80 {
+		return fmt.Errorf("password is longer than the 80 bytes TCP MD5 allows")
+	}
+	if p.Multihop != 0 {
+		if p.Multihop < 2 || p.Multihop > 255 {
+			return fmt.Errorf("multihop %d: must be 2-255 (leave it unset for a directly connected peer)", p.Multihop)
+		}
+		if p.ASN == localASN {
+			return fmt.Errorf("multihop applies to eBGP; this peer is in the same AS (%d)", p.ASN)
+		}
+	}
+	if g := p.GracefulRestart; g != nil && g.RestartTime > 4095 {
+		return fmt.Errorf("gracefulRestart.restartTime %d: at most 4095 seconds", g.RestartTime)
+	}
+	return nil
 }
 
 // Validate checks b in isolation — reused both by Config.Validate() for
@@ -329,19 +519,56 @@ func (b BGP) Validate() error {
 			return fmt.Errorf("bgp: ipv6NextHop must be a valid IPv6 address")
 		}
 	}
-	if len(b.Peers) == 0 {
+	if len(b.Peers) == 0 && !b.PeersFromResources {
 		return fmt.Errorf("bgp: at least one peer is required when enabled")
 	}
 	for _, p := range b.Peers {
-		if net.ParseIP(p.Address) == nil {
-			return fmt.Errorf("bgp peer %q: invalid address", p.Address)
+		if err := p.Validate(b.ASN); err != nil {
+			return err
 		}
-		if p.ASN == 0 {
-			return fmt.Errorf("bgp peer %s: asn must be > 0", p.Address)
+	}
+	if _, err := ParseCommunities(b.Communities); err != nil {
+		return fmt.Errorf("bgp: %w", err)
+	}
+	for _, a := range b.Aggregates {
+		if _, err := netip.ParsePrefix(a.Prefix); err != nil {
+			return fmt.Errorf("bgp aggregate %q: not a valid prefix: %w", a.Prefix, err)
+		}
+		if err := b.checkPeerNames(a.Peers); err != nil {
+			return fmt.Errorf("bgp aggregate %s: peers: %w", a.Prefix, err)
+		}
+		if _, err := ParseCommunities(a.Communities); err != nil {
+			return fmt.Errorf("bgp aggregate %s: %w", a.Prefix, err)
 		}
 	}
 	return nil
 }
+
+// checkPeerNames accepts a list of peer addresses that are valid and, when every peer is known here
+// (none arrive at run time), all configured.
+func (b BGP) checkPeerNames(names []string) error {
+	norm, err := ParsePeerAddrs(names)
+	if err != nil {
+		return err
+	}
+	if !b.Enabled || b.PeersFromResources {
+		return nil
+	}
+	known := map[string]bool{}
+	for _, p := range b.Peers {
+		if n, err := ParsePeerAddrs([]string{p.Address}); err == nil {
+			known[n[0]] = true
+		}
+	}
+	for _, n := range norm {
+		if !known[n] {
+			return fmt.Errorf("%s is not one of the configured BGP peers", n)
+		}
+	}
+	return nil
+}
+
+func (c Config) checkBGPPeers(names []string) error { return c.BGP.checkPeerNames(names) }
 
 // XDPMode is how the XDP ingress program attaches to the interface.
 //
@@ -380,12 +607,19 @@ type Config struct {
 	Interface string `yaml:"interface"`
 	// XDPMode defaults to generic, the only mode that works on every interface
 	// (native XDP_TX on veth, for one, does not reliably cross a bridge).
-	XDPMode     XDPMode     `yaml:"xdpMode,omitempty"`
-	APIListen   string      `yaml:"apiListen"`
-	HealthCheck HealthCheck `yaml:"healthCheck"`
-	RateLimit   RateLimit   `yaml:"rateLimit"`
-	BGP         BGP         `yaml:"bgp"`
-	VIPs        []VIP       `yaml:"vips"`
+	XDPMode XDPMode `yaml:"xdpMode,omitempty"`
+	// TunnelSource and TunnelSource6 are the source addresses of the outer header for the
+	// dsr-ipip / dsr-gre modes, IPv4 and IPv6 respectively. Unset, each defaults to the
+	// attached interface's own address of that family. It should be an address the backends can
+	// route back to (they do not reply through the tunnel, so it only needs to be a plausible
+	// source, and must not be filtered by their reverse-path checks).
+	TunnelSource  string      `yaml:"tunnelSource,omitempty"`
+	TunnelSource6 string      `yaml:"tunnelSource6,omitempty"`
+	APIListen     string      `yaml:"apiListen"`
+	HealthCheck   HealthCheck `yaml:"healthCheck"`
+	RateLimit     RateLimit   `yaml:"rateLimit"`
+	BGP           BGP         `yaml:"bgp"`
+	VIPs          []VIP       `yaml:"vips"`
 }
 
 // HasNATVIP reports whether any of vips forwards in full-NAT mode. rivorad
@@ -394,6 +628,16 @@ type Config struct {
 func HasNATVIP(vips []VIP) bool {
 	for _, v := range vips {
 		if v.Mode == ModeNAT {
+			return true
+		}
+	}
+	return false
+}
+
+// HasTunnelVIP reports whether any of vips uses a tunnel mode (dsr-ipip / dsr-gre).
+func HasTunnelVIP(vips []VIP) bool {
+	for _, v := range vips {
+		if v.Mode.IsTunnel() {
 			return true
 		}
 	}
@@ -412,6 +656,9 @@ func RestartRequired(running, next Config) []string {
 	}
 	if running.XDPMode.Effective() != next.XDPMode.Effective() {
 		changed = append(changed, "xdpMode")
+	}
+	if running.TunnelSource != next.TunnelSource || running.TunnelSource6 != next.TunnelSource6 {
+		changed = append(changed, "tunnelSource")
 	}
 	if running.APIListen != next.APIListen {
 		changed = append(changed, "apiListen")
@@ -535,6 +782,9 @@ func (c Config) Validate() error {
 	if err := c.BGP.Validate(); err != nil {
 		return err
 	}
+	if err := c.validateTunnelSources(); err != nil {
+		return err
+	}
 	if len(c.VIPs) == 0 {
 		return fmt.Errorf("at least one VIP is required")
 	}
@@ -560,8 +810,8 @@ func (c Config) Validate() error {
 		if v.Protocol != ProtoTCP && v.Protocol != ProtoUDP {
 			return fmt.Errorf("vip %s:%d: protocol must be tcp or udp", v.Address, v.Port)
 		}
-		if v.Mode != ModeDSR && v.Mode != ModeNAT {
-			return fmt.Errorf("vip %s:%d: mode must be dsr or nat", v.Address, v.Port)
+		if !v.Mode.Valid() {
+			return fmt.Errorf("vip %s:%d: mode must be dsr, nat, dsr-ipip or dsr-gre", v.Address, v.Port)
 		}
 		if len(v.Backends) == 0 {
 			return fmt.Errorf("vip %s:%d: at least one backend is required", v.Address, v.Port)
@@ -588,6 +838,12 @@ func (c Config) Validate() error {
 		if err := v.RateLimit.Validate(); err != nil {
 			return fmt.Errorf("vip %s:%d: %w", v.Address, v.Port, err)
 		}
+		if _, err := ParseCommunities(v.BGPCommunities); err != nil {
+			return fmt.Errorf("vip %s:%d: bgpCommunities: %w", v.Address, v.Port, err)
+		}
+		if err := c.checkBGPPeers(v.BGPPeers); err != nil {
+			return fmt.Errorf("vip %s:%d: bgpPeers: %w", v.Address, v.Port, err)
+		}
 		vipIsV4 := vipIP.To4() != nil
 		for _, b := range v.Backends {
 			beIP := net.ParseIP(b.Address)
@@ -601,6 +857,9 @@ func (c Config) Validate() error {
 			// family; see internal/dataplane's UpsertVIP).
 			if (beIP.To4() != nil) != vipIsV4 {
 				return fmt.Errorf("vip %s:%d: backend %s is a different address family than the VIP", v.Address, v.Port, b.Address)
+			}
+			if v.Mode.IsTunnel() && b.MAC != "" {
+				return fmt.Errorf("backend %s: mac only applies to mode dsr; a %s backend is reached by its address", b.Address, v.Mode)
 			}
 			if v.Mode == ModeDSR {
 				if b.MAC == "" {
@@ -700,4 +959,46 @@ func (c Config) checkRanges() error {
 		byAddr[k] = append(byAddr[k], span{v.Port, v.PortEnd, name})
 	}
 	return nil
+}
+
+// validateTunnelSources checks tunnelSource is an IPv4 address and tunnelSource6 an IPv6 one.
+func (c Config) validateTunnelSources() error {
+	if c.TunnelSource != "" {
+		if ip := net.ParseIP(c.TunnelSource); ip == nil || ip.To4() == nil {
+			return fmt.Errorf("tunnelSource %q: must be an IPv4 address", c.TunnelSource)
+		}
+	}
+	if c.TunnelSource6 != "" {
+		if ip := net.ParseIP(c.TunnelSource6); ip == nil || ip.To4() != nil {
+			return fmt.Errorf("tunnelSource6 %q: must be an IPv6 address", c.TunnelSource6)
+		}
+	}
+	return nil
+}
+
+// LoadBGP reads a YAML file whose top-level bgp: section is a BGP block (the same schema as the
+// static config's) and returns it enabled and validated. It exists so a Kubernetes deployment can
+// mount BGP settings, including peer passwords, from a Secret instead of putting them on a command
+// line.
+func LoadBGP(path string) (BGP, error) { return LoadBGPWith(path, false) }
+
+// LoadBGPWith is LoadBGP, where peersFromResources says peers will also arrive at run time, so the
+// file may list none.
+func LoadBGPWith(path string, peersFromResources bool) (BGP, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return BGP{}, fmt.Errorf("read bgp config: %w", err)
+	}
+	var doc struct {
+		BGP BGP `yaml:"bgp"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return BGP{}, fmt.Errorf("parse bgp config: %w", err)
+	}
+	doc.BGP.Enabled = true
+	doc.BGP.PeersFromResources = peersFromResources
+	if err := doc.BGP.Validate(); err != nil {
+		return BGP{}, err
+	}
+	return doc.BGP, nil
 }
