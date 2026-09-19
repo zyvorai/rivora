@@ -11,7 +11,6 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -34,6 +33,7 @@ import (
 	"github.com/zyvorai/rivora/internal/healthcheck"
 	"github.com/zyvorai/rivora/internal/k8s"
 	"github.com/zyvorai/rivora/internal/loader"
+	"github.com/zyvorai/rivora/internal/logging"
 	"github.com/zyvorai/rivora/internal/speaker"
 	"github.com/zyvorai/rivora/internal/tlsutil"
 )
@@ -45,6 +45,8 @@ func main() {
 		configPath = flag.String("config", "/etc/rivora/config.yaml", "path to VIP/backend config (static-YAML mode; ignored with -kubernetes)")
 		bpfDir     = flag.String("bpf-dir", "/usr/local/share/rivora/bpf", "directory containing xdp_ingress.o and tc_nat.o")
 		showVer    = flag.Bool("version", false, "print version and exit")
+		logLevel   = flag.String("log-level", "info", "log level: debug, info, warn or error")
+		logFormat  = flag.String("log-format", "text", "log format: text or json")
 
 		kubeMode      = flag.Bool("kubernetes", false, "run the Kubernetes reconciler + ARP speaker instead of loading -config; VIPs come from Service/EndpointSlice")
 		kubeconfig    = flag.String("kubeconfig", "", "path to a kubeconfig file (default: in-cluster config, falling back to $KUBECONFIG / ~/.kube/config); only used with -kubernetes")
@@ -80,7 +82,11 @@ func main() {
 		return
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	logger, err := logging.New(os.Stdout, *logLevel, *logFormat)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "rivorad:", err)
+		os.Exit(2)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -374,13 +380,6 @@ func main() {
 	}
 }
 
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
 const (
 	// readHeaderTimeout bounds how long a client may take to send request
 	// headers, closing the slowloris hole on the API and metrics listeners.
@@ -388,6 +387,13 @@ const (
 	// shutdownTimeout bounds the graceful drain of the API server on SIGTERM.
 	shutdownTimeout = 5 * time.Second
 )
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
 
 func bpfDirPath(dir, prog string) string {
 	name := "xdp_ingress.o"

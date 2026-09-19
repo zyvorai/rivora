@@ -18,6 +18,7 @@ package dataplane
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"runtime"
@@ -33,14 +34,33 @@ import (
 	"github.com/zyvorai/rivora/internal/maglev"
 )
 
+// Errors returned by the operator-facing admin calls (SetBackendAdminDraining,
+// SetBackendWeight) so the API layer can map them to 404 vs 500.
+var (
+	ErrBackendNotFound = errors.New("backend not found")
+	ErrVIPNotFound     = errors.New("vip not found")
+	ErrInvalidWeight   = errors.New("invalid weight")
+)
+
+// MaxBackendWeight bounds an operator-supplied weight. BuildTable creates one
+// virtual entry per unit of weight, so an unbounded value would let a single
+// API call make a Maglev rebuild arbitrarily expensive.
+const MaxBackendWeight = 1000
+
 type BackendStatus struct {
 	ID      uint32 `json:"id"`
 	Address string `json:"address"`
 	Port    uint16 `json:"port"`
 	Weight  uint32 `json:"weight"`
-	Healthy bool   `json:"healthy"`
-	Packets uint64 `json:"packets"`
-	Bytes   uint64 `json:"bytes"`
+	// Healthy is true only for "healthy": a draining or down backend is not
+	// taking new flows. State distinguishes the two ("healthy", "draining",
+	// "down"), and AdminDraining is set when an operator (rivoractl drain)
+	// rather than a Kubernetes EndpointSlice asked for the drain.
+	Healthy       bool   `json:"healthy"`
+	State         string `json:"state"`
+	AdminDraining bool   `json:"adminDraining,omitempty"`
+	Packets       uint64 `json:"packets"`
+	Bytes         uint64 `json:"bytes"`
 }
 
 type Status struct {
@@ -61,10 +81,17 @@ type Status struct {
 
 // serviceEntry is a node's live state for one VIP.
 type serviceEntry struct {
-	serviceID  uint32
-	vip        config.VIP
-	backendIDs map[string]uint32 // "addr:port" -> backend_id, this VIP's current backend set
-	extent     extent            // this VIP's slice of the shared maglev_table
+	serviceID uint32
+	// vipSpec is the VIP exactly as the last UpsertVIP caller (config or a
+	// Kubernetes reconciler) supplied it; vip is what is actually programmed,
+	// i.e. vipSpec with weightOverrides applied. Keeping both lets an operator
+	// override survive reconciler re-syncs and lets a reset restore the
+	// caller's original weight.
+	vipSpec         config.VIP
+	vip             config.VIP
+	weightOverrides map[string]uint32 // "addr:port" -> operator-set weight
+	backendIDs      map[string]uint32 // "addr:port" -> backend_id, this VIP's current backend set
+	extent          extent            // this VIP's slice of the shared maglev_table
 }
 
 // backendState is a node's live state for one backend, shared across every
@@ -75,7 +102,11 @@ type backendState struct {
 	isV4         bool // which of backend_map/backend_map6 this ID lives in (v0.3)
 	probeHealthy bool // from internal/healthcheck's active TCP probes
 	draining     bool // from a Kubernetes reconciler's EndpointSlice terminating state (v0.2+)
-	refCount     int
+	// adminDraining is an operator's drain (rivoractl drain). Tracked apart
+	// from draining so a reconciler clearing its own terminating state can't
+	// silently undo an operator's drain, and vice versa.
+	adminDraining bool
+	refCount      int
 }
 
 type Dataplane struct {
@@ -192,8 +223,11 @@ func (d *Dataplane) applyRateLimit() error {
 func (d *Dataplane) UpsertVIP(vip config.VIP) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	return d.upsertVIPLocked(vip)
+}
 
-	key := vipKeyString(vip)
+func (d *Dataplane) upsertVIPLocked(spec config.VIP) error {
+	key := vipKeyString(spec)
 	entry, existed := d.services[key]
 	if !existed {
 		id, err := d.serviceAlloc.Alloc(key)
@@ -204,6 +238,7 @@ func (d *Dataplane) UpsertVIP(vip config.VIP) error {
 		d.services[key] = entry
 	}
 
+	vip := entry.applyWeightOverrides(spec)
 	desired := make(map[string]config.Backend, len(vip.Backends))
 	for _, b := range vip.Backends {
 		desired[backendName(b)] = b
@@ -269,8 +304,37 @@ func (d *Dataplane) UpsertVIP(vip config.VIP) error {
 		return fmt.Errorf("vip %s: %w", key, err)
 	}
 
+	entry.vipSpec = spec
 	entry.vip = vip
 	return nil
+}
+
+// applyWeightOverrides returns spec with each operator-overridden backend's
+// weight replaced. Overrides for backends spec no longer contains are dropped,
+// so a backend that leaves and later rejoins starts from its configured
+// weight rather than a stale override. spec's own Backends slice is never
+// mutated (it belongs to the caller).
+func (e *serviceEntry) applyWeightOverrides(spec config.VIP) config.VIP {
+	if len(e.weightOverrides) == 0 {
+		return spec
+	}
+	present := make(map[string]bool, len(spec.Backends))
+	out := spec
+	out.Backends = make([]config.Backend, len(spec.Backends))
+	for i, b := range spec.Backends {
+		name := backendName(b)
+		present[name] = true
+		if w, ok := e.weightOverrides[name]; ok {
+			b.Weight = w
+		}
+		out.Backends[i] = b
+	}
+	for name := range e.weightOverrides {
+		if !present[name] {
+			delete(e.weightOverrides, name)
+		}
+	}
+	return out
 }
 
 // rebuildMaglevLocked rebuilds entry's slice of maglev_table for its
@@ -425,7 +489,7 @@ func (d *Dataplane) writeHealthLocked(id uint32) error {
 	switch {
 	case !st.probeHealthy:
 		v = bpfmaps.HealthDown
-	case st.draining:
+	case st.draining || st.adminDraining:
 		v = bpfmaps.HealthDraining
 	}
 	return d.dp.Maps[bpfmaps.MapBackendHealth].Update(&id, &v, ebpf.UpdateAny)
@@ -517,6 +581,78 @@ func (d *Dataplane) SetBackendDrainingByKey(vipKey, backendKey string, draining 
 	return d.writeHealthLocked(id)
 }
 
+// SetBackendAdminDraining is the operator's drain (rivoractl drain/undrain):
+// backendID stops receiving *new* flows while established ones keep flowing,
+// exactly like a Kubernetes-driven drain but tracked independently of it (see
+// backendState.adminDraining). A failed active probe still wins over draining.
+// Returns ErrBackendNotFound if no VIP currently references backendID.
+func (d *Dataplane) SetBackendAdminDraining(backendID uint32, draining bool) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	st := d.backendStates[backendID]
+	if st == nil {
+		return fmt.Errorf("backend %d: %w", backendID, ErrBackendNotFound)
+	}
+	st.adminDraining = draining
+	return d.writeHealthLocked(backendID)
+}
+
+// SetBackendWeight overrides backendID's Maglev weight and rebuilds the
+// affected VIP tables, returning how many VIPs were changed. vipKey scopes the
+// change to one VIP ("addr:port:proto", as VIPKey builds it); empty applies it
+// to every VIP that references the backend. weight 0 clears the override so the
+// configured (or reconciler-supplied) weight applies again. The override
+// survives UpsertVIP re-syncs until cleared or the backend leaves the VIP.
+func (d *Dataplane) SetBackendWeight(backendID uint32, vipKey string, weight uint32) (int, error) {
+	if weight > MaxBackendWeight {
+		return 0, fmt.Errorf("weight %d exceeds maximum %d: %w", weight, MaxBackendWeight, ErrInvalidWeight)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if vipKey != "" {
+		if _, ok := d.services[vipKey]; !ok {
+			return 0, fmt.Errorf("vip %q: %w", vipKey, ErrVIPNotFound)
+		}
+	}
+
+	// Collect targets first so a mid-loop rebuild error can't leave us
+	// iterating a map we're mutating.
+	type target struct {
+		entry *serviceEntry
+		name  string
+	}
+	var targets []target
+	for key, entry := range d.services {
+		if vipKey != "" && key != vipKey {
+			continue
+		}
+		for name, id := range entry.backendIDs {
+			if id == backendID {
+				targets = append(targets, target{entry, name})
+			}
+		}
+	}
+	if len(targets) == 0 {
+		return 0, fmt.Errorf("backend %d: %w", backendID, ErrBackendNotFound)
+	}
+
+	for _, t := range targets {
+		if weight == 0 {
+			delete(t.entry.weightOverrides, t.name)
+		} else {
+			if t.entry.weightOverrides == nil {
+				t.entry.weightOverrides = map[string]uint32{}
+			}
+			t.entry.weightOverrides[t.name] = weight
+		}
+		if err := d.upsertVIPLocked(t.entry.vipSpec); err != nil {
+			return 0, err
+		}
+	}
+	return len(targets), nil
+}
+
 // Targets returns every backend across every VIP this node owns, deduped
 // by ID (a backend shared by two VIPs is probed once, not twice) — the
 // health checker's target set.
@@ -575,9 +711,13 @@ func (d *Dataplane) Statuses() ([]Status, error) {
 		for name, id := range entry.backendIDs {
 			var healthy uint8
 			_ = healthMap.Lookup(&id, &healthy)
-			bs := BackendStatus{ID: id, Weight: weightByName[name], Healthy: healthy == bpfmaps.HealthHealthy}
+			bs := BackendStatus{
+				ID: id, Weight: weightByName[name],
+				Healthy: healthy == bpfmaps.HealthHealthy, State: healthStateName(healthy),
+			}
 			if bst := d.backendStates[id]; bst != nil {
 				bs.Address, bs.Port = bst.address, bst.port
+				bs.AdminDraining = bst.adminDraining
 			}
 			if s, err := sumStats(statsMap, 1+id); err == nil {
 				bs.Packets, bs.Bytes = s.Packets, s.Bytes
@@ -615,6 +755,20 @@ func (d *Dataplane) Status() (Status, error) {
 		return all[0], nil
 	default:
 		return Status{}, fmt.Errorf("%d VIPs configured; use the vips list (rivoractl vips / /api/v1/vips) instead of status", len(all))
+	}
+}
+
+// healthStateName maps a backend_health_map value to the label the API and
+// CLI show. Anything unrecognised reads as "down" — the safe interpretation,
+// since the dataplane only routes new flows to HealthHealthy.
+func healthStateName(v uint8) string {
+	switch v {
+	case bpfmaps.HealthHealthy:
+		return "healthy"
+	case bpfmaps.HealthDraining:
+		return "draining"
+	default:
+		return "down"
 	}
 }
 
@@ -720,3 +874,58 @@ func ip6To16(ip net.IP) [16]byte {
 // once serialized little-endian by cilium/ebpf, reproduces the port's
 // network-order bytes — matching what tcphdr/udphdr's source/dest hold.
 func htons(port uint16) uint16 { return (port << 8) | (port >> 8) }
+
+// MapUsage is one BPF table's live occupancy, for the conntrack gauges.
+type MapUsage struct {
+	Table    string `json:"table"`
+	Entries  uint64 `json:"entries"`
+	Capacity uint64 `json:"capacity"`
+}
+
+// conntrackTables are the LRU flow tables whose fill level matters: both are
+// fixed-size, and once full the kernel evicts live flows — for
+// connection_affinity_map that means a flow can silently be re-hashed onto a
+// different backend. IPv6 siblings are reported separately.
+var conntrackTables = []struct{ label, mapName string }{
+	{"affinity", bpfmaps.MapConnectionAffinity},
+	{"affinity6", bpfmaps.MapConnectionAffinity6},
+	{"nat_reverse", bpfmaps.MapNATReverse},
+	{"nat_reverse6", bpfmaps.MapNATReverse6},
+}
+
+// ConntrackUsage counts entries in each flow table. It walks the keys (one
+// syscall each), so it is O(entries) — callers on a scrape path should cache
+// the result rather than call it per request. It deliberately doesn't take
+// d.mu: the map handles are fixed after load and the kernel serialises map
+// access, so a slow walk must not stall reconciles or health updates.
+// Tables missing from the loaded object (e.g. no NAT object) are skipped.
+func (d *Dataplane) ConntrackUsage() []MapUsage {
+	out := make([]MapUsage, 0, len(conntrackTables))
+	for _, t := range conntrackTables {
+		m := d.dp.Maps[t.mapName]
+		if m == nil {
+			continue
+		}
+		n, ok := countKeys(m)
+		if !ok {
+			continue
+		}
+		out = append(out, MapUsage{Table: t.label, Entries: n, Capacity: uint64(m.MaxEntries())})
+	}
+	return out
+}
+
+// countKeys walks m's keys with NextKeyBytes. On an LRU map under churn a key
+// can vanish between calls, which makes the kernel restart the walk from the
+// first key; bounding the loop at 2x capacity turns that (rare) livelock into
+// a best-effort answer instead of a hung scrape. ok is false only on a real
+// error, in which case the table is left out rather than reported as empty.
+func countKeys(m *ebpf.Map) (n uint64, ok bool) {
+	limit := uint64(m.MaxEntries()) * 2
+	key, err := m.NextKeyBytes(nil) // nil key -> first key; nil result -> done
+	for err == nil && key != nil && n < limit {
+		n++
+		key, err = m.NextKeyBytes(key)
+	}
+	return n, err == nil
+}

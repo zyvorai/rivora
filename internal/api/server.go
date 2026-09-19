@@ -13,7 +13,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"mime"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -26,8 +28,17 @@ import (
 
 var errUnauthorized = errors.New("unauthorized")
 
+// Admin is the operator-facing mutation surface (drain/undrain/weight),
+// narrowed to an interface so the handlers can be tested without loading BPF
+// maps. *dataplane.Dataplane implements it.
+type Admin interface {
+	SetBackendAdminDraining(backendID uint32, draining bool) error
+	SetBackendWeight(backendID uint32, vipKey string, weight uint32) (int, error)
+}
+
 type Server struct {
 	dp       *dataplane.Dataplane
+	admin    Admin
 	apiKey   string
 	registry *prometheus.Registry
 }
@@ -41,7 +52,7 @@ func New(dp *dataplane.Dataplane, apiKey string) *Server {
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		metrics.NewDataplaneCollector(dp),
 	)
-	return &Server{dp: dp, apiKey: apiKey, registry: reg}
+	return &Server{dp: dp, admin: dp, apiKey: apiKey, registry: reg}
 }
 
 // MetricsHandler serves only /healthz, /readyz and /metrics — no console,
@@ -69,6 +80,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/status", s.handleStatus)
 	mux.HandleFunc("GET /api/v1/vips", s.handleVIPs)
 	mux.HandleFunc("GET /api/v1/backends", s.handleBackends)
+	mux.HandleFunc("POST /api/v1/backends/{id}/drain", s.handleBackendDrain(true))
+	mux.HandleFunc("POST /api/v1/backends/{id}/undrain", s.handleBackendDrain(false))
+	mux.HandleFunc("POST /api/v1/backends/{id}/weight", s.handleBackendWeight)
 	// /healthz, /readyz and /metrics are deliberately outside /api/* so they
 	// stay reachable without a bearer token — same routes MetricsHandler
 	// serves standalone, kept here too so a local kubelet/rivoractl caller
@@ -158,6 +172,84 @@ func (s *Server) handleBackends(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, st.Backends)
+}
+
+// maxAdminBody bounds a mutation request body; the payloads are a few dozen
+// bytes, so anything larger is a mistake or abuse.
+const maxAdminBody = 4 << 10
+
+// adminRequest validates the parts common to every mutation: an operator
+// asked for it with a JSON content type, and the {id} path value is a valid
+// backend id. Requiring application/json is a CSRF guard for the
+// auth-disabled case — a cross-site <form> can only send simple content types,
+// and a cross-origin fetch with application/json triggers a CORS preflight
+// this server never approves — so a hostile web page can't drain backends
+// through an operator's browser.
+func adminRequest(w http.ResponseWriter, r *http.Request) (id uint32, ok bool) {
+	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
+		writeError(w, http.StatusUnsupportedMediaType, errors.New(`Content-Type must be application/json`))
+		return 0, false
+	}
+	n, err := strconv.ParseUint(r.PathValue("id"), 10, 32)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("backend id must be a non-negative integer"))
+		return 0, false
+	}
+	return uint32(n), true
+}
+
+// adminStatus maps an admin-call error to an HTTP status: unknown backend or
+// VIP is the caller's 404, a rejected value their 400, anything else ours.
+func adminStatus(err error) int {
+	switch {
+	case errors.Is(err, dataplane.ErrBackendNotFound), errors.Is(err, dataplane.ErrVIPNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, dataplane.ErrInvalidWeight):
+		return http.StatusBadRequest
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+func (s *Server) handleBackendDrain(draining bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, ok := adminRequest(w, r)
+		if !ok {
+			return
+		}
+		if err := s.admin.SetBackendAdminDraining(id, draining); err != nil {
+			writeError(w, adminStatus(err), err)
+			return
+		}
+		writeJSON(w, map[string]any{"id": id, "draining": draining})
+	}
+}
+
+func (s *Server) handleBackendWeight(w http.ResponseWriter, r *http.Request) {
+	id, ok := adminRequest(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		Weight *uint32 `json:"weight"`
+		VIP    string  `json:"vip"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxAdminBody))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, errors.New(`body must be JSON like {"weight": 5} (weight 0 clears the override; optional "vip": "addr:port:proto")`))
+		return
+	}
+	if body.Weight == nil {
+		writeError(w, http.StatusBadRequest, errors.New(`"weight" is required (0 clears the override)`))
+		return
+	}
+	vips, err := s.admin.SetBackendWeight(id, body.VIP, *body.Weight)
+	if err != nil {
+		writeError(w, adminStatus(err), err)
+		return
+	}
+	writeJSON(w, map[string]any{"id": id, "weight": *body.Weight, "vips": vips})
 }
 
 // handleHealthz is a liveness probe: it only proves the HTTP server is up

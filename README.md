@@ -74,7 +74,11 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
   TCP health checks, and serves a local HTTP API on `127.0.0.1:9870`.
 - **`rivoractl`** (`cmd/rivoractl`) — CLI, talks to `rivorad` over that API.
   `rivoractl status`, `rivoractl vips`, `rivoractl backends` — add
-  `--format json` for machine-readable output.
+  `--format json` for machine-readable output. Live operations:
+  `rivoractl drain|undrain ID` and `rivoractl weight ID N` (see the
+  [runbook](website/docs/operations/runbook.md)); `rivoractl validate FILE`
+  checks a static config offline. `rivorad` and `rivora-controller` take
+  `-log-level` and `-log-format text|json`.
 - **`rivora-doctor`** (`cmd/rivora-doctor`) — standalone host-readiness
   checker: bpffs mounted, kernel new enough for TCX, build tools present.
   `--json`, `--strict`, exit 0/2 — same shape as netra's doctor tool.
