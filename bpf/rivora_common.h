@@ -31,6 +31,11 @@ static __s64 (*bpf_csum_diff)(__be32 *from, __u32 from_size, __be32 *to, __u32 t
 static long (*bpf_xdp_adjust_head)(struct xdp_md *ctx, int delta) = (void *)BPF_FUNC_xdp_adjust_head;
 static long (*bpf_fib_lookup)(void *ctx, struct bpf_fib_lookup *params, int plen, __u32 flags) = (void *)BPF_FUNC_fib_lookup;
 static long (*bpf_redirect)(__u32 ifindex, __u64 flags) = (void *)BPF_FUNC_redirect;
+static long (*bpf_xdp_adjust_tail)(struct xdp_md *ctx, int delta) = (void *)BPF_FUNC_xdp_adjust_tail;
+/* Copy between a packet and memory (kernel 5.18+); they work on any offset without the byte-wise copy
+ * loops, and register spills, that memcpy on an unaligned packet pointer costs the BPF stack. */
+static long (*bpf_xdp_load_bytes)(struct xdp_md *ctx, __u32 offset, void *buf, __u32 len) = (void *)BPF_FUNC_xdp_load_bytes;
+static long (*bpf_xdp_store_bytes)(struct xdp_md *ctx, __u32 offset, void *buf, __u32 len) = (void *)BPF_FUNC_xdp_store_bytes;
 static __u32 (*bpf_get_prandom_u32)(void) = (void *)BPF_FUNC_get_prandom_u32;
 
 #define IPPROTO_ICMP_ 1

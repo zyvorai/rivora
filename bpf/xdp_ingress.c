@@ -393,6 +393,139 @@ static __always_inline __u16 rivora_ip_csum(void *hdr, __u32 len)
     return (__u16)~sum;
 }
 
+/* Scratch space for building an ICMP reply. The frame's own stack is nearly used up by the tunnel code
+ * it is called from (the verifier caps a call chain at 512 bytes), so the message is staged here. */
+struct scratch {
+    __u8 b[128];
+};
+_Static_assert(sizeof(struct scratch) == 128, "scratch");
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct scratch);
+} scratch_map SEC(".maps");
+
+/* The tunnel adds 20-44 bytes, and XDP cannot fragment, so a packet that fits the client's path
+ * can be too big for the load balancer's path to the backend. bpf_fib_lookup says so
+ * (BPF_FIB_LKUP_RET_FRAG_NEEDED, with the egress MTU). Rather than drop it silently, answer the
+ * client the way a router would, with "fragmentation needed" (IPv4, when the packet had DF set, which
+ * TCP's does) or "packet too big" (IPv6), quoting the packet and advertising the MTU less the
+ * tunnel overhead: its path-MTU discovery then shrinks its segments, and the connection works.
+ *
+ * At this point the frame is [L2][outer header][inner packet]. The reply is built over it in place
+ * and the frame cut down to size, so it goes straight back out the interface it came in on. It is
+ * addressed from the VIP the client was talking to. `l2len` and `encap` are constants at every call
+ * site, for the reasons given at tunnel_v4. */
+/* Both builders lay the reply out in the per-CPU scratch buffer and copy it over the frame with two
+ * helper calls, so they need almost no BPF stack. sc->b[0..11] is the Ethernet header's two MACs,
+ * swapped; the IP header and ICMP message follow at [16..]. */
+static __attribute__((noinline)) int frag_needed_v4(struct xdp_md *ctx, const __u32 l2len, const __u32 encap, __u32 egress_mtu)
+{
+    __u32 zero = 0;
+    struct scratch *sc = bpf_map_lookup_elem(&scratch_map, &zero);
+    if (!sc)
+        return XDP_DROP;
+    __u8 *b = sc->b;
+    __u8 *ip = b + 16;         /* 20-byte IPv4 header */
+    __u8 *msg = b + 36;        /* ICMP: 8 header bytes, then the client's packet (IP header + 8 bytes) */
+
+    if (bpf_xdp_load_bytes(ctx, l2len + encap, msg + 8, 28))
+        return XDP_DROP;
+    if (bpf_xdp_load_bytes(ctx, 0, b, 12))
+        return XDP_DROP;
+    __u8 t[6];
+    __builtin_memcpy(t, b, 6);          /* dst MAC */
+    __builtin_memcpy(b, b + 6, 6);      /* becomes the old source */
+    __builtin_memcpy(b + 6, t, 6);      /* and the old destination becomes our source */
+
+    __u16 mtu = egress_mtu > encap + 68 ? (__u16)(egress_mtu - encap) : 68;
+    __builtin_memset(msg, 0, 8);
+    msg[0] = 3;  /* destination unreachable */
+    msg[1] = 4;  /* fragmentation needed and DF set */
+    msg[6] = mtu >> 8;
+    msg[7] = mtu & 0xff;
+    __u32 sum = (__u32)bpf_csum_diff(0, 0, (__be32 *)msg, 36, 0);
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    *(__u16 *)(msg + 2) = (__u16)~sum;
+
+    __builtin_memset(ip, 0, 20);
+    ip[0] = 0x45;
+    ip[2] = 0; ip[3] = 56;               /* total length: 20 + 36 */
+    __u16 id = (__u16)bpf_get_prandom_u32();
+    ip[4] = id >> 8; ip[5] = id & 0xff;
+    ip[8] = 64;                          /* TTL */
+    ip[9] = 1;                           /* ICMP */
+    __builtin_memcpy(ip + 12, msg + 8 + 16, 4);  /* from the VIP: the quoted packet's destination */
+    __builtin_memcpy(ip + 16, msg + 8 + 12, 4);  /* to the client: its source */
+    *(__u16 *)(ip + 10) = rivora_ip_csum(ip, 20);
+
+    if (bpf_xdp_store_bytes(ctx, 0, b, 12) || bpf_xdp_store_bytes(ctx, l2len, ip, 56))
+        return XDP_DROP;
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    if (bpf_xdp_adjust_tail(ctx, (int)(l2len + 56) - (int)(data_end - data)))
+        return XDP_DROP;
+    return XDP_TX;
+}
+
+static __attribute__((noinline)) int packet_too_big_v6(struct xdp_md *ctx, const __u32 l2len, const __u32 encap, __u32 egress_mtu)
+{
+    __u32 zero = 0;
+    struct scratch *sc = bpf_map_lookup_elem(&scratch_map, &zero);
+    if (!sc)
+        return XDP_DROP;
+    __u8 *b = sc->b;
+
+    /* b[0..11] swapped MACs. Then, staged so one csum_diff covers it: b[16..55] the pseudo-header
+     * (src, dst, length, next header), b[56..63] the ICMPv6 header, b[64..111] the client's packet
+     * (IPv6 header + 8 bytes). The IPv6 header itself is written from the pseudo-header's addresses. */
+    if (bpf_xdp_load_bytes(ctx, 0, b, 12))
+        return XDP_DROP;
+    __u8 t[6];
+    __builtin_memcpy(t, b, 6);
+    __builtin_memcpy(b, b + 6, 6);
+    __builtin_memcpy(b + 6, t, 6);
+
+    __u8 *ps = b + 16;
+    __u8 *msg = b + 56;
+    if (bpf_xdp_load_bytes(ctx, l2len + encap, msg + 8, 48))
+        return XDP_DROP;
+    __builtin_memcpy(ps, msg + 8 + 24, 16);        /* pseudo src = the quoted packet's destination (the VIP) */
+    __builtin_memcpy(ps + 16, msg + 8 + 8, 16);    /* pseudo dst = its source (the client) */
+    __builtin_memset(ps + 32, 0, 8);
+    ps[35] = 56;                                   /* upper-layer length */
+    ps[39] = 58;                                   /* next header: ICMPv6 */
+    __u32 mtu = egress_mtu > encap + 1280 ? egress_mtu - encap : 1280; /* IPv6 never goes below 1280 */
+    __builtin_memset(msg, 0, 8);
+    msg[0] = 2;                                    /* packet too big */
+    msg[4] = mtu >> 24; msg[5] = mtu >> 16; msg[6] = mtu >> 8; msg[7] = mtu;
+    __u32 sum = (__u32)bpf_csum_diff(0, 0, (__be32 *)ps, 96, 0);
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    *(__u16 *)(msg + 2) = (__u16)~sum;
+
+    /* The IPv6 header goes out in three pieces: its first 8 bytes, then the two addresses straight from
+     * the pseudo-header, then the ICMPv6 message. */
+    __u8 hdr[8];
+    __builtin_memset(hdr, 0, 8);
+    hdr[0] = 0x60;
+    hdr[4] = 0; hdr[5] = 56;                       /* payload length */
+    hdr[6] = 58;                                   /* next header */
+    hdr[7] = 64;                                   /* hop limit */
+    if (bpf_xdp_store_bytes(ctx, 0, b, 12))
+        return XDP_DROP;
+    if (bpf_xdp_store_bytes(ctx, l2len, hdr, 8) || bpf_xdp_store_bytes(ctx, l2len + 8, ps, 32) ||
+        bpf_xdp_store_bytes(ctx, l2len + 40, msg, 56))
+        return XDP_DROP;
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    if (bpf_xdp_adjust_tail(ctx, (int)(l2len + 96) - (int)(data_end - data)))
+        return XDP_DROP;
+    return XDP_TX;
+}
+
 static __always_inline int tunnel_v4_l2(struct xdp_md *ctx, struct ethhdr *eth, struct iphdr *iph,
                                         __u8 mode, __u32 be_addr, const __u32 l2len)
 {
@@ -413,6 +546,7 @@ static __always_inline int tunnel_v4_l2(struct xdp_md *ctx, struct ethhdr *eth, 
     __u8 gre = mode == RIVORA_MODE_TUNNEL_GRE;
     __u32 encap = gre ? 24 : 20;
     __u8 tos = iph->tos;
+    __u8 df = (iph->frag_off & __constant_htons(0x4000)) != 0;
     __u16 inner_len = __builtin_bswap16(iph->tot_len);
     __u8 l2buf[22];
     __builtin_memcpy(l2buf, eth, 22);
@@ -462,7 +596,10 @@ static __always_inline int tunnel_v4_l2(struct xdp_md *ctx, struct ethhdr *eth, 
     fib.ifindex = ctx->ingress_ifindex;
     fib.ipv4_src = src4;
     fib.ipv4_dst = be_addr;
-    if (bpf_fib_lookup(ctx, &fib, sizeof(fib), 0) != BPF_FIB_LKUP_RET_SUCCESS)
+    long rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), 0);
+    if (rc == BPF_FIB_LKUP_RET_FRAG_NEEDED && df)
+        return gre ? frag_needed_v4(ctx, l2len, 24, fib.mtu_result) : frag_needed_v4(ctx, l2len, 20, fib.mtu_result);
+    if (rc != BPF_FIB_LKUP_RET_SUCCESS)
         return XDP_PASS;
     __builtin_memcpy(e2->h_dest, fib.dmac, 6);
     __builtin_memcpy(e2->h_source, fib.smac, 6);
@@ -542,7 +679,10 @@ static __always_inline int tunnel_v6_l2(struct xdp_md *ctx, struct ethhdr *eth, 
     fib.ifindex = ctx->ingress_ifindex;
     __builtin_memcpy(fib.ipv6_src, src6, 16);
     __builtin_memcpy(fib.ipv6_dst, be_addr, 16);
-    if (bpf_fib_lookup(ctx, &fib, sizeof(fib), 0) != BPF_FIB_LKUP_RET_SUCCESS)
+    long rc = bpf_fib_lookup(ctx, &fib, sizeof(fib), 0);
+    if (rc == BPF_FIB_LKUP_RET_FRAG_NEEDED)
+        return gre ? packet_too_big_v6(ctx, l2len, 44, fib.mtu_result) : packet_too_big_v6(ctx, l2len, 40, fib.mtu_result);
+    if (rc != BPF_FIB_LKUP_RET_SUCCESS)
         return XDP_PASS;
     __builtin_memcpy(e2->h_dest, fib.dmac, 6);
     __builtin_memcpy(e2->h_source, fib.smac, 6);

@@ -259,10 +259,16 @@ vips:
 - **On each backend** you need a tunnel endpoint that accepts packets to its own address from any
   remote (`ip tunnel add tun0 mode ipip local <backend-ip>`; `mode gre`; `ip -6 tunnel add ... mode
   ip6ip6` or `ip6gre`), the VIP on `lo`, and reverse-path filtering off on the tunnel device.
-- **MTU is on you.** The tunnelled packet is 20 bytes larger (24 with GRE, 40/44 for IPv6) and XDP
-  cannot fragment it, so the path from the load balancer to the backends must carry the client's
-  packets plus that overhead, or full-size segments are dropped. Raise the MTU on that path (or clamp
-  the TCP MSS).
+- **MTU.** The tunnelled packet is 20 bytes larger (24 with GRE, 40/44 for IPv6) and XDP cannot
+  fragment it. When a packet fits the client's path but not the load balancer's path to the backend,
+  the load balancer answers the client as a router would: "fragmentation needed" for an IPv4 packet
+  with DF set (which TCP's is), "packet too big" for IPv6, advertising the link's MTU less the tunnel
+  overhead, from the VIP. The client's path-MTU discovery then shrinks its segments and the connection
+  works (`selftest-l3dsr.sh` checks a 20000-byte transfer over a 1400-byte link, and the MTU the client
+  learns). Two cases are not covered: an IPv4 packet **without** DF (nothing can carry it, and it takes
+  the kernel-fallback path below), and a path where the smaller link is beyond the first hop (the
+  router there sends its own ICMP to the tunnel source, not to the client). Where you can, give the
+  path to the backends a larger MTU.
 - **How it is forwarded.** After encapsulation the outer header is routed with `bpf_fib_lookup`, and
   the frame goes straight out of the egress interface, so the load balancer needs a route to the
   backend and IP forwarding enabled. If the lookup cannot answer (next-hop neighbour not resolved

@@ -325,6 +325,9 @@ jobs:
     - name: Edge-case selftest (VLAN/QinQ, IP options, fragments, ICMP path-MTU)
       if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-edgecases.sh
+    - name: IPv6 affinity and drop-counter selftest
+      if: ${{ !cancelled() }}
+      run: sudo bash scripts/selftest-ipv6-policy.sh
     - name: L3 DSR selftest (IP-in-IP and GRE, IPv4 + IPv6, routed backend)
       if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-l3dsr.sh
