@@ -148,6 +148,11 @@ type Dataplane struct {
 	backendAlloc  *idAllocator
 	maglevAlloc   *extentAllocator
 
+	// tunnelSrc4/6 are the outer-header sources of the dsr-ipip / dsr-gre modes, resolved at Apply
+	// (configured, else the attached interface's own address). nil means none was found.
+	tunnelSrc4 net.IP
+	tunnelSrc6 net.IP
+
 	startup StartupSummary
 }
 
@@ -180,6 +185,9 @@ func (d *Dataplane) Apply(iface *net.Interface) error {
 	}
 
 	if err := d.applyRateLimit(); err != nil {
+		return err
+	}
+	if err := d.applyTunnelConfig(iface); err != nil {
 		return err
 	}
 
@@ -260,6 +268,82 @@ func (d *Dataplane) applyRateLimit() error {
 	return nil
 }
 
+// applyTunnelConfig resolves the outer-header source of the tunnel modes for each family
+// (configured, else the attached interface's own address) and writes tunnel_config_map. Finding
+// none is not an error here: only a tunnel VIP needs one, and upsertVIPLocked says so then.
+func (d *Dataplane) applyTunnelConfig(iface *net.Interface) error {
+	var src4, src6 net.IP
+	if d.cfg.TunnelSource != "" {
+		src4 = net.ParseIP(d.cfg.TunnelSource).To4()
+	}
+	if d.cfg.TunnelSource6 != "" {
+		src6 = net.ParseIP(d.cfg.TunnelSource6)
+	}
+	if iface != nil && (src4 == nil || src6 == nil) {
+		addrs, _ := iface.Addrs()
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			if v4 := ipn.IP.To4(); v4 != nil {
+				if src4 == nil {
+					src4 = v4
+				}
+			} else if src6 == nil && ipn.IP.IsGlobalUnicast() {
+				src6 = ipn.IP
+			}
+		}
+	}
+	d.mu.Lock()
+	d.tunnelSrc4, d.tunnelSrc6 = src4, src6
+	d.mu.Unlock()
+
+	m := d.dp.Maps[bpfmaps.MapTunnelConfig]
+	if m == nil {
+		return nil // an object built before tunnel modes existed; a tunnel VIP fails in upsertVIPLocked
+	}
+	var tc bpfmaps.TunnelConfig
+	if src4 != nil {
+		tc.Src4 = ip4ToBE32(src4)
+	}
+	if src6 != nil {
+		tc.Src6 = ip6To16(src6)
+	}
+	var zero uint32
+	if err := m.Update(&zero, &tc, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("update tunnel_config_map: %w", err)
+	}
+	return nil
+}
+
+// TunnelSources returns the outer-header source addresses in use for the tunnel modes
+// (IPv4, IPv6); nil means none was configured or found.
+func (d *Dataplane) TunnelSources() (v4, v6 net.IP) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.tunnelSrc4, d.tunnelSrc6
+}
+
+// checkTunnelReady says why a tunnel-mode VIP cannot be programmed, or nil.
+func (d *Dataplane) checkTunnelReady(vip config.VIP) error {
+	if !vip.Mode.IsTunnel() {
+		return nil
+	}
+	if d.dp.Maps[bpfmaps.MapTunnelConfig] == nil {
+		return fmt.Errorf("mode %s: this datapath object has no tunnel support; rebuild the BPF objects", vip.Mode)
+	}
+	ip := net.ParseIP(vip.Address)
+	if ip != nil && ip.To4() != nil {
+		if d.tunnelSrc4 == nil {
+			return fmt.Errorf("mode %s: no IPv4 tunnel source: set tunnelSource, or give %s an IPv4 address", vip.Mode, d.cfg.Interface)
+		}
+	} else if d.tunnelSrc6 == nil {
+		return fmt.Errorf("mode %s: no IPv6 tunnel source: set tunnelSource6, or give %s a global IPv6 address", vip.Mode, d.cfg.Interface)
+	}
+	return nil
+}
+
 // scaleRateLimit turns a configured per-source rate and burst into what the BPF
 // program enforces. Each CPU keeps its own bucket, so both are divided by the CPU
 // count (see applyRateLimit), with a floor of 1 so a small limit still admits
@@ -315,6 +399,9 @@ func (d *Dataplane) UpsertVIP(vip config.VIP) error {
 
 func (d *Dataplane) upsertVIPLocked(spec config.VIP) error {
 	key := vipKeyString(spec)
+	if err := d.checkTunnelReady(spec); err != nil {
+		return fmt.Errorf("vip %s: %w", key, err)
+	}
 	entry, existed := d.services[key]
 	if !existed {
 		id, err := d.serviceAlloc.Alloc(key)
@@ -379,8 +466,13 @@ func (d *Dataplane) upsertVIPLocked(spec config.VIP) error {
 	}
 
 	mode := uint8(bpfmaps.ModeDSR)
-	if vip.Mode == config.ModeNAT {
+	switch vip.Mode {
+	case config.ModeNAT:
 		mode = bpfmaps.ModeNAT
+	case config.ModeDSRIPIP:
+		mode = bpfmaps.ModeTunnelIPIP
+	case config.ModeDSRGRE:
+		mode = bpfmaps.ModeTunnelGRE
 	}
 	sc := bpfmaps.ServiceConfig{
 		BackendCount: uint32(len(entry.backendIDs)),

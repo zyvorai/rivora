@@ -73,6 +73,7 @@ cleanup() {
     echo quit > "${WORK}/cmd-$((CMDN + 1))" 2>/dev/null
     [ -n "$INNER_PID" ] && kill "$INNER_PID" 2>/dev/null
     for p in "${BE_PIDS[@]:-}"; do [ -n "$p" ] && ip netns exec "$NS_BE" kill "$p" 2>/dev/null; done
+    for ns in "$NS_LB" "$NS_CLIENT" "$NS_BE"; do ip netns pids "$ns" 2>/dev/null | xargs -r kill 2>/dev/null; done
     for ns in "$NS_LB" "$NS_CLIENT" "$NS_BE"; do ip netns del "$ns" 2>/dev/null; done
     ip link del "$BR" 2>/dev/null
     rm -rf "$WORK"

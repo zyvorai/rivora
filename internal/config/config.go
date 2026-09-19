@@ -20,9 +20,24 @@ import (
 type Mode string
 
 const (
+	// ModeDSR rewrites the frame's MAC and sends it straight back out: the backend must be on
+	// the load balancer's own L2 segment and own the VIP locally.
 	ModeDSR Mode = "dsr"
 	ModeNAT Mode = "nat"
+	// ModeDSRIPIP and ModeDSRGRE are "L3 DSR": the packet is tunnelled to the backend
+	// (IP-in-IP, or GRE) and the backend, which owns the VIP locally, unwraps it and answers the
+	// client directly. The backend only has to be routable from the load balancer, not on its L2
+	// segment. IPv4 VIPs get an IPv4 outer header, IPv6 VIPs an IPv6 one. The path to the
+	// backends must carry the extra 20 (24 with GRE, 40/44 for IPv6) bytes.
+	ModeDSRIPIP Mode = "dsr-ipip"
+	ModeDSRGRE  Mode = "dsr-gre"
 )
+
+// IsTunnel reports whether m encapsulates towards the backend.
+func (m Mode) IsTunnel() bool { return m == ModeDSRIPIP || m == ModeDSRGRE }
+
+// Valid reports whether m is a mode rivorad knows.
+func (m Mode) Valid() bool { return m == ModeDSR || m == ModeNAT || m.IsTunnel() }
 
 type Protocol string
 
@@ -380,12 +395,19 @@ type Config struct {
 	Interface string `yaml:"interface"`
 	// XDPMode defaults to generic, the only mode that works on every interface
 	// (native XDP_TX on veth, for one, does not reliably cross a bridge).
-	XDPMode     XDPMode     `yaml:"xdpMode,omitempty"`
-	APIListen   string      `yaml:"apiListen"`
-	HealthCheck HealthCheck `yaml:"healthCheck"`
-	RateLimit   RateLimit   `yaml:"rateLimit"`
-	BGP         BGP         `yaml:"bgp"`
-	VIPs        []VIP       `yaml:"vips"`
+	XDPMode XDPMode `yaml:"xdpMode,omitempty"`
+	// TunnelSource and TunnelSource6 are the source addresses of the outer header for the
+	// dsr-ipip / dsr-gre modes, IPv4 and IPv6 respectively. Unset, each defaults to the
+	// attached interface's own address of that family. It should be an address the backends can
+	// route back to (they do not reply through the tunnel, so it only needs to be a plausible
+	// source, and must not be filtered by their reverse-path checks).
+	TunnelSource  string      `yaml:"tunnelSource,omitempty"`
+	TunnelSource6 string      `yaml:"tunnelSource6,omitempty"`
+	APIListen     string      `yaml:"apiListen"`
+	HealthCheck   HealthCheck `yaml:"healthCheck"`
+	RateLimit     RateLimit   `yaml:"rateLimit"`
+	BGP           BGP         `yaml:"bgp"`
+	VIPs          []VIP       `yaml:"vips"`
 }
 
 // HasNATVIP reports whether any of vips forwards in full-NAT mode. rivorad
@@ -394,6 +416,16 @@ type Config struct {
 func HasNATVIP(vips []VIP) bool {
 	for _, v := range vips {
 		if v.Mode == ModeNAT {
+			return true
+		}
+	}
+	return false
+}
+
+// HasTunnelVIP reports whether any of vips uses a tunnel mode (dsr-ipip / dsr-gre).
+func HasTunnelVIP(vips []VIP) bool {
+	for _, v := range vips {
+		if v.Mode.IsTunnel() {
 			return true
 		}
 	}
@@ -412,6 +444,9 @@ func RestartRequired(running, next Config) []string {
 	}
 	if running.XDPMode.Effective() != next.XDPMode.Effective() {
 		changed = append(changed, "xdpMode")
+	}
+	if running.TunnelSource != next.TunnelSource || running.TunnelSource6 != next.TunnelSource6 {
+		changed = append(changed, "tunnelSource")
 	}
 	if running.APIListen != next.APIListen {
 		changed = append(changed, "apiListen")
@@ -535,6 +570,9 @@ func (c Config) Validate() error {
 	if err := c.BGP.Validate(); err != nil {
 		return err
 	}
+	if err := c.validateTunnelSources(); err != nil {
+		return err
+	}
 	if len(c.VIPs) == 0 {
 		return fmt.Errorf("at least one VIP is required")
 	}
@@ -560,8 +598,8 @@ func (c Config) Validate() error {
 		if v.Protocol != ProtoTCP && v.Protocol != ProtoUDP {
 			return fmt.Errorf("vip %s:%d: protocol must be tcp or udp", v.Address, v.Port)
 		}
-		if v.Mode != ModeDSR && v.Mode != ModeNAT {
-			return fmt.Errorf("vip %s:%d: mode must be dsr or nat", v.Address, v.Port)
+		if !v.Mode.Valid() {
+			return fmt.Errorf("vip %s:%d: mode must be dsr, nat, dsr-ipip or dsr-gre", v.Address, v.Port)
 		}
 		if len(v.Backends) == 0 {
 			return fmt.Errorf("vip %s:%d: at least one backend is required", v.Address, v.Port)
@@ -601,6 +639,9 @@ func (c Config) Validate() error {
 			// family; see internal/dataplane's UpsertVIP).
 			if (beIP.To4() != nil) != vipIsV4 {
 				return fmt.Errorf("vip %s:%d: backend %s is a different address family than the VIP", v.Address, v.Port, b.Address)
+			}
+			if v.Mode.IsTunnel() && b.MAC != "" {
+				return fmt.Errorf("backend %s: mac only applies to mode dsr; a %s backend is reached by its address", b.Address, v.Mode)
 			}
 			if v.Mode == ModeDSR {
 				if b.MAC == "" {
@@ -698,6 +739,21 @@ func (c Config) checkRanges() error {
 			}
 		}
 		byAddr[k] = append(byAddr[k], span{v.Port, v.PortEnd, name})
+	}
+	return nil
+}
+
+// validateTunnelSources checks tunnelSource is an IPv4 address and tunnelSource6 an IPv6 one.
+func (c Config) validateTunnelSources() error {
+	if c.TunnelSource != "" {
+		if ip := net.ParseIP(c.TunnelSource); ip == nil || ip.To4() == nil {
+			return fmt.Errorf("tunnelSource %q: must be an IPv4 address", c.TunnelSource)
+		}
+	}
+	if c.TunnelSource6 != "" {
+		if ip := net.ParseIP(c.TunnelSource6); ip == nil || ip.To4() != nil {
+			return fmt.Errorf("tunnelSource6 %q: must be an IPv6 address", c.TunnelSource6)
+		}
 	}
 	return nil
 }
