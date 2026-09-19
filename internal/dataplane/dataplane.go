@@ -122,6 +122,8 @@ type Dataplane struct {
 	serviceAlloc  *idAllocator
 	backendAlloc  *idAllocator
 	maglevAlloc   *extentAllocator
+
+	startup StartupSummary
 }
 
 func New(cfg config.Config, dp *loader.Datapath) *Dataplane {
@@ -156,12 +158,42 @@ func (d *Dataplane) Apply(iface *net.Interface) error {
 		return err
 	}
 
-	for _, vip := range d.cfg.VIPs {
-		if err := d.UpsertVIP(vip); err != nil {
-			return fmt.Errorf("vip %s:%d: %w", vip.Address, vip.Port, err)
-		}
+	// Static-YAML mode: the file is the whole desired VIP set, so recover what
+	// a previous run left in the pinned maps and reconcile it against the file
+	// (see adopt.go) instead of programming on top of leftovers. Kubernetes mode
+	// also calls Apply, but with no VIPs — its reconcilers supply them later, so
+	// there is nothing to reconcile against, and adopting-then-reloading to an
+	// empty set would tear down every persisted VIP. It keeps the old path.
+	if len(d.cfg.VIPs) == 0 {
+		return nil
 	}
-	return nil
+	d.mu.Lock()
+	sum, err := d.adoptLocked()
+	d.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("adopt existing datapath state: %w", err)
+	}
+	res, err := d.ReloadVIPs(d.cfg.VIPs)
+	d.mu.Lock()
+	d.startup = StartupSummary{AdoptSummary: sum, ReloadResult: res}
+	d.mu.Unlock()
+	return err
+}
+
+// StartupSummary is what Apply found already programmed and what it did about
+// it: Adopted VIPs recovered from the pinned maps, Dropped entries it couldn't
+// trust, and the add/update/remove/unchanged split of reconciling them against
+// the config (Removed are VIPs left over from a previous config).
+type StartupSummary struct {
+	AdoptSummary
+	ReloadResult
+}
+
+// Startup returns the summary of the last Apply. Zero in Kubernetes mode.
+func (d *Dataplane) Startup() StartupSummary {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.startup
 }
 
 func (d *Dataplane) writeIfaceMAC(iface *net.Interface) error {

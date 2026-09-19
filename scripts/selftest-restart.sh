@@ -65,11 +65,27 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Fixed device names + asynchronous veth teardown after `ip netns del` means a run
+# started right after another can hit "File exists". Clear any leftovers and wait
+# until they are gone before creating anything.
+clear_stale_links() {
+    local n
+    for role in lb client be1 be2; do
+        ip link del "rst-${role}-br" 2>/dev/null || true
+        ip link del "rst-${role}" 2>/dev/null || true
+    done
+    for n in $(seq 1 50); do
+        ip -o link 2>/dev/null | grep -qE ' rst-(lb|client|be1|be2)(-br)?[:@]' || return 0
+        sleep 0.1
+    done
+    echo "stale rst-* links did not go away" >&2; return 1
+}
+
 setup_topology() {
+    clear_stale_links || exit 1
     ip link add "$BR" type bridge; ip link set "$BR" up
     for pair in "lb:$NS_LB:10.78.0.1" "client:$NS_CLIENT:10.78.0.2" "be1:$NS_BE1:10.78.0.11" "be2:$NS_BE2:10.78.0.12"; do
         role="${pair%%:*}"; rest="${pair#*:}"; ns="${rest%%:*}"; ip_="${rest#*:}"
-        ip link del "rst-${role}" 2>/dev/null || true
         ip netns add "$ns"
         ip link add "rst-${role}" type veth peer name "rst-${role}-br"
         ip link set "rst-${role}" netns "$ns"

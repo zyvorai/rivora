@@ -194,11 +194,18 @@ What you take on when you enable it:
   compatibility rule holds: a `rivorad` whose BPF maps changed shape won't load
   against maps from an older version. Read the release notes before upgrading
   across such a change.
-- **A VIP you removed from the config while `rivorad` was down stays
-  programmed.** The maps are reused and nothing sweeps entries that are no
-  longer configured at start-up (this is true of a default restart too; a
-  persisted datapath just keeps serving it in the meantime). Removing a VIP
-  with the daemon running (edit and reload) does clean up.
+- **Start-up reconciles against what the maps already hold (static-YAML
+  mode).** `rivorad` reads the VIPs, Maglev extents and backends back from the
+  pinned maps, so a VIP that stays in the config keeps the IDs it had, and one
+  you removed while `rivorad` was down is torn down at start-up (the log says
+  `removed VIPs left programmed by a previous config`). This matters more than
+  it sounds: without it, the removed VIP's service ID is reused by the first VIP
+  in the new config, and traffic still addressed to the removed VIP is answered
+  by another VIP's backends. `scripts/selftest-adopt.sh` reproduces that on an
+  older build and passes on this one. **Not done with `-kubernetes`**: there the
+  reconcilers supply the VIPs after start-up, so there is nothing to reconcile
+  against yet, and a VIP whose Service was deleted while `rivorad` was down stays
+  programmed until its map entry is cleared.
 - **Changing `interface` or dropping every `mode: nat` VIP leaves the old link
   attached.** The start-up log warns about persisted links this config no
   longer manages; run `rivorad -detach` to clear them.

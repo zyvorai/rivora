@@ -221,3 +221,5 @@ jobs:
       run: sudo bash scripts/selftest-ndp.sh
     - name: Restart selftest (persisted datapath, veth/netns)
       run: sudo bash scripts/selftest-restart.sh
+    - name: Restart reconciliation selftest (stale VIPs, shifted IDs, veth/netns)
+      run: sudo bash scripts/selftest-adopt.sh

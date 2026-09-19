@@ -218,6 +218,7 @@ func main() {
 		logger.Error("apply config", "err", err)
 		os.Exit(1)
 	}
+	logStartup(logger, plane.Startup())
 
 	// bgpSpeaker is not Kubernetes-specific (unlike the ARP speaker, which
 	// needs a K8s Lease for its cluster-wide mutual exclusion) — a
@@ -435,6 +436,23 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Warn("api graceful shutdown incomplete, closing", "err", err)
 		_ = srv.Close()
+	}
+}
+
+// logStartup reports what start-up found already programmed in the pinned maps.
+// Removing a VIP the config no longer lists is worth a warning of its own: it
+// was still forwarding traffic until this moment.
+func logStartup(logger *slog.Logger, s dataplane.StartupSummary) {
+	if s.Adopted == 0 && s.Dropped == 0 {
+		return // fresh maps (or Kubernetes mode): nothing was there
+	}
+	logger.Info("recovered existing datapath state from the pinned maps",
+		"adopted", s.Adopted, "updated", s.Updated, "unchanged", s.Unchanged, "added", s.Added)
+	if s.Removed > 0 {
+		logger.Warn("removed VIPs left programmed by a previous config that this config no longer lists", "removed", s.Removed)
+	}
+	if s.Dropped > 0 {
+		logger.Warn("dropped pinned VIP entries that were internally inconsistent", "dropped", s.Dropped)
 	}
 }
 
