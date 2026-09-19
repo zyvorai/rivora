@@ -1,0 +1,41 @@
+# HTTP health checks: probe an endpoint and judge its status, instead of only
+# checking that a TCP port accepts connections. A backend whose app is failing,
+# erroring or still warming up is taken out of rotation even though its socket is
+# open. The default (no healthCheck on the VIP) is still a plain TCP connect.
+
+interface: eth0
+apiListen: 127.0.0.1:9870
+
+# Global probe timing; the per-VIP healthCheck below says WHAT to probe.
+healthCheck:
+  interval: 3s
+  timeout: 1s
+  failThreshold: 2
+  successThreshold: 2
+
+vips:
+  - address: 10.0.0.100
+    port: 80
+    protocol: tcp
+    mode: nat
+    healthCheck:
+      type: http
+      path: /healthz          # default "/"
+      expectStatus: 200-299   # "200" or a range; default 200-399 (redirects are counted, not followed)
+      # port: 8081            # probe this port instead of the service port (health is often separate)
+      # host: app.internal    # Host header; default is the backend address
+    backends:
+      - address: 10.0.1.11
+        port: 8080
+      - address: 10.0.1.12
+        port: 8080
+
+  # A UDP service has no TCP port to connect to, so probe an HTTP health port.
+  - address: 10.0.0.101
+    port: 5353
+    protocol: udp
+    mode: nat
+    healthCheck: {type: http, port: 8081, path: /ready}
+    backends:
+      - address: 10.0.1.21
+        port: 5353

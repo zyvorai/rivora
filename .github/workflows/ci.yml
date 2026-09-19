@@ -227,3 +227,5 @@ jobs:
       run: sudo bash scripts/selftest-drops.sh
     - name: XDP attach mode selftest (generic, native, auto, mode change, veth/netns)
       run: sudo bash scripts/selftest-xdpmode.sh
+    - name: HTTP health check selftest (open port + failing app, reload, bad config, veth/netns)
+      run: sudo bash scripts/selftest-httpcheck.sh

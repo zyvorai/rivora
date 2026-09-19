@@ -138,6 +138,57 @@ Things to know:
   at start-up, so a reload (SIGHUP) that changes it logs `NOT applied`.
 - **Multiple interfaces** are still not supported: one `interface` per node.
 
+## Health checks: TCP and HTTP
+
+By default each backend is probed with a TCP connect to its service port. That
+proves the port accepts connections and nothing more: a backend whose app is
+wedged, returning 500s or still warming up stays "healthy" and keeps receiving
+traffic. Give a VIP an HTTP probe to judge the app itself:
+
+```yaml
+vips:
+  - address: 10.0.0.100
+    port: 80
+    protocol: tcp
+    mode: nat
+    healthCheck:
+      type: http
+      path: /healthz          # default "/"
+      expectStatus: 200-299   # "200" or a range; default 200-399
+      port: 8081              # optional: a separate health port
+      host: app.internal      # optional Host header
+    backends: [{address: 10.0.1.11, port: 8080}]
+```
+
+- **What passes:** a `GET` that answers within the probe `timeout` with a status in
+  `expectStatus`. Redirects are **not followed**, only counted, so a `302` passes
+  the default `200-399` and fails `expectStatus: 200`. Anything else fails: a
+  connect error, a timeout, a backend that accepts and never replies, a service
+  that isn't HTTP.
+- **Every probe is a fresh connection**, so a backend that has stopped accepting
+  new connections is noticed rather than masked by a kept-alive one. Proxy
+  environment variables are ignored: the probe reaches the backend itself.
+- **`port`** probes another port than the service port. Use it when health is
+  served separately, and for a UDP VIP (there is no TCP port to connect to).
+  It applies to `tcp` probes too.
+- **Timing is still global** (`healthCheck.interval`, `timeout`, `failThreshold`,
+  `successThreshold`), so one failed probe doesn't flap a backend out.
+- **A backend is probed once, however many VIPs list it**, so VIPs that share a
+  backend address and port must agree on its probe. `rivorad` and
+  `rivoractl validate` refuse a config where they don't, naming the backend,
+  instead of letting one VIP silently win.
+- **Editing only a VIP's `healthCheck` and reloading (SIGHUP) takes effect
+  immediately**; the backend keeps its current health state until the new probe
+  says otherwise. Removing `healthCheck` returns it to a TCP connect.
+- **Not covered yet:** `https` (there is no TLS probe), gRPC, and per-backend or
+  per-Service probe settings. VIPs created from Kubernetes Services or Gateways
+  have no probe setting and always use the TCP connect.
+
+To see it working, `rivora_backend_healthy` drops to `0` for a backend whose
+health endpoint fails while a plain TCP connect to its service port still
+succeeds, and `rivora_vip_dropped_packets_total{reason="no_healthy_backend"}`
+starts counting if that was the VIP's only backend.
+
 ## Reloading the config without a restart
 
 For a static-YAML node, edit `/etc/rivora/config.yaml`, check it, then reload:

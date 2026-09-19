@@ -268,7 +268,7 @@ func main() {
 	refreshTargets := func() {
 		var targets []healthcheck.Target
 		for _, t := range plane.Targets() {
-			targets = append(targets, healthcheck.Target{BackendID: t.ID, Address: t.Address, Port: t.Port})
+			targets = append(targets, healthcheck.Target{BackendID: t.ID, Address: t.Address, Port: t.Port, Probe: t.Probe})
 		}
 		checker.SetTargets(targets)
 	}
@@ -345,7 +345,7 @@ func main() {
 		onChange := func() {
 			var targets []healthcheck.Target
 			for _, t := range plane.Targets() {
-				targets = append(targets, healthcheck.Target{BackendID: t.ID, Address: t.Address, Port: t.Port})
+				targets = append(targets, healthcheck.Target{BackendID: t.ID, Address: t.Address, Port: t.Port, Probe: t.Probe})
 			}
 			checker.SetTargets(targets)
 			if sp != nil {

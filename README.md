@@ -78,7 +78,9 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
   `rivoractl drain|undrain ID` and `rivoractl weight ID N` (see the
   [runbook](website/docs/operations/runbook.md)); `rivoractl validate FILE`
   checks a static config offline, and `systemctl reload rivorad` (SIGHUP)
-  applies an edited config's VIP set live. `xdpMode: native` (or `auto`)
+  applies an edited config's VIP set live. A VIP's `healthCheck: {type: http, ...}`
+  probes an HTTP endpoint and judges its status instead of only a TCP connect
+  (see `config/examples/http-healthcheck.yaml`). `xdpMode: native` (or `auto`)
   attaches XDP in the NIC driver instead of the default generic mode.
   `rivorad -persist-datapath` keeps
   the datapath attached across restarts (no traffic gap; see the runbook).

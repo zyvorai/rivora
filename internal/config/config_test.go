@@ -4,6 +4,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -256,5 +257,147 @@ func TestXDPModeDefaultsToGenericAndLoads(t *testing.T) {
 	}
 	if _, err := Load(write("bad.yaml", "xdpMode: driver\n")); err == nil {
 		t.Error("an unknown xdpMode loaded; a typo must fail at start-up, not silently mean generic")
+	}
+}
+
+func TestProbeSpecEffectiveDefaults(t *testing.T) {
+	if got := (ProbeSpec{}).Effective(); got.Type != ProbeTCP {
+		t.Errorf("zero spec = %+v, want a plain tcp probe (the legacy behaviour)", got)
+	}
+	h := ProbeSpec{Type: ProbeHTTP}.Effective()
+	if h.Path != "/" || h.ExpectStatus != DefaultExpectStatus {
+		t.Errorf("http defaults = path %q status %q, want / and %s", h.Path, h.ExpectStatus, DefaultExpectStatus)
+	}
+	// Explicit-default and unset must compare equal, or the shared-backend
+	// conflict check would flag a VIP that spells out what another leaves unset.
+	if (ProbeSpec{Type: ProbeHTTP}).Effective() != (ProbeSpec{Type: ProbeHTTP, Path: "/", ExpectStatus: "200-399"}).Effective() {
+		t.Error("an http spec with defaults spelled out differs from one with them unset")
+	}
+}
+
+func TestProbeSpecStatusRange(t *testing.T) {
+	for _, c := range []struct {
+		in     string
+		lo, hi int
+	}{
+		{"", 200, 399}, {"200", 200, 200}, {"200-299", 200, 299}, {" 204 - 206 ", 204, 206}, {"500-599", 500, 599},
+	} {
+		lo, hi, err := ProbeSpec{Type: ProbeHTTP, ExpectStatus: c.in}.StatusRange()
+		if err != nil || lo != c.lo || hi != c.hi {
+			t.Errorf("%q -> %d-%d, %v; want %d-%d", c.in, lo, hi, err, c.lo, c.hi)
+		}
+	}
+	for _, bad := range []string{"abc", "99", "600", "300-200", "200-", "-200", "200-abc", "2xx"} {
+		if _, _, err := (ProbeSpec{Type: ProbeHTTP, ExpectStatus: bad}).StatusRange(); err == nil {
+			t.Errorf("expectStatus %q accepted", bad)
+		}
+	}
+}
+
+func TestProbeSpecValidate(t *testing.T) {
+	ok := []ProbeSpec{
+		{}, {Type: ProbeTCP}, {Type: ProbeTCP, Port: 8081},
+		{Type: ProbeHTTP}, {Type: ProbeHTTP, Path: "/healthz?deep=1", Host: "app.example", ExpectStatus: "200", Port: 9000},
+	}
+	for _, p := range ok {
+		if err := p.Validate(); err != nil {
+			t.Errorf("%+v rejected: %v", p, err)
+		}
+	}
+	bad := map[string]ProbeSpec{
+		"unknown type":            {Type: "grpc"},
+		"http path without slash": {Type: ProbeHTTP, Path: "healthz"},
+		"path with a space":       {Type: ProbeHTTP, Path: "/a b"},
+		"host with a slash":       {Type: ProbeHTTP, Host: "a/b"},
+		"bad status":              {Type: ProbeHTTP, ExpectStatus: "ok"},
+		"tcp with a path":         {Type: ProbeTCP, Path: "/x"},
+		"unset type with a path":  {Path: "/x"}, // a path means http was intended: don't silently ignore it
+		"tcp with a status":       {ExpectStatus: "200"},
+	}
+	for name, p := range bad {
+		if err := p.Validate(); err == nil {
+			t.Errorf("%s: %+v accepted", name, p)
+		}
+	}
+}
+
+func loadYAML(t *testing.T, body string) (Config, error) {
+	t.Helper()
+	p := t.TempDir() + "/c.yaml"
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return Load(p)
+}
+
+func TestLoadParsesPerVIPHealthCheck(t *testing.T) {
+	cfg, err := loadYAML(t, `
+interface: eth0
+vips:
+  - address: 10.0.0.1
+    port: 80
+    protocol: tcp
+    mode: nat
+    healthCheck: {type: http, path: /ready, expectStatus: 200, port: 9000, host: app.local}
+    backends: [{address: 10.1.0.1, port: 80}]
+  - address: 10.0.0.2
+    port: 80
+    protocol: tcp
+    mode: nat
+    backends: [{address: 10.1.0.2, port: 80}]
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ProbeSpec{Type: ProbeHTTP, Path: "/ready", ExpectStatus: "200", Port: 9000, Host: "app.local"}
+	if cfg.VIPs[0].HealthCheck != want {
+		t.Errorf("vip 0 healthCheck = %+v, want %+v", cfg.VIPs[0].HealthCheck, want)
+	}
+	if cfg.VIPs[1].HealthCheck.Effective().Type != ProbeTCP {
+		t.Errorf("a VIP with no healthCheck must probe with tcp, got %+v", cfg.VIPs[1].HealthCheck.Effective())
+	}
+}
+
+func TestLoadRejectsABadHealthCheck(t *testing.T) {
+	_, err := loadYAML(t, `
+interface: eth0
+vips:
+  - address: 10.0.0.1
+    port: 80
+    protocol: tcp
+    mode: nat
+    healthCheck: {type: http, path: healthz}
+    backends: [{address: 10.1.0.1, port: 80}]
+`)
+	if err == nil || !strings.Contains(err.Error(), "path") {
+		t.Errorf("err = %v, want a complaint about the path", err)
+	}
+}
+
+func TestSharedBackendMustAgreeOnItsProbe(t *testing.T) {
+	vip := func(addr string, hc ProbeSpec) VIP {
+		return VIP{Address: addr, Port: 80, Protocol: ProtoTCP, Mode: ModeNAT, HealthCheck: hc,
+			Backends: []Backend{{Address: "10.1.0.1", Port: 8080}}}
+	}
+	mk := func(vips ...VIP) Config { return Config{Interface: "eth0", VIPs: vips} }
+
+	// Same backend, one VIP http and one tcp: cannot both be honoured.
+	err := mk(vip("10.0.0.1", ProbeSpec{Type: ProbeHTTP}), vip("10.0.0.2", ProbeSpec{})).Validate()
+	if err == nil || !strings.Contains(err.Error(), "10.1.0.1:8080") || !strings.Contains(err.Error(), "must agree") {
+		t.Errorf("conflicting probes accepted or unclear: %v", err)
+	}
+	// Different path is a conflict too.
+	if err := mk(vip("10.0.0.1", ProbeSpec{Type: ProbeHTTP, Path: "/a"}), vip("10.0.0.2", ProbeSpec{Type: ProbeHTTP, Path: "/b"})).Validate(); err == nil {
+		t.Error("two different http paths for one backend were accepted")
+	}
+	// Agreeing — including one spelling out the defaults — is fine.
+	if err := mk(vip("10.0.0.1", ProbeSpec{Type: ProbeHTTP}), vip("10.0.0.2", ProbeSpec{Type: ProbeHTTP, Path: "/", ExpectStatus: "200-399"})).Validate(); err != nil {
+		t.Errorf("identical effective probes rejected: %v", err)
+	}
+	// Different backends may of course differ.
+	other := vip("10.0.0.2", ProbeSpec{})
+	other.Backends[0].Address = "10.1.0.9"
+	if err := mk(vip("10.0.0.1", ProbeSpec{Type: ProbeHTTP}), other).Validate(); err != nil {
+		t.Errorf("different backends with different probes rejected: %v", err)
 	}
 }

@@ -109,6 +109,10 @@ type backendState struct {
 	isV4         bool // which of backend_map/backend_map6 this ID lives in (v0.3)
 	probeHealthy bool // from internal/healthcheck's active TCP probes
 	draining     bool // from a Kubernetes reconciler's EndpointSlice terminating state (v0.2+)
+	// probe is how the health checker should check this backend, taken from the
+	// VIP that lists it. A backend shared by several VIPs is probed once, and
+	// config validation guarantees those VIPs agree, so any of them will do.
+	probe config.ProbeSpec
 	// adminDraining is an operator's drain (rivoractl drain). Tracked apart
 	// from draining so a reconciler clearing its own terminating state can't
 	// silently undo an operator's drain, and vice versa.
@@ -310,6 +314,8 @@ func (d *Dataplane) upsertVIPLocked(spec config.VIP) error {
 		backendSetChanged = true
 	}
 
+	d.applyProbeLocked(entry, vip.HealthCheck)
+
 	oldWeights := make(map[string]uint32, len(entry.vip.Backends))
 	for _, b := range entry.vip.Backends {
 		oldWeights[backendName(b)] = maglev.NormalizeWeight(b.Weight)
@@ -349,6 +355,17 @@ func (d *Dataplane) upsertVIPLocked(spec config.VIP) error {
 	entry.vipSpec = spec
 	entry.vip = vip
 	return nil
+}
+
+// applyProbeLocked records probe as the health-check spec of every backend entry
+// lists, so a probe edit in the config (or a reload) reaches the checker on its
+// next Targets() call.
+func (d *Dataplane) applyProbeLocked(entry *serviceEntry, probe config.ProbeSpec) {
+	for _, id := range entry.backendIDs {
+		if st := d.backendStates[id]; st != nil {
+			st.probe = probe
+		}
+	}
 }
 
 // applyWeightOverrides returns spec with each operator-overridden backend's
@@ -806,6 +823,7 @@ func (d *Dataplane) Targets() []struct {
 	ID      uint32
 	Address string
 	Port    uint16
+	Probe   config.ProbeSpec
 } {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -813,13 +831,15 @@ func (d *Dataplane) Targets() []struct {
 		ID      uint32
 		Address string
 		Port    uint16
+		Probe   config.ProbeSpec
 	}, 0, len(d.backendStates))
 	for id, st := range d.backendStates {
 		out = append(out, struct {
 			ID      uint32
 			Address string
 			Port    uint16
-		}{ID: id, Address: st.address, Port: st.port})
+			Probe   config.ProbeSpec
+		}{ID: id, Address: st.address, Port: st.port, Probe: st.probe})
 	}
 	return out
 }
