@@ -71,6 +71,40 @@ they were actually removed, a restart rebuilds them from the current
 config/K8s state (some in-flight NAT connection affinity is lost in that
 case, existing DSR flows are not since the backend owns the reply path).
 
+## API keys: read-only access, rotation, and probing
+
+The API has two roles. `RIVORA_API_KEY` is the **admin** key (full access,
+including the mutating calls below); `RIVORA_API_READONLY_KEY` may read but gets a
+`403` on anything that changes state. Hand the read-only key to dashboards and to
+anyone who only needs to look, so a leaked screen-share can't drain a backend.
+
+**Rotating a key with no outage** (either variable accepts a comma-separated list):
+
+1. Generate the new key: `openssl rand -hex 24`.
+2. Set `RIVORA_API_KEY=<new>,<old>` (in `/etc/rivora/rivorad.env`, or the chart's
+   `rivorad.apiKey`, escaping the comma with `--set`) and restart `rivorad`. Both
+   keys now work.
+3. Move every client to `<new>`.
+4. Set `RIVORA_API_KEY=<new>` and restart. `<old>` now gets `401`.
+
+Rotate a read-only key the same way with `RIVORA_API_READONLY_KEY`.
+
+**Watching for probing.** A publicly bound API attracts scanners. Alert on
+`rate(rivora_api_auth_failures_total{reason="unauthenticated"}[5m])`; a steady
+rise means someone is guessing keys (`forbidden` means a read-only key was used to
+try to change something). Rejections are also logged, throttled to about one line
+per 10 seconds with a count of how many were swallowed, showing the source
+address and path but never a key. Behind a proxy the address is the proxy's.
+
+**Trusting the certificate.** With `RIVORA_TLS_CERT`/`RIVORA_TLS_KEY`, verify it
+rather than skipping verification: `rivoractl --ca-file cert.pem ...`. The
+auto-generated self-signed certificate changes on every start, so it can only be
+skipped with `--tls-insecure`.
+
+`rivorad` refuses to start, before touching the kernel, if the key settings are
+unsafe: a read-only key with no admin key, a key in both roles, or a setting with
+no usable key in it.
+
 ## Draining a backend or shifting weight (live)
 
 Use these for maintenance and canary shifts without editing config or
@@ -137,6 +171,49 @@ Things to know:
   restarting in the *same* mode afterwards hot-swaps as usual. `xdpMode` is read
   at start-up, so a reload (SIGHUP) that changes it logs `NOT applied`.
 - **Multiple interfaces** are still not supported: one `interface` per node.
+
+## Kubernetes Service semantics: session affinity and `externalTrafficPolicy`
+
+For `type: LoadBalancer` Services, `rivorad` reads two Service fields.
+
+**`sessionAffinity: ClientIP` is honoured always.** All connections from one client
+address go to the same backend while the backend set is unchanged, and when it
+changes Maglev moves only a small share of clients. The same behaviour is available
+to static configs as a VIP's `sessionAffinity: clientIP`
+(`config/examples/session-affinity.yaml`). Two differences from Kubernetes to know
+about:
+
+- **There is no timeout.** Stickiness is a pure function of the source address and the
+  current backend set, so the Service's `sessionAffinityConfig.clientIP.timeoutSeconds`
+  is ignored.
+- **A client behind a NAT or proxy is one client.** Everyone behind one address hashes
+  identically, so a large NAT'd population lands on a single backend. That is what
+  source-address affinity means, but it is easy to trip over with a corporate proxy.
+
+**`externalTrafficPolicy: Local` is honoured only where it is safe**, and otherwise
+treated as `Cluster` (which is what it always was here). Both preserve the client
+address, since the NAT rewrites only the destination, so what you lose without `Local`
+is only the locality of delivering on the node that has the pod.
+
+| Configuration | `Local` |
+| --- | --- |
+| `-bgp` on, `-speaker=false`, node name known | **Honoured**: a node uses only its own endpoints, and a node with none programs no VIP, so it withdraws the route rather than attracting traffic it would have to forward elsewhere. |
+| L2 speaker on (`-speaker=true`, the default) | Treated as `Cluster`. The speaker elects **one** node to answer ARP/NDP for **every** VIP, whether or not it runs a Service's pods; honouring `Local` there would blackhole a Service whenever the elected node has none of its pods. |
+| BGP and the L2 speaker both on | Treated as `Cluster`; run with `-speaker=false` to honour `Local`. |
+| Neither BGP nor L2 | Treated as `Cluster`: nothing stops a node without the pods from receiving the traffic. |
+| BGP on, speaker off, but no node name | Treated as `Cluster`; set `-node-name` (the Helm chart sets `NODE_NAME` from `spec.nodeName`). |
+
+Whenever a Service asks for `Local` and it isn't honoured, `rivorad` logs a warning
+**once per Service** saying why (`externalTrafficPolicy: Local is being treated as
+Cluster for this Service`), and its start-up log states whether `Local` is honoured on
+that node. Endpoints with no node (external addresses, hand-authored slices) are not
+assumed local; a local terminating endpoint stays in as draining; node names must
+match exactly.
+
+Not implemented: topology-aware routing (`trafficDistribution`), `internalTrafficPolicy`
+(this is a LoadBalancer implementation), and the Service's `healthCheckNodePort`
+(that exists for external load balancers to probe a node; here `rivorad` is the load
+balancer).
 
 ## Health checks: TCP and HTTP
 

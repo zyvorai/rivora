@@ -16,6 +16,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -86,7 +87,11 @@ type Reconciler struct {
 
 	// installed tracks, per Gateway key, the VIP keys most recently
 	// programmed for it — same role as internal/controller.Reconciler's
-	// field of the same name.
+	// field of the same name, and guarded by mu for the same reason: different
+	// Gateways reconcile on concurrent workers and unguarded writes to this map
+	// crash the process ("concurrent map read and map write"). Held only around
+	// the map access, never across a dataplane call.
+	mu        sync.Mutex
 	installed map[string][]string
 
 	// OnChange mirrors internal/controller.Reconciler.OnChange — rivorad
@@ -448,7 +453,10 @@ func (r *Reconciler) removeAllFor(key string, desired []desiredVIP) error {
 		}
 	}
 
-	for _, oldKey := range r.installed[key] {
+	r.mu.Lock()
+	previous := append([]string(nil), r.installed[key]...)
+	r.mu.Unlock()
+	for _, oldKey := range previous {
 		if newKeys[oldKey] {
 			continue
 		}
@@ -458,6 +466,7 @@ func (r *Reconciler) removeAllFor(key string, desired []desiredVIP) error {
 		changed = true
 	}
 
+	r.mu.Lock()
 	if len(newKeys) == 0 {
 		delete(r.installed, key)
 	} else {
@@ -467,6 +476,7 @@ func (r *Reconciler) removeAllFor(key string, desired []desiredVIP) error {
 		}
 		r.installed[key] = keys
 	}
+	r.mu.Unlock()
 
 	if changed && r.OnChange != nil {
 		r.OnChange()

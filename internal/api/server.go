@@ -9,10 +9,10 @@
 package api
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"mime"
 	"net/http"
 	"strconv"
@@ -26,7 +26,10 @@ import (
 	"github.com/zyvorai/rivora/internal/metrics"
 )
 
-var errUnauthorized = errors.New("unauthorized")
+var (
+	errUnauthorized = errors.New("unauthorized")
+	errReadOnly     = errors.New("forbidden: this key is read-only and cannot change state")
+)
 
 // Admin is the operator-facing mutation surface (drain/undrain/weight),
 // narrowed to an interface so the handlers can be tested without loading BPF
@@ -37,22 +40,35 @@ type Admin interface {
 }
 
 type Server struct {
-	dp       *dataplane.Dataplane
-	admin    Admin
-	apiKey   string
-	registry *prometheus.Registry
+	dp     *dataplane.Dataplane
+	admin  Admin
+	apiKey string // admin key(s): full access; a comma-separated list rotates keys
+	// readOnlyKey is the key(s) that may only read. Empty means no read-only role.
+	readOnlyKey  string
+	registry     *prometheus.Registry
+	authFailures *prometheus.CounterVec // nil when the Server was built without a registry
+	logger       *slog.Logger
+	failLog      *throttle
 }
 
 // New creates a Server. apiKey may be empty, in which case the API is
 // unauthenticated (today's default behavior).
 func New(dp *dataplane.Dataplane, apiKey string) *Server {
 	reg := prometheus.NewRegistry()
+	failures := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "rivora_api_auth_failures_total",
+		Help: "API requests rejected: unauthenticated (missing or wrong key, 401) or forbidden (a read-only key attempting a change, 403). A steady rise on a publicly bound API is someone probing it.",
+	}, []string{"reason"})
+	// Create both series up front so they read 0 rather than being absent.
+	failures.WithLabelValues(failUnauthenticated)
+	failures.WithLabelValues(failForbidden)
 	reg.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		metrics.NewDataplaneCollector(dp),
+		failures,
 	)
-	return &Server{dp: dp, admin: dp, apiKey: apiKey, registry: reg}
+	return &Server{dp: dp, admin: dp, apiKey: apiKey, registry: reg, authFailures: failures}
 }
 
 // RegisterBGP adds the rivora_bgp_* series to /metrics. Call it once, before the
@@ -128,30 +144,44 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) auth(next http.Handler) http.Handler {
-	if s.apiKey == "" {
+	admin := parseKeys(s.apiKey)
+	if len(admin) == 0 {
 		return next
 	}
+	readOnly := parseKeys(s.readOnlyKey)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/api/") {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if !s.validBearer(r.Header.Get("Authorization")) {
+		token, ok := bearerToken(r.Header.Get("Authorization"))
+		switch {
+		case ok && matchAny(token, admin):
+			next.ServeHTTP(w, r)
+		case ok && matchAny(token, readOnly):
+			// A valid read-only key: fine for anything that can't change state.
+			if safeMethod(r.Method) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			s.recordAuthFailure(r, failForbidden)
+			writeError(w, http.StatusForbidden, errReadOnly)
+		default:
+			s.recordAuthFailure(r, failUnauthenticated)
 			w.Header().Set("WWW-Authenticate", `Bearer realm="rivorad"`)
 			writeError(w, http.StatusUnauthorized, errUnauthorized)
-			return
 		}
-		next.ServeHTTP(w, r)
 	})
 }
 
+// validBearer reports whether header carries any valid credential, admin or
+// read-only.
 func (s *Server) validBearer(header string) bool {
-	const prefix = "Bearer "
-	if !strings.HasPrefix(header, prefix) {
+	token, ok := bearerToken(header)
+	if !ok {
 		return false
 	}
-	token := strings.TrimPrefix(header, prefix)
-	return subtle.ConstantTimeCompare([]byte(token), []byte(s.apiKey)) == 1
+	return matchAny(token, parseKeys(s.apiKey)) || matchAny(token, parseKeys(s.readOnlyKey))
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {

@@ -34,11 +34,19 @@ type desiredVIP struct {
 // IP yet, or that has no ready same-family backends, or that uses an
 // unsupported protocol, yields no VIP for that port — the caller then
 // just removes whatever was previously installed.
-func buildDesiredVIPs(svc *corev1.Service, slices []*discoveryv1.EndpointSlice) ([]desiredVIP, error) {
+func buildDesiredVIPs(svc *corev1.Service, slices []*discoveryv1.EndpointSlice, opts buildOptions) ([]desiredVIP, error) {
 	addrs := ingressIPs(svc)
 	if len(addrs) == 0 {
 		return nil, nil
 	}
+
+	// externalTrafficPolicy: Local restricts a VIP to this node's own endpoints, but
+	// only when the caller says it is safe to (see buildOptions.LocalNode).
+	localOnly := ""
+	if opts.LocalNode != "" && svc.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyLocal {
+		localOnly = opts.LocalNode
+	}
+	affinity := affinityFor(svc)
 
 	var out []desiredVIP
 	for _, addr := range addrs {
@@ -48,7 +56,7 @@ func buildDesiredVIPs(svc *corev1.Service, slices []*discoveryv1.EndpointSlice) 
 				continue // SCTP or other unsupported protocol: skip this port, not the whole Service
 			}
 
-			backends, draining := EndpointsForPort(slices, p.Name)
+			backends, draining := endpointsForPort(slices, p.Name, localOnly)
 			backends = SameFamily(backends, addr)
 			draining = SameFamily(draining, addr)
 			if len(backends) == 0 {
@@ -62,12 +70,37 @@ func buildDesiredVIPs(svc *corev1.Service, slices []*discoveryv1.EndpointSlice) 
 					Protocol: proto,
 					Mode:     config.ModeNAT,
 					Backends: backends,
+
+					SessionAffinity: affinity,
 				},
 				DrainingBackends: draining,
 			})
 		}
 	}
 	return out, nil
+}
+
+// buildOptions carries this node's behaviour into buildDesiredVIPs.
+type buildOptions struct {
+	// LocalNode, when non-empty, makes a Service with externalTrafficPolicy: Local
+	// use only the endpoints running on this node. It must be empty unless every
+	// node that can attract this Service's traffic is one that has its endpoints.
+	// That holds with BGP (a node advertises a VIP only while it has a healthy local
+	// backend, so a node with none withdraws it), but NOT with the L2 speaker, where
+	// one elected node answers ARP for every VIP whether or not it has the pods: a
+	// Local Service would then blackhole whenever the leader has none.
+	LocalNode string
+}
+
+// affinityFor maps Service.spec.sessionAffinity. ClientIP becomes source-address
+// hashing. The Service's timeoutSeconds is not honoured: affinity here holds while
+// the backend set is stable (and moves only a small share of clients when it
+// changes), rather than expiring on a timer.
+func affinityFor(svc *corev1.Service) config.SessionAffinity {
+	if svc.Spec.SessionAffinity == corev1.ServiceAffinityClientIP {
+		return config.AffinityClientIP
+	}
+	return ""
 }
 
 // ingressIPs returns every LoadBalancer ingress IP (IPv4 and IPv6), in
@@ -125,6 +158,14 @@ func protocolFor(p corev1.Protocol) (config.Protocol, bool) {
 // family-scoped) should filter with sameFamily. Exported: reused by
 // internal/gatewayapi for TCPRoute/UDPRoute backendRefs.
 func EndpointsForPort(slices []*discoveryv1.EndpointSlice, portName string) (backends, draining []config.Backend) {
+	return endpointsForPort(slices, portName, "")
+}
+
+// endpointsForPort is EndpointsForPort with an optional node filter: a non-empty
+// node keeps only endpoints that run on it. An endpoint with no node at all
+// (external addresses, hand-authored slices) is not on any node, so it is dropped
+// by the filter rather than assumed local.
+func endpointsForPort(slices []*discoveryv1.EndpointSlice, portName, node string) (backends, draining []config.Backend) {
 	seen := map[string]bool{} // "addr:port" — dedupe across slices
 	for _, slice := range slices {
 		targetPort, ok := PortForName(slice.Ports, portName)
@@ -133,6 +174,9 @@ func EndpointsForPort(slices []*discoveryv1.EndpointSlice, portName string) (bac
 		}
 		for _, ep := range slice.Endpoints {
 			if !endpointServing(ep) {
+				continue
+			}
+			if node != "" && (ep.NodeName == nil || *ep.NodeName != node) {
 				continue
 			}
 			ready := ep.Conditions.Ready != nil && *ep.Conditions.Ready

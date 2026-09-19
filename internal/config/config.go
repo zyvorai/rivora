@@ -48,9 +48,44 @@ type VIP struct {
 	Protocol Protocol  `yaml:"protocol"`
 	Mode     Mode      `yaml:"mode"`
 	Backends []Backend `yaml:"backends"`
+	// SessionAffinity says whether one client sticks to one backend. Unset (or
+	// "none") spreads a client's connections across backends; "clientIP" sends
+	// every connection from a source address to the same backend, for as long as
+	// the backend set is unchanged. It maps Kubernetes' Service.spec.sessionAffinity.
+	SessionAffinity SessionAffinity `yaml:"sessionAffinity,omitempty"`
 	// HealthCheck says how this VIP's backends are probed. Unset means the
 	// default: a TCP connect to the backend's service port, exactly as before.
 	HealthCheck ProbeSpec `yaml:"healthCheck,omitempty"`
+}
+
+// SessionAffinity is how a VIP chooses a backend for a new connection.
+type SessionAffinity string
+
+const (
+	// AffinityNone hashes the whole 5-tuple: a client's connections spread out.
+	AffinityNone SessionAffinity = "none"
+	// AffinityClientIP hashes the source address only, so a client's connections all
+	// go to the same backend. Unlike Kubernetes' ClientIP affinity there is no
+	// timeout: it holds while the backend set is stable, and when that changes
+	// Maglev moves only a small share of clients.
+	AffinityClientIP SessionAffinity = "clientIP"
+)
+
+// Effective treats the empty value as the default, none.
+func (a SessionAffinity) Effective() SessionAffinity {
+	if a == "" {
+		return AffinityNone
+	}
+	return a
+}
+
+// Validate accepts none, clientIP, or empty (the default).
+func (a SessionAffinity) Validate() error {
+	switch a.Effective() {
+	case AffinityNone, AffinityClientIP:
+		return nil
+	}
+	return fmt.Errorf("sessionAffinity %q: must be none or clientIP", string(a))
 }
 
 // ProbeType is what an active health probe does.
@@ -402,6 +437,9 @@ func (c Config) Validate() error {
 		}
 		if len(v.Backends) == 0 {
 			return fmt.Errorf("vip %s:%d: at least one backend is required", v.Address, v.Port)
+		}
+		if err := v.SessionAffinity.Validate(); err != nil {
+			return fmt.Errorf("vip %s:%d: %w", v.Address, v.Port, err)
 		}
 		if err := v.HealthCheck.Validate(); err != nil {
 			return fmt.Errorf("vip %s:%d: %w", v.Address, v.Port, err)

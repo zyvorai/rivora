@@ -78,7 +78,10 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
   `rivoractl drain|undrain ID` and `rivoractl weight ID N` (see the
   [runbook](website/docs/operations/runbook.md)); `rivoractl validate FILE`
   checks a static config offline, and `systemctl reload rivorad` (SIGHUP)
-  applies an edited config's VIP set live. A VIP's `healthCheck: {type: http, ...}`
+  applies an edited config's VIP set live. `sessionAffinity: clientIP` pins a client
+  to one backend (and maps a Service's `sessionAffinity: ClientIP`);
+  `externalTrafficPolicy: Local` is honoured with BGP and the L2 speaker off (see the
+  [runbook](website/docs/operations/runbook.md)). A VIP's `healthCheck: {type: http, ...}`
   probes an HTTP endpoint and judges its status instead of only a TCP connect
   (see `config/examples/http-healthcheck.yaml`). `xdpMode: native` (or `auto`)
   attaches XDP in the NIC driver instead of the default generic mode.
@@ -172,18 +175,36 @@ config/examples/        static-YAML examples (DSR/NAT, IPv6, multi-VIP, weighted
 ## Securing the API
 
 `rivorad`'s local API (`127.0.0.1:9870` by default) is plain HTTP and
-unauthenticated out of the box — fine for a loopback-only listener, but both
-are opt-in to lock down, same env-var-driven shape as netra's `netrad`:
+unauthenticated out of the box — fine for a loopback-only listener, but all of
+this is opt-in, same env-var-driven shape as netra's `netrad`:
 
 | Env var                    | Effect                                              |
 | --------------------------- | ---------------------------------------------------- |
-| `RIVORA_API_KEY`            | Require this bearer token on every request           |
+| `RIVORA_API_KEY`            | Admin key: require this bearer token on every request; full access (including `drain`/`weight`). Setting it is what turns authentication on. |
+| `RIVORA_API_READONLY_KEY`   | Read-only key: may read the API and console, gets `403` on anything that changes state. Needs `RIVORA_API_KEY` too. |
 | `RIVORA_TLS_CERT` / `_KEY`  | Serve HTTPS with this certificate                     |
 | `RIVORA_TLS_SELF_SIGNED`    | Serve HTTPS with an auto-generated self-signed cert (no cert files needed) |
 
-`rivoractl` picks up `RIVORA_API_KEY` and `RIVORA_TLS_INSECURE` (accept a
-self-signed cert) from its own environment, or via `--api-key`/
-`--tls-insecure`. `rivora-doctor` reports which of these are set.
+- **Rotation with no outage:** either key variable takes a comma-separated list.
+  Set `RIVORA_API_KEY=<new>,<old>`, move clients to `<new>`, then drop `<old>` and
+  restart. Give dashboards and anyone who only needs to look the read-only key.
+- **`rivorad` refuses to start** with a read-only key but no admin key (it would
+  protect nothing), a key in both roles, or a key setting that holds no usable
+  key (a stray `,` must not silently switch auth off). Short keys start but warn;
+  generate one with `openssl rand -hex 24`.
+- **Failed attempts are visible:** `rivora_api_auth_failures_total{reason}`
+  counts `unauthenticated` (401) and `forbidden` (403), and rejections are logged
+  (throttled, source address only, never a key).
+- **Trust the certificate instead of skipping verification:** start `rivorad`
+  with `RIVORA_TLS_CERT`/`_KEY` and pass that certificate (or its CA) to
+  `rivoractl --ca-file cert.pem` (or `RIVORA_CA_FILE`). The auto-generated
+  self-signed certificate is new on every start, so it can only be skipped
+  (`--tls-insecure`), not pinned.
+
+`rivoractl` picks up `RIVORA_API_KEY`, `RIVORA_CA_FILE` and
+`RIVORA_TLS_INSECURE` from its own environment, or via `--api-key`/`--ca-file`/
+`--tls-insecure`; either TLS flag makes a bare `host:port` mean `https`.
+`rivora-doctor` reports which of these are set.
 
 ## Quickstart
 

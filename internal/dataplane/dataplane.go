@@ -343,6 +343,7 @@ func (d *Dataplane) upsertVIPLocked(spec config.VIP) error {
 		MaglevOffset: entry.extent.offset,
 		MaglevSize:   entry.extent.size,
 		Mode:         mode,
+		Affinity:     affinityByte(vip.SessionAffinity),
 	}
 	if err := d.dp.Maps[bpfmaps.MapServiceConfig].Update(&entry.serviceID, &sc, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update service_config_map: %w", err)
@@ -930,6 +931,14 @@ func (d *Dataplane) Status() (Status, error) {
 	default:
 		return Status{}, fmt.Errorf("%d VIPs configured; use the vips list (rivoractl vips / /api/v1/vips) instead of status", len(all))
 	}
+}
+
+// affinityByte is the service_config value for a VIP's session affinity.
+func affinityByte(a config.SessionAffinity) uint8 {
+	if a.Effective() == config.AffinityClientIP {
+		return bpfmaps.AffinityClientIP
+	}
+	return bpfmaps.AffinityNone
 }
 
 // healthStateName maps a backend_health_map value to the label the API and
