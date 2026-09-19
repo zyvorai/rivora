@@ -311,3 +311,6 @@ jobs:
     - name: Session affinity selftest (clientIP stickiness, reload, restart, failover, veth/netns)
       if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-affinity.sh
+    - name: NAT checksum selftest (offload off: TCP/UDP, IPv4/IPv6 checksums verified end to end)
+      if: ${{ !cancelled() }}
+      run: sudo bash scripts/selftest-checksum.sh
