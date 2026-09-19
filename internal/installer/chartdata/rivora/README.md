@@ -23,7 +23,7 @@ attaches XDP/TCX to (see `values.yaml`).
 
 Large IPv6 prefixes (e.g. `/64`) allocate **sparsely** — the controller
 does not expand 2^64 addresses into memory. See the top-level
-[IPv6](../../../README.md#ipv6-v03) docs.
+[IPv6](../../../README.md#ipv6) docs.
 
 ```sh
 helm upgrade rivora deploy/helm/rivora \
@@ -48,29 +48,33 @@ addressPools:
 
 CI sample: [`ci/addresspool-ipv6.yaml`](ci/addresspool-ipv6.yaml).
 
-## The CRD is not managed by upgrade/uninstall
+## The CRDs are not managed by upgrade/uninstall
 
-`crds/addresspool-crd.yaml` lives at the chart root (not
-`templates/crds/`), which is Helm's documented convention for CRDs: Helm
-installs it on the first `helm install`, but **never upgrades or deletes
-it** on subsequent `helm upgrade` or `helm uninstall` — this is intentional
-upstream behavior, not a bug in this chart. If a future chart version
-changes the `AddressPool` schema, apply the updated CRD yourself:
+The chart ships three CRDs in `crds/` (not `templates/crds/`, which is Helm's documented convention):
+`addresspool-crd.yaml`, `servicepolicy-crd.yaml` and `bgppeer-crd.yaml`. Helm installs them on the first
+`helm install`, but **never upgrades or deletes them** on `helm upgrade` or `helm uninstall`; this is
+intentional upstream behaviour, not a bug in this chart. When a release adds or changes a CRD, apply them
+yourself **before** upgrading:
 
 ```sh
-kubectl apply -f deploy/helm/rivora/crds/addresspool-crd.yaml
+kubectl apply -f deploy/helm/rivora/crds/
 ```
 
-And `helm uninstall` leaves both the CRD and any `AddressPool` objects in
-place — delete them explicitly if you want them gone:
+This matters most when upgrading from a release that predates a CRD. `rivorad` probes for the `ServicePolicy`
+and `BGPPeer` CRDs at start-up; if one is missing it logs that the feature is ignored and carries on serving
+Services (apply the CRD and restart the DaemonSet). A missing or older `AddressPool` schema surfaces as
+`rivora-controller` reconcile errors, not as a Helm failure.
+
+`helm uninstall` leaves the CRDs and every object of those kinds in place; delete them explicitly if you want
+them gone:
 
 ```sh
 kubectl delete addresspools.rivora.zyvor.dev --all
-kubectl delete -f deploy/helm/rivora/crds/addresspool-crd.yaml
+kubectl delete -f deploy/helm/rivora/crds/
 ```
 
-The OpenAPI description on `spec.addresses` documents IPv6 CIDRs/ranges
-and sparse `/64` allocation; keep that text in sync when changing IPAM.
+The OpenAPI description on `spec.addresses` documents IPv6 CIDRs/ranges and sparse `/64` allocation; keep that
+text in sync when changing IPAM. Field-by-field reference: the [CRD reference](../../../website/docs/kubernetes/crds.md).
 
 ## Evolving the schema
 
@@ -132,9 +136,9 @@ owns ARP/NDP for these addresses.
 Setting `gatewayApi.enabled=true` turns on a second control loop, on both
 `rivorad` and `rivora-controller`, that watches `Gateway`/`TCPRoute`/
 `UDPRoute` (the Gateway API's L4 "experimental channel" resources) instead
-of only `Service`. `HTTPRoute` is deliberately out of scope — Rivora's XDP
-dataplane has no L7 visibility, so it can't enforce HTTPRoute's path/header
-matching rules.
+of only `Service`. `HTTPRoute`, `GRPCRoute` and `TLSRoute` are deliberately out
+of scope: Rivora's XDP dataplane has no L7 visibility, so it cannot match
+paths, headers or SNI (use a `TCPRoute` for TLS passthrough).
 
 This chart does **not** bundle the Gateway API CRDs — like any other
 vendor's CRDs, install them yourself first:
@@ -202,12 +206,27 @@ helm upgrade rivora deploy/helm/rivora \
 | `bgp.peerResources` | Also read cluster-scoped `BGPPeer` resources (password from a Secret, multihop, graceful restart, node selector); default `true`. `bgp.peers` may then be empty. Apply `crds/bgppeer-crd.yaml` yourself on an upgrade |
 | `bgp.configSecret` | A Secret holding a `bgp:` section for what the values cannot say; replaces `asn`, `routerId`, `ipv6NextHop` and `peers` |
 
-Read the top-level README's [BGP/BFD HA](../../../README.md#bgpbfd-ha-v03)
+Read the top-level README's [BGP/BFD HA](../../../README.md#bgpbfd-ha)
 section before enabling this — it covers the health-gated
 advertise/withdraw model and a real caveat: in full-NAT mode (the
 **only** mode K8s-managed VIPs currently run in, per the note below), a
 router-side ECMP rehash can disrupt in-flight connections on a node that's
 rebalanced away from, since connection state isn't shared across nodes.
+
+## ServicePolicy
+
+`servicePolicy.enabled` (default `true`) makes `rivorad` honour `ServicePolicy` objects: per-Service health
+probe, per-source SYN rate limit, endpoint weights per node, and BGP communities and peers. It adds the RBAC
+to read them and passes `-service-policy=true`. Guide:
+[ServicePolicy](../../../website/docs/kubernetes/service-policy.md).
+
+## BGPPeer resources
+
+With `bgp.enabled`, `bgp.peerResources` (default `true`) also reads cluster-scoped `BGPPeer` objects: each adds
+a neighbour (TCP MD5 password from a Secret in the release namespace, multihop, graceful restart, a node
+selector) to the peers the node started with, with no restart. The chart grants `rivorad` read access to
+`bgppeers`, `get` on its Node, and `get` on Secrets **in the release namespace only**. With it on,
+`bgp.peers` may be empty. Guide: [BGP](../../../website/docs/operations/bgp.md#bgppeer-resources-kubernetes).
 
 ## Observability
 
@@ -229,16 +248,21 @@ add your own `PodMonitor` targeting port `9871` on both workloads — this
 chart doesn't bundle `monitoring.coreos.com` CRDs, the same policy it
 applies to the Gateway API CRDs above.
 
-## Values reference (IPv6-related)
+## Values reference (main values; the full list is in the [Helm chart docs](../../../website/docs/kubernetes/helm.md#values))
 
 | Path | Default | Notes |
 | --- | --- | --- |
 | `rivorad.interface` | `""` (required) | Host iface for XDP/TCX + speaker |
+| `rivorad.xdpMode` | `generic` | `generic`, `native` or `auto` |
 | `rivorad.speaker` | `true` | ARP+NDP Lease speaker |
+| `rivorad.apiKey` / `.apiReadOnlyKey` | `""` | API keys (admin, read-only); a comma-separated list rotates |
+| `servicePolicy.enabled` | `true` | Honour `ServicePolicy` objects |
 | `gatewayApi.enabled` | `false` | Service + Gateway control loops |
 | `gatewayClass.create` / `.name` | `false` / `rivora` | Optional GatewayClass |
 | `bgp.enabled` | `false` | Per-node BGP speaker |
 | `bgp.ipv6NextHop` | `""` | Required for IPv6 `/128` ads |
+| `bgp.configSecret` | `""` | Secret with a `bgp:` section for password, multihop, communities...; replaces `asn`/`routerId`/`ipv6NextHop`/`peers` |
+| `bgp.peerResources` | `true` | Also read `BGPPeer` resources |
 | `addressPools[]` | `[]` | Seeded `AddressPool` CRs; IPv6 `/64` OK |
 | `controller.podDisruptionBudget.enabled` / `.minAvailable` | `true` / `1` | Keeps a controller replica up during node drains |
 | `controller.networkPolicy.enabled` | `false` | Restrict ingress to the controller's metrics port |
@@ -251,8 +275,8 @@ Full defaults and comments: [`values.yaml`](values.yaml).
   match — both sides need to agree on which `Service` objects they manage.
   Leave both `""` to manage every `type: LoadBalancer` Service with no
   `spec.loadBalancerClass` set (the common single-LB-controller case).
-- K8s-managed VIPs are NAT-only in v0.2 — DSR isn't available through this
-  path yet.
+- K8s-managed VIPs are full-NAT only: DSR isn't available through this path
+  (it would need the VIP bound inside backend pods).
 - A node running this DaemonSet manages only K8s-sourced VIPs; the
   static-YAML `-config` path (see the top-level README) is a separate,
   non-Kubernetes deployment mode and isn't used here.

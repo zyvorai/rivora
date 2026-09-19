@@ -9,9 +9,11 @@ title: Gateway API
 Service/EndpointSlice: `GatewayClass`, `Gateway`, and L4 experimental
 `TCPRoute` / `UDPRoute`.
 
-:::warning HTTPRoute is out of scope
-Rivora's XDP dataplane has no L7 visibility. Claiming to enforce
-HTTPRoute path/header matching would be a correctness hazard.
+:::warning HTTPRoute, GRPCRoute and TLSRoute are out of scope
+Rivora's XDP dataplane forwards packets and has no L7 visibility: it cannot match HTTP paths, headers or
+methods (`HTTPRoute`, `GRPCRoute`) or read a TLS ClientHello for SNI routing (`TLSRoute`). Claiming to
+enforce those rules would be a correctness hazard, so they are not implemented. For TLS passthrough to a
+single backend set, use a `TCPRoute` on a `TCP` listener.
 :::
 
 ```sh
@@ -87,7 +89,12 @@ helm upgrade rivora deploy/helm/rivora \
 
 ## Verification status
 
-Reconciler startup, informer sync, and `GatewayClass` creation were confirmed on a live cluster earlier;
-full traffic-path scenarios were pending an unrelated cluster networking issue on the test host.
-The attachment, `ReferenceGrant` and status logic added since is covered by unit tests against fake
-clients (`internal/gatewayapi`), **not yet run against a real cluster**.
+Reconciler start-up, informer sync and `GatewayClass` creation were confirmed on a live cluster; the
+traffic-path scenarios (address assignment, real packets through a Gateway VIP, weighted split) were blocked
+by an unrelated networking problem on that cluster and **have not been run live**. The attachment,
+`ReferenceGrant` and status logic is covered by unit tests against fake clients (`internal/gatewayapi`), and
+the VIPs a Gateway produces go through the same dataplane the Service path and the selftests exercise. It has
+**not been run against a real cluster** since.
+
+On restart, a Gateway's VIPs are adopted like a Service's and pruned only after both reconcilers' first pass
+completes: see [Kubernetes overview](overview.md#restarts-and-upgrades).

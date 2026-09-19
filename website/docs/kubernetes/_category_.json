@@ -3,6 +3,6 @@
   "position": 3,
   "link": {
     "type": "generated-index",
-    "description": "Service LB, Gateway API, and Helm."
+    "description": "Service load balancing, IPAM, Gateway API, CRDs, ServicePolicy and Helm."
   }
 }

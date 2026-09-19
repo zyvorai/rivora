@@ -39,7 +39,14 @@ any of the following are especially welcome:
   configured BGP peer, or — if peering is misconfigured — the network
   path to it).
 - `internal/api`'s local HTTP API, particularly the bearer-token
-  comparison and TLS setup (see README.md#securing-the-api).
+  comparison, the read-only/admin role split, mutual-TLS client
+  certificate handling and TLS setup (see README.md#securing-the-api and
+  website/docs/operations/api.md).
+- `internal/bgppeers` and the chart's RBAC for it: a `BGPPeer` password is
+  read from a Secret in `rivorad`'s own namespace only, and the chart
+  grants read access to Secrets in that namespace and nowhere else.
+- The IPv6 extension-header walk and fragment tracking in
+  `bpf/xdp_ingress.c` / `bpf/tc_nat.c` (bounded, but attacker-facing).
 
 ## Known posture gaps
 
@@ -58,5 +65,6 @@ until an upstream fix exists:
   attribute (`github.com/osrg/gobgp/v4`). No fixed version is published
   upstream as of this writing. Impact is scoped to `internal/bgp`, which
   only processes messages from explicitly configured BGP peers
-  (`-bgp-peers`/`bgp.peers`) — not exposed to arbitrary network input.
+  (`-bgp-peers`/`bgp.peers`/`BGPPeer` resources) — not exposed to arbitrary
+  network input.
   Re-evaluate when gobgp ships a fix.

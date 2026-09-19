@@ -3,6 +3,6 @@
   "position": 4,
   "link": {
     "type": "generated-index",
-    "description": "BGP/BFD HA, selftests, and CI."
+    "description": "Configuration, commands, the API, metrics, BGP, the runbook, and CI."
   }
 }

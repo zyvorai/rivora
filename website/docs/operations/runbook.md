@@ -1,13 +1,13 @@
 ---
-sidebar_position: 3
+sidebar_position: 6
 title: Production runbook
 ---
 
 # Production runbook
 
-Operational procedures for a live `rivorad`/`rivora-controller` deployment
-— what to check first, and how to read the signals covered in
-[Observability](../kubernetes/helm.md#observability).
+Operational procedures for a live `rivorad`/`rivora-controller` deployment: what to check first, and how to
+read the signals. For the reference material see [Configuration](configuration.md),
+[Commands and flags](cli.md), [API and console](api.md), [Metrics and alerts](metrics.md) and [BGP](bgp.md).
 
 ## Health and metrics endpoints
 
@@ -20,11 +20,10 @@ auth — see [Helm chart: Observability](../kubernetes/helm.md#observability)):
 | `/readyz` | `rivorad` only: the BPF maps are readable. `rivora-controller`: always ready once started. |
 | `/metrics` | Prometheus text exposition. |
 
-`rivorad` additionally serves `/api/v1/status`, `/api/v1/vips`,
-`/api/v1/backends` on its main API port (`9870`, loopback-only) — see
-[Securing the API](https://github.com/zyvorai/rivora#securing-the-api).
-`rivoractl status` / `rivoractl vips` wrap the same data for human
-reading.
+`rivorad` additionally serves `/api/v1/status`, `/api/v1/vips` and `/api/v1/backends` on its main API port
+(`9870`, loopback by default): see [API and console](api.md). `rivoractl status` / `rivoractl vips` wrap the
+same data for human reading (`status` and `backends` answer only on a node with exactly one VIP; use `vips`
+otherwise).
 
 ## A VIP stopped responding
 
@@ -71,64 +70,30 @@ they were actually removed, a restart rebuilds them from the current
 config/K8s state (some in-flight NAT connection affinity is lost in that
 case, existing DSR flows are not since the backend owns the reply path).
 
-## API keys: read-only access, rotation, and probing
+## API keys, rotation and probing
 
-The API has two roles. `RIVORA_API_KEY` is the **admin** key (full access,
-including the mutating calls below); `RIVORA_API_READONLY_KEY` may read but gets a
-`403` on anything that changes state. Hand the read-only key to dashboards and to
-anyone who only needs to look, so a leaked screen-share can't drain a backend.
+The full reference (two roles, named keys and the audit trail, client certificates, TLS) is
+[API and console](api.md#securing-it). The procedures you will need on the day:
 
-**Rotating a key with no outage** (either variable accepts a comma-separated list):
-
-1. Generate the new key: `openssl rand -hex 24`.
-2. Set `RIVORA_API_KEY=<new>,<old>` (in `/etc/rivora/rivorad.env`, or the chart's
-   `rivorad.apiKey`, escaping the comma with `--set`) and restart `rivorad`. Both
-   keys now work.
-3. Move every client to `<new>`.
-4. Set `RIVORA_API_KEY=<new>` and restart. `<old>` now gets `401`.
-
-Rotate a read-only key the same way with `RIVORA_API_READONLY_KEY`.
-
-**Watching for probing.** A publicly bound API attracts scanners. Alert on
-`rate(rivora_api_auth_failures_total{reason="unauthenticated"}[5m])`; a steady
-rise means someone is guessing keys (`forbidden` means a read-only key was used to
-try to change something). Rejections are also logged, throttled to about one line
-per 10 seconds with a count of how many were swallowed, showing the source
-address and path but never a key. Behind a proxy the address is the proxy's.
-
-**Trusting the certificate.** With `RIVORA_TLS_CERT`/`RIVORA_TLS_KEY`, verify it
-rather than skipping verification: `rivoractl --ca-file cert.pem ...`. The
-auto-generated self-signed certificate changes on every start, so it can only be
-skipped with `--tls-insecure`.
-
-`rivorad` refuses to start, before touching the kernel, if the key settings are
-unsafe: a read-only key with no admin key, a key in both roles, or a setting with
-no usable key in it.
-
-**Who did it: named keys and an audit trail.** Write a key as `id:NAME=KEY`
-(`RIVORA_API_KEY=id:alice=...,id:bob=...`; NAME is letters, digits, `.`, `_` or `-`, up to 64) and
-every state-changing request (drain, undrain, weight) is logged as
-`api change user=alice role=admin method=POST path=... status=200 remote=...` and counted in
-`rivora_api_changes_total{user,code}`, whether it succeeded or not. A change refused because the caller's
-key or certificate is read-only is always logged, naming them (`reason=forbidden user=viewer`), and is
-never throttled. A key without `id:` is named by its position (`key-1`), and the audit line never contains
-a key. Reusing a name is refused at start-up.
-
-**Client certificates (mutual TLS).** Set `RIVORA_TLS_CLIENT_CA` to a PEM CA bundle (TLS must be on,
-via `RIVORA_TLS_CERT`/`RIVORA_TLS_KEY` or `RIVORA_TLS_SELF_SIGNED`) and a client certificate signed by
-it authenticates its holder with no key: the common name is the identity (`cert:ops` in the audit trail),
-common names listed in `RIVORA_API_CERT_ADMIN_CNS` (comma-separated) get the admin role, and any other
-verified certificate is read-only. By default a certificate is optional, so bearer keys keep working
-beside it; add `RIVORA_TLS_CLIENT_REQUIRED=1` to turn away every caller without one at the TLS
-handshake. With certificates on, authentication is on even if no key is set. Give `rivoractl` its own:
-`rivoractl --cert ops.pem --key ops.key --ca-file server.pem drain 3` (or `RIVORA_CLIENT_CERT`/
-`RIVORA_CLIENT_KEY`). A certificate is verified against the CA only; **revocation is not checked**, so keep
-them short-lived or rotate the CA. Per-user roles finer than admin/read-only are not implemented.
+- **Rotate a key with no outage:** set `RIVORA_API_KEY=<new>,<old>` (in `/etc/rivora/rivorad.env`, or the
+  chart's `rivorad.apiKey`, escaping the comma with `--set`), restart, move every client to `<new>`, then set
+  `RIVORA_API_KEY=<new>` and restart again. The read-only key rotates the same way. See
+  [Rotating a key](api.md#rotating-a-key-with-no-outage).
+- **Someone is guessing keys:** alert on `rate(rivora_api_auth_failures_total{reason="unauthenticated"}[5m])`.
+  Rejections are logged (throttled, source address and path, never a key). Behind a proxy the address is the
+  proxy's. Bind the API to loopback or put it behind a network policy.
+- **Who drained that backend?** Give each key a name (`id:alice=...`); every drain, undrain and weight change
+  is then logged as `api change user=alice ...` and counted in `rivora_api_changes_total{user,code}`.
+- **`rivorad` will not start and mentions its keys:** it refuses, before touching the kernel, a read-only key
+  with no admin key, a key in both roles, or a key setting with no usable key in it. Fix the environment; nothing
+  was attached.
 
 ## Draining a backend or shifting weight (live)
 
 Use these for maintenance and canary shifts without editing config or
-restarting `rivorad`. Backend IDs come from `rivoractl backends`.
+restarting `rivorad`. Backend IDs come from `rivoractl backends` on a node with one VIP, and from
+`rivoractl vips --format json` (each VIP lists its backends' IDs) on a node with several, such as a
+Kubernetes node.
 
 ```bash
 rivoractl backends                 # ID, address, weight, STATE, counters
@@ -400,9 +365,10 @@ vips:
 - **Editing only a VIP's `healthCheck` and reloading (SIGHUP) takes effect
   immediately**; the backend keeps its current health state until the new probe
   says otherwise. Removing `healthCheck` returns it to a TCP connect.
-- **Not covered yet:** `https` (there is no TLS probe), gRPC, and per-backend or
-  per-Service probe settings. VIPs created from Kubernetes Services or Gateways
-  have no probe setting and always use the TCP connect.
+- **Kubernetes:** a Service's probe comes from its [`ServicePolicy`](../kubernetes/service-policy.md)
+  (`spec.healthCheck`, the same fields as above). A Service without one, and every VIP a Gateway
+  produces, uses the TCP connect.
+- **Not covered yet:** `https` (there is no TLS probe), gRPC, and per-backend probe settings.
 
 To see it working, `rivora_backend_healthy` drops to `0` for a backend whose
 health endpoint fails while a plain TCP connect to its service port still
@@ -430,7 +396,7 @@ What a reload does **not** do:
 - **A file that fails validation is rejected whole.** The log says
   `config reload rejected; keeping the running config`, and nothing changes.
 - **Startup-only settings are ignored, with a warning.** `interface`,
-  `apiListen`, `healthCheck`, `rateLimit` and `bgp` are read once; if you changed
+  `xdpMode`, `tunnelSource`, `apiListen`, `healthCheck`, `rateLimit` and `bgp` are read once; if you changed
   any, the log says `NOT applied` and names them. Restart `rivorad` to apply.
 - **The first NAT VIP needs a restart.** The `tc_nat` egress program (which
   un-NATs replies) is only loaded at startup if some VIP uses `mode: nat`. A
@@ -449,7 +415,7 @@ backend. `rivora_vip_dropped_packets_total{vip,reason}` counts real drops:
 
 | `reason` | What it means | First thing to check |
 | --- | --- | --- |
-| `rate_limited` | A SYN exceeded the per-source `rateLimit`. | Is it an attack, or is the limit set too low for legitimate clients? Compare with the source addresses in your flow logs. |
+| `rate_limited` | A SYN exceeded the per-source limit: the VIP's own `rateLimit` (or its Service's `ServicePolicy`), else the node-wide one. | Is it an attack, or is the limit set too low for legitimate clients? Compare with the source addresses in your flow logs. |
 | `no_healthy_backend` | The VIP matched but every backend in its Maglev probe window is down or draining, so there was nowhere to send it. | `rivora_backend_healthy` for that VIP; the backends themselves, not `rivorad`. |
 
 `rivora_vip_unserved_packets_total{vip}` is deliberately **not** a drop. It counts
@@ -606,13 +572,31 @@ current holder and its renew time, and check that replica's logs for
 Kubernetes API errors (RBAC, API server unavailability) rather than
 assuming a code-level bug.
 
+## Log lines and what they mean
+
+`rivorad` logs structured lines (`-log-format json` for machines). The ones that ask you to do something:
+
+| Message | Meaning and action |
+| --- | --- |
+| `config reload rejected; keeping the running config` | The edited file failed validation. Nothing changed. Run `rivoractl validate FILE`. |
+| `... NOT applied` (names settings) | A reload saw a start-up-only setting change. Restart `rivorad` to apply it. |
+| `config reload partly applied` | One VIP could not be applied (for example the Maglev table is full); the rest were. The next reload retries. |
+| `recovered existing datapath state from the pinned maps` | Normal on restart: adoption found VIPs already programmed. |
+| `removed VIPs left programmed by a previous config ...` | Static mode: VIPs the new config no longer lists were torn down at start-up. |
+| `removed VIPs left programmed by an earlier run that no Service or Gateway wants any more` | Kubernetes mode: pruned after the first reconcile pass. |
+| `not removing the VIPs recovered at start-up that nothing has claimed` | A Service kept failing to reconcile, so nothing was pruned. Fix that Service (see the `reconcile` errors above it) and restart. |
+| `ServicePolicy is disabled: the CRD is not installed` | Apply `crds/servicepolicy-crd.yaml` and restart `rivorad`. Services run without policies meanwhile. |
+| `BGPPeer resources are ignored: the CRD is not installed` | Apply `crds/bgppeer-crd.yaml` and restart. |
+| `BGPPeer is not applied` (with `name`, `err`) | That resource is invalid, duplicates an address, or its password Secret cannot be read. Logged once per change. |
+| `externalTrafficPolicy: Local is being treated as Cluster for this Service` | Local is not honoured on this node; the message says why (see [Service semantics](#kubernetes-service-semantics-session-affinity-and-externaltrafficpolicy)). |
+| `api change user=... ` | The audit trail of a drain, undrain or weight change. |
+| `persisted links from an earlier run are still attached ...` | `-persist-datapath` left links this config no longer manages. `rivorad -detach` removes them. |
+| `some BGP peers could not be applied` | See the error: a peer failed to start (bad password file, port). The others are unaffected. |
+
 ## CRD schema changes
 
-`helm upgrade`/`helm uninstall` never touch the `AddressPool` CRD once
-installed — see [CRD lifecycle](../kubernetes/helm.md#crd-lifecycle).
-Before upgrading to a chart version whose CRD schema changed, diff
-`deploy/helm/rivora/crds/addresspool-crd.yaml` against what's installed
-(`kubectl get crd addresspools.rivora.zyvor.dev -o yaml`) and
-`kubectl apply` the new version yourself first — a chart upgrade that
-assumes a newer schema than what's installed will surface as `rivora-controller`
-reconcile errors reading `AddressPool` objects, not as a Helm failure.
+`helm upgrade`, `rivora upgrade` and uninstall never touch the CRDs once installed: see
+[CRD lifecycle](../kubernetes/helm.md#crd-lifecycle). Before upgrading to a chart version whose CRDs changed,
+`kubectl apply -f deploy/helm/rivora/crds/` yourself first. A newer chart against an older `AddressPool`
+schema shows up as `rivora-controller` reconcile errors reading `AddressPool` objects, not as a Helm failure;
+a missing `ServicePolicy` or `BGPPeer` CRD shows up as the log lines above.

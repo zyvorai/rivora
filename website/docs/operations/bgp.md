@@ -1,21 +1,51 @@
 ---
-sidebar_position: 1
+sidebar_position: 5
 title: BGP/BFD HA
 ---
 
 # BGP/BFD HA
 
-Opt-in **active/active ECMP** HA on `rivorad`. Every node with BGP enabled
-independently advertises a host route for each VIP with at least one
-healthy backend — and withdraws when that stops being true.
+Opt-in **active/active ECMP** HA on `rivorad`. Every node with BGP enabled **independently** advertises a
+host route for each VIP it currently has at least one healthy backend for, and withdraws it the moment that
+stops being true. Upstream routers then spread traffic across every node advertising the VIP (ECMP), and a
+node whose backends all die simply stops attracting traffic. There is no leader election: multiple nodes
+advertising the same VIP at once is the point.
 
 | Family | Prefix | Next-hop source |
 | --- | --- | --- |
 | IPv4 | `/32` | `bgp.routerId` / `-bgp-router-id` |
-| IPv6 | `/128` | `bgp.ipv6NextHop` / `-bgp-ipv6-next-hop` (**required** for IPv6 ads) |
+| IPv6 | `/128` | `bgp.ipv6NextHop` / `-bgp-ipv6-next-hop` (**required** for IPv6 ads; without it IPv4 still works and IPv6 VIPs are skipped with an error) |
 
-Sessions negotiate **both** unicast AFI/SAFIs. BFD is per-peer.
-`rivora-controller` is not involved.
+Sessions negotiate **both** unicast families, so one peer carries IPv4 and IPv6 VIPs together. BFD is
+per-peer and, when enabled, gives sub-second peer-down detection that feeds the same withdraw path.
+`rivora-controller` is not involved: BGP needs no cluster-wide coordination.
+
+## BGP or the L2 speaker?
+
+Both announce a VIP; pick one per deployment.
+
+| | L2 speaker (ARP + NDP) | BGP |
+| --- | --- | --- |
+| Where VIPs must live | On the nodes' own L2 segment | Anywhere your routers can route to |
+| Which node carries a VIP | **One** elected node at a time (a Lease) | **Every** node with a healthy backend (ECMP) |
+| Failover | Lease handover, then a gratuitous ARP / NA | Route withdrawal (sub-second with BFD) |
+| Needs | Nothing on the network | A BGP-speaking router or top-of-rack switch |
+| `externalTrafficPolicy: Local` | Not honoured | Honoured (with `rivorad.speaker: false`) |
+
+## On the router side
+
+Accept `/32` (and `/128`) routes from the nodes and enable ECMP so it uses more than one next hop. The
+nodes' next hop is their `routerId` (IPv4) or `ipv6NextHop`, so those must be reachable from the router.
+Configure BFD on the router too if a peer has `bfd: true`. Use `multihop` when the router is more than one hop
+from the node, and TCP MD5 (`password`) if the session crosses a network you do not control.
+
+## Full-NAT and ECMP
+
+A full-NAT flow's state lives on the node that first received it. If the router re-hashes (a peer flaps, a node
+joins or leaves the ECMP set), an in-flight NAT'd connection can land on a node with no state for it and reset.
+DSR has no such problem, since the load balancer is only ever on the forward path; that makes it the better fit
+for BGP where you can use it. This is the same trade-off other BGP-mode load balancers document, and inherent
+to stateful NAT with ECMP.
 
 ## Flags / Helm
 
@@ -51,7 +81,7 @@ Each entry under `bgp.peers` accepts more than an address and an AS
 | `multihop` | TTL (2-255) for an **eBGP** peer that is not directly connected. Without it an eBGP session does not cross a router (the default TTL is too small). Refused on an iBGP peer. |
 | `gracefulRestart` | `{enabled, restartTime}`: negotiates graceful restart (RFC 4724, default 120 s) so the peer keeps this node's routes for `restartTime` seconds if the session drops, rather than withdrawing them at once. |
 | `nodes` | Node names this peer applies to. Unset means every node, so one shared config can give each rack its own router. Needs `-node-name` (the chart sets it) or the hostname. |
-| `bfd` | as before |
+| `bfd` | Bidirectional Forwarding Detection on the session, for sub-second peer-down detection. The router must enable it too. |
 
 ## Route attributes and aggregation
 
@@ -147,12 +177,6 @@ until it can.
 MD5 for BFD, GTSM, and BGP-level local-pref/MED per VIP or per peer. A `BGPPeer` has no status
 (session state is in the `rivora_bgp_*` metrics and `rivoractl`), since every node would be writing to
 the same object.
-
-## Full-NAT / ECMP caveat
-
-K8s VIPs are NAT-only. Connection state lives on the node that first
-received the flow. ECMP rehash can disrupt in-flight NAT'd connections —
-same tradeoff MetalLB documents. DSR (static YAML) avoids this.
 
 ## Verification
 

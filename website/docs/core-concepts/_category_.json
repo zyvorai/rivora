@@ -3,6 +3,6 @@
   "position": 2,
   "link": {
     "type": "generated-index",
-    "description": "Dataplane architecture and IPv6."
+    "description": "Architecture, forwarding modes, IPv6, and limitations."
   }
 }
