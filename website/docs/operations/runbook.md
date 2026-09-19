@@ -253,9 +253,22 @@ below stated plainly. `scripts/selftest-edgecases.sh` exercises all of it.
   ICMP quoting a connection that does not exist is **not** steered. IPv6 "packet too big" and
   the other ICMPv6 errors are handled the same way. Echo (ping) to a VIP is untouched. Only
   TCP and UDP flows are matched, and only where the quoted header has no IP options.
-- **Not handled:** IPv6 extension headers (hop-by-hop, routing, destination options) and IPv6
-  fragments. A packet whose IPv6 next header is not TCP or UDP is passed through untouched,
-  as before.
+- **IPv6 extension headers.** Hop-by-Hop and Destination Options headers (up to four headers,
+  248 bytes in all) are stepped over to reach the TCP/UDP header, in full-NAT and DSR, and stay
+  in the packet. **Not handled, and passed through untouched:** a Routing header (it changes what
+  the checksum's destination is), AH and ESP (ESP hides the ports), and any longer chain. ICMPv6
+  errors are steered only when the ICMPv6 header directly follows the IPv6 header, and only for a
+  flow whose quoted packet has none, so path-MTU discovery for a flow that carries extension
+  headers is not steered.
+- **IPv6 fragments.** Handled like IPv4's: the first fragment carries the ports, is balanced
+  normally, and its backend is remembered (keyed by source, destination, the Fragment header's
+  identification and protocol; LRU); later fragments follow it. In full-NAT the backend's
+  fragmented replies are un-NATed on the way out the same way. The same limit applies: a later
+  fragment that arrives *before* its first fragment is not steered, so that datagram is lost.
+  `scripts/selftest-ipv6-ext.sh` runs 4000-byte datagrams (three fragments each way) and
+  extension-header TCP through NAT and DSR; the L3 DSR modes handle these packets by the same code
+  but are **not** covered by that selftest, and an IPv6 fragment that grows past the path MTU under
+  a tunnel is answered with a "packet too big" like any other packet.
 
 ## L3 DSR (IP-in-IP and GRE)
 

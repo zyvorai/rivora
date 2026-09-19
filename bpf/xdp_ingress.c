@@ -194,6 +194,14 @@ struct {
     __type(value, struct frag_val);
 } frag_map SEC(".maps");
 
+/* IPv6 fragment steering (see struct frag_key6). */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct frag_key6);
+    __type(value, struct frag_val);
+} frag_map6 SEC(".maps");
+
 /* Port-range VIPs (see struct vip_range_key). BPF_F_NO_PREALLOC is mandatory for an LPM
  * trie. Room for MaxVIPs ranges of a few blocks each. */
 struct {
@@ -1132,6 +1140,44 @@ static __always_inline int handle_v6_icmp(struct xdp_md *ctx, void *data, void *
  * backend_health_map, stats_map, iface_mac_map, rl_config_map,
  * pick_backend()) as-is — only the address-keyed maps and a few checksum
  * details differ from v4, noted inline below. */
+/* A later IPv6 fragment (offset > 0) has no L4 header, so like its IPv4 counterpart it follows the
+ * backend its datagram's first fragment was given. Full-NAT changes only the destination address:
+ * IPv6 has no header checksum, and the L4 checksum lives in the first fragment. */
+static __always_inline int handle_v6_later_fragment(struct xdp_md *ctx, void *data, void *data_end,
+                                                    struct ethhdr *eth, struct ipv6hdr *iph,
+                                                    const struct rivora_v6_l4 *w)
+{
+    struct frag_key6 fk = {.id = w->id, .proto = w->proto};
+    __builtin_memcpy(fk.saddr, &iph->saddr, 16);
+    __builtin_memcpy(fk.daddr, &iph->daddr, 16);
+    struct frag_val *fv = bpf_map_lookup_elem(&frag_map6, &fk);
+    if (!fv)
+        return XDP_PASS; /* not ours, or its first fragment hasn't been seen */
+
+    __u32 backend_id = fv->backend_id;
+    struct service_config *cfg = bpf_map_lookup_elem(&service_config_map, &fv->service_id);
+    if (!cfg)
+        return XDP_PASS;
+    __u8 *healthy = bpf_map_lookup_elem(&backend_health_map, &backend_id);
+    if (!healthy || !*healthy) {
+        bump_stats(RIVORA_STATS_GLOBAL, 0, 1);
+        return XDP_DROP; /* the first fragment went to a backend that has since died */
+    }
+    struct backend_info6 *be = bpf_map_lookup_elem(&backend_map6, &backend_id);
+    if (!be)
+        return XDP_PASS;
+
+    __u32 pkt_len = (__u32)(data_end - data);
+    bump_stats(RIVORA_STATS_GLOBAL, pkt_len, 0);
+    bump_stats(1 + backend_id, pkt_len, 0);
+
+    if (cfg->mode != RIVORA_MODE_NAT)
+        return forward_v6(ctx, eth, iph, cfg->mode, be);
+
+    __builtin_memcpy(&iph->daddr, be->addr, 16);
+    return XDP_PASS;
+}
+
 static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *data_end, struct ethhdr *eth,
                                        struct ipv6hdr *iph)
 {
@@ -1139,18 +1185,24 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
         return XDP_PASS;
     if (iph->nexthdr == IPPROTO_ICMPV6_)
         return handle_v6_icmp(ctx, data, data_end, eth, iph);
-    /* v0.3: no extension headers, mirroring handle_ipv4's "no IP options"
-     * scope limitation — nexthdr must be TCP/UDP directly. A packet with a
-     * Hop-by-Hop/Routing/Fragment/etc. extension header before the L4
-     * header is passed through unmodified rather than walked. */
-    if (iph->nexthdr != IPPROTO_TCP_ && iph->nexthdr != IPPROTO_UDP_)
+
+    /* Step over Hop-by-Hop, Destination Options and Fragment headers to the L4 header. A chain the
+     * walk does not cover (Routing, AH, ESP, too long) is passed through unmodified. */
+    struct rivora_v6_l4 w;
+    if (rivora_v6_walk(iph, data_end, &w) < 0)
         return XDP_PASS;
+    const __u8 proto = w.proto;
+    if (proto != IPPROTO_TCP_ && proto != IPPROTO_UDP_)
+        return XDP_PASS;
+    if (w.is_frag && w.frag_off != 0)
+        return handle_v6_later_fragment(ctx, data, data_end, eth, iph, &w);
+    const __u8 first_fragment = w.is_frag && w.more;
 
     __u16 sport, dport;
     __u8 is_syn = 0;
-    void *l4 = (void *)(iph + 1);
+    void *l4 = (void *)(iph + 1) + (w.off & 0xff);
 
-    if (iph->nexthdr == IPPROTO_TCP_) {
+    if (proto == IPPROTO_TCP_) {
         struct tcphdr *tcph = l4;
         if ((void *)(tcph + 1) > data_end)
             return XDP_PASS;
@@ -1165,7 +1217,7 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
         dport = udph->dest;
     }
 
-    __u32 *service_id = v6_service((__u8 *)&iph->daddr, dport, iph->nexthdr);
+    __u32 *service_id = v6_service((__u8 *)&iph->daddr, dport, proto);
     if (!service_id)
         return XDP_PASS; /* not a VIP we own */
     __u32 sid = *service_id;
@@ -1182,7 +1234,7 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
         return XDP_PASS;
     }
 
-    struct conn_key6 ck = {.sport = sport, .dport = dport, .proto = iph->nexthdr};
+    struct conn_key6 ck = {.sport = sport, .dport = dport, .proto = proto};
     __builtin_memcpy(ck.saddr, &iph->saddr, 16);
     __builtin_memcpy(ck.daddr, &iph->daddr, 16);
 
@@ -1200,7 +1252,7 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
     if (!use_affinity) {
         __u32 hash = cfg->affinity == RIVORA_AFFINITY_CLIENT_IP
                          ? rivora_hash_src_v6((__u8 *)&iph->saddr)
-                         : rivora_hash5_v6((__u8 *)&iph->saddr, (__u8 *)&iph->daddr, sport, dport, iph->nexthdr);
+                         : rivora_hash5_v6((__u8 *)&iph->saddr, (__u8 *)&iph->daddr, sport, dport, proto);
         __u32 local_slot = hash % cfg->maglev_size;
         if (pick_backend(cfg->maglev_offset, cfg->maglev_size, local_slot, &backend_id) < 0) {
             bump_stats(RIVORA_STATS_GLOBAL, 0, 1);
@@ -1219,6 +1271,16 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
     __u32 pkt_len = (__u32)(data_end - data);
     bump_stats(RIVORA_STATS_GLOBAL, pkt_len, 0);
     bump_stats(1 + backend_id, pkt_len, 0);
+
+    /* The first fragment of a fragmented datagram: remember its backend, keyed by the ORIGINAL
+     * addresses (before any NAT rewrite), so the later fragments follow it. */
+    if (first_fragment) {
+        struct frag_key6 fk = {.id = w.id, .proto = proto};
+        __builtin_memcpy(fk.saddr, &iph->saddr, 16);
+        __builtin_memcpy(fk.daddr, &iph->daddr, 16);
+        struct frag_val fv = {.backend_id = backend_id, .service_id = sid};
+        bpf_map_update_elem(&frag_map6, &fk, &fv, BPF_ANY);
+    }
 
     if (cfg->mode != RIVORA_MODE_NAT) {
         /* DSR / L3 DSR: the VIP stays the destination IP — the backend must have the VIP
@@ -1246,9 +1308,9 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
     __builtin_memcpy(new_daddr, be->addr, 16);
     __u16 old_dport = dport;
     __u16 new_dport = (cfg->flags & RIVORA_SVC_RANGE) ? dport : be->port;
-    void *l4b = (void *)(iph + 1);
+    void *l4b = (void *)(iph + 1) + (w.off & 0xff);
 
-    if (iph->nexthdr == IPPROTO_TCP_) {
+    if (proto == IPPROTO_TCP_) {
         struct tcphdr *t = l4b;
         if ((void *)(t + 1) > data_end)
             return XDP_PASS;
@@ -1265,7 +1327,7 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
     }
     __builtin_memcpy(&iph->daddr, new_daddr, 16);
 
-    struct nat_reverse_key6 rk = {.backend_port = new_dport, .client_port = sport, .proto = iph->nexthdr};
+    struct nat_reverse_key6 rk = {.backend_port = new_dport, .client_port = sport, .proto = proto};
     __builtin_memcpy(rk.backend_addr, be->addr, 16);
     __builtin_memcpy(rk.client_addr, &iph->saddr, 16); /* saddr untouched by dest-NAT */
     struct nat_reverse_val6 rv = {.vip_port = old_dport};
