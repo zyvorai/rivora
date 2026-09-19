@@ -158,7 +158,13 @@ def serve(port):
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((addr, port)); s.listen(64)
     while True:
-        c, _ = s.accept(); c.sendall(("%s:%d\n" % (ident, port)).encode()); c.close()
+        c, _ = s.accept()
+        try:
+            c.sendall(("%s:%d\n" % (ident, port)).encode())
+        except OSError:
+            pass  # a health probe that hangs up early must not stop this port being served
+        finally:
+            c.close()
 for p in ports:
     threading.Thread(target=serve, args=(p,), daemon=True).start()
 threading.Event().wait()
@@ -171,7 +177,11 @@ def serve(port):
     s = socket.socket(fam, socket.SOCK_DGRAM)
     s.bind((addr, port))
     while True:
-        _, peer = s.recvfrom(64); s.sendto(("%s:%d" % (ident, port)).encode(), peer)
+        _, peer = s.recvfrom(64)
+        try:
+            s.sendto(("%s:%d" % (ident, port)).encode(), peer)
+        except OSError:
+            pass
 for p in ports:
     threading.Thread(target=serve, args=(p,), daemon=True).start()
 threading.Event().wait()
@@ -249,7 +259,7 @@ vip_entry() {
     R6) echo "  - {address: 'fd00:82::100', portRange: '9100-9109', protocol: tcp, mode: nat, healthCheck: {port: 9199}, backends: [{address: 'fd00:82::11'}]}" ;;
     E6) echo "  - {address: 'fd00:82::100', port: 9105, protocol: tcp, mode: nat, backends: [{address: 'fd00:82::12', port: 9105}]}" ;;
     U6) echo "  - {address: 'fd00:82::101', portRange: '9200-9203', protocol: udp, mode: nat, healthCheck: {port: 9199}, backends: [{address: 'fd00:82::11'}]}" ;;
-    D4) echo "  - {address: ${DSR_VIP}, portRange: '9300-9302', protocol: tcp, mode: dsr, healthCheck: {port: 9300}, backends: [{address: 10.82.0.11, mac: '${BE_MAC}'}]}" ;;
+    D4) echo "  - {address: ${DSR_VIP}, portRange: '9300-9302', protocol: tcp, mode: dsr, healthCheck: {port: 9199}, backends: [{address: 10.82.0.11, mac: '${BE_MAC}'}]}" ;;
     esac
 }
 write_config() {
@@ -315,10 +325,15 @@ sys.exit(0 if len(v) == 1 and v[0]['vipPort'] == 9100 and v[0]['vipPortEnd'] == 
 else
     fail "the API does not describe the range VIP: $json"
 fi
-if ip netns exec "$NS_LB" curl -sf "http://127.0.0.1:9871/metrics" | grep -q 'vip="10.82.0.100:9100-9109"'; then
+metric_ok=0
+for _ in $(seq 1 10); do
+    if ip netns exec "$NS_LB" curl -sf "http://127.0.0.1:9871/metrics" 2>/dev/null | grep -q 'vip="10.82.0.100:9100-9109"'; then metric_ok=1; break; fi
+    sleep 0.5
+done
+if [ "$metric_ok" = 1 ]; then
     pass "metrics label the range VIP 10.82.0.100:9100-9109"
 else
-    fail "no metric labelled 10.82.0.100:9100-9109"
+    fail "no metric labelled 10.82.0.100:9100-9109 (metrics said: $(ip netns exec "$NS_LB" curl -s "http://127.0.0.1:9871/metrics" 2>&1 | grep -m3 'rivora_vip_packets' | tr '\n' ' '))"
 fi
 
 # ---------------------------------------------------------------------------

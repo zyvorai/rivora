@@ -612,7 +612,37 @@ func (c Config) Validate() error {
 			}
 		}
 	}
+	if err := c.checkSharedBackendMACs(); err != nil {
+		return err
+	}
 	return c.checkSharedBackendProbes()
+}
+
+// checkSharedBackendMACs rejects two VIPs that give the same backend address and port
+// different MACs. A backend has one MAC in the datapath, shared by every VIP that uses it,
+// so they cannot both be honoured. A VIP that gives none (full-NAT) never conflicts: it
+// simply shares the MAC the DSR VIP supplied.
+func (c Config) checkSharedBackendMACs() error {
+	type use struct{ vip, mac string }
+	first := map[string]use{}
+	for _, v := range c.VIPs {
+		vipName := fmt.Sprintf("%s:%s/%s", v.Address, v.PortLabel(), v.Protocol)
+		for _, b := range v.Backends {
+			if b.MAC == "" {
+				continue
+			}
+			hw, err := net.ParseMAC(b.MAC)
+			if err != nil {
+				continue // reported by the per-backend checks
+			}
+			key := fmt.Sprintf("%s:%d", b.Address, b.Port)
+			if prev, seen := first[key]; seen && prev.mac != hw.String() {
+				return fmt.Errorf("backend %s has mac %s in vip %s but %s in vip %s; a backend has one MAC", key, prev.mac, prev.vip, hw.String(), vipName)
+			}
+			first[key] = use{vipName, hw.String()}
+		}
+	}
+	return nil
 }
 
 // checkSharedBackendProbes rejects two VIPs that list the same backend address

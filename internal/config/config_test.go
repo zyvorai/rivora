@@ -590,3 +590,22 @@ func TestVIPContainsAndLabel(t *testing.T) {
 		t.Errorf("single-port VIP: %+v label %q", s, s.PortLabel())
 	}
 }
+
+func TestSharedBackendMACsMustAgree(t *testing.T) {
+	mk := func(macA, macB string) Config {
+		be := func(mac string) []Backend { return []Backend{{Address: "10.0.0.11", Port: 80, MAC: mac}} }
+		return Config{Interface: "eth0", VIPs: []VIP{
+			{Address: "10.0.0.100", Port: 80, Protocol: ProtoTCP, Mode: ModeDSR, Backends: be(macA)},
+			{Address: "10.0.0.101", Port: 80, Protocol: ProtoTCP, Mode: ModeNAT, Backends: be(macB)},
+		}}
+	}
+	if err := mk("aa:bb:cc:dd:ee:01", "").Validate(); err != nil {
+		t.Errorf("a NAT VIP sharing a DSR VIP's backend without naming a MAC must be fine: %v", err)
+	}
+	if err := mk("aa:bb:cc:dd:ee:01", "AA:BB:CC:DD:EE:01").Validate(); err != nil {
+		t.Errorf("the same MAC written two ways must agree: %v", err)
+	}
+	if err := mk("aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02").Validate(); err == nil || !strings.Contains(err.Error(), "one MAC") {
+		t.Errorf("two different MACs for one backend must be rejected, got %v", err)
+	}
+}

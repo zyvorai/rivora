@@ -123,6 +123,11 @@ type backendState struct {
 	// VIP that lists it. A backend shared by several VIPs is probed once, and
 	// config validation guarantees those VIPs agree, so any of them will do.
 	probe config.ProbeSpec
+	// mac is the backend's MAC as last given by a VIP that names one (DSR). A backend
+	// shared with a VIP that names none (full-NAT) must keep it: writing that VIP's empty
+	// MAC over it would leave the DSR VIP forwarding to 00:00:00:00:00:00.
+	mac    [6]byte
+	hasMAC bool
 	// adminDraining is an operator's drain (rivoractl drain). Tracked apart
 	// from draining so a reconciler clearing its own terminating state can't
 	// silently undo an operator's drain, and vice versa.
@@ -640,12 +645,18 @@ func (d *Dataplane) writeBackendInfoLocked(id uint32, b config.Backend) error {
 		return fmt.Errorf("backend %s: invalid address", b.Address)
 	}
 	var mac [6]byte
+	st := d.backendStates[id]
 	if b.MAC != "" {
 		hw, err := net.ParseMAC(b.MAC)
 		if err != nil {
 			return fmt.Errorf("backend %s: %w", b.Address, err)
 		}
 		copy(mac[:], hw)
+		if st != nil {
+			st.mac, st.hasMAC = mac, true
+		}
+	} else if st != nil && st.hasMAC {
+		mac = st.mac
 	}
 	if ip4 := ip.To4(); ip4 != nil {
 		bi := bpfmaps.BackendInfo{Addr: ip4ToBE32(ip4), Port: htons(b.Port), Mac: mac}
