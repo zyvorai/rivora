@@ -229,15 +229,30 @@ for _ in $(seq 1 20); do
     [ "$(metrics | grep '^rivora_backend_healthy' | head -1 | awk '{print $NF}')" = "1" ] && break
 done
 sleep 1.3
-lb 'exec:bpftool map delete pinned /sys/fs/bpf/rivora-lb/backend_map key hex 00 00 00 00'
-DEL_OUT=$(cat "${WORK}/exec-${CMDN}.out" 2>/dev/null)
-# The whole scenario rests on that delete having worked. If it hadn't, "unserved"
-# would stay 0 and the check below would read as a product bug when it is not; so
-# prove the precondition first, and report it as such.
-lb 'exec:bpftool map lookup pinned /sys/fs/bpf/rivora-lb/backend_map key hex 00 00 00 00'
-LOOK_OUT=$(cat "${WORK}/exec-${CMDN}.out" 2>/dev/null)
+# Find the backend's real ID from the API rather than assuming it is 0: deleting a key
+# that never existed also "succeeds" and also looks absent afterwards, which would make
+# the precondition below pass vacuously.
+# lbx runs a command in the LB namespace and leaves its output in LBX_OUT. It must be
+# called directly, NOT inside $(...): lb bumps the command counter, and in a subshell
+# that increment is lost, so the next command would reuse an already-acknowledged
+# number and silently return stale output.
+LBX_OUT=""
+lbx() { lb "exec:$1"; LBX_OUT=$(cat "${WORK}/exec-${CMDN}.out" 2>/dev/null); }
+BID=$(ip netns exec "$NS_LB" curl -s --max-time 3 http://127.0.0.1:9870/api/v1/backends | python3 -c 'import sys,json; b=json.load(sys.stdin); print(b[0]["id"] if b else "")' 2>/dev/null)
+[ -n "$BID" ] || { fail "could not read the backend id from the API"; BID=0; }
+KEYHEX=$(printf '%02x %02x %02x %02x' $((BID & 255)) $(((BID >> 8) & 255)) $(((BID >> 16) & 255)) $(((BID >> 24) & 255)))
+lbx "bpftool map lookup pinned /sys/fs/bpf/rivora-lb/backend_map key hex ${KEYHEX}"; BEFORE_OUT="$LBX_OUT"
+if echo "$BEFORE_OUT" | grep -qiE 'not found|no such|ENOENT|error'; then
+    fail "precondition: backend id ${BID} is not in backend_map to begin with: '${BEFORE_OUT}'"
+else
+    pass "precondition: backend id ${BID} is present in backend_map before the delete"
+fi
+lbx "bpftool map delete pinned /sys/fs/bpf/rivora-lb/backend_map key hex ${KEYHEX}"; DEL_OUT="$LBX_OUT"
+# The scenario rests on that delete having worked; prove it, and report it as a
+# precondition failure (not a product bug) if it didn't.
+lbx "bpftool map lookup pinned /sys/fs/bpf/rivora-lb/backend_map key hex ${KEYHEX}"; LOOK_OUT="$LBX_OUT"
 if echo "$LOOK_OUT" | grep -qiE 'not found|no such|ENOENT|error'; then
-    pass "precondition: the backend's map entry is really gone"
+    pass "precondition: backend id ${BID}'s map entry is really gone"
 else
     fail "precondition: the backend_map entry still exists after the delete (delete said: '${DEL_OUT}'; lookup said: '${LOOK_OUT}')"
 fi
@@ -246,8 +261,11 @@ for _ in 1 2 3; do probe "$VIP1" 0.3 >/dev/null; sleep 1.3; done
 UN=$(D_UN "$VIP1")
 check_ge "unserved counted the packets that bypassed the load balancer" "$((UN - UN0))" 1
 if [ "$((UN - UN0))" -lt 1 ]; then
-    echo "    diagnostics: bpftool $(bpftool version 2>&1 | head -1); kernel $(uname -r); cpus $(nproc)"
-    echo "    diagnostics: $(metrics | grep -E '^rivora_(vip_unserved|vip_dropped|backend_healthy)' | tr '\n' ' ')"
+    echo "    diagnostics: $(bpftool version 2>&1 | grep -v WARNING | head -1); kernel $(uname -r); cpus $(nproc); backend id ${BID}"
+    echo "    diagnostics: unserved before=${UN0} after=${UN}; vip metrics: $(metrics | grep -E '^rivora_vip_(unserved|dropped)' | grep "$VIP1" | sed -E 's/rivora_vip_//; s/\{[^}]*(reason="[a-z_]+")?[^}]*\}/ /' | tr '\n' ' ')"
+    lbx 'bpftool map dump pinned /sys/fs/bpf/rivora-lb/backend_map';  echo "    diagnostics: backend_map after delete:      $(echo "$LBX_OUT" | tr '\n' ' ' | cut -c1-200)"
+    lbx 'bpftool map lookup pinned /sys/fs/bpf/rivora-lb/service_config_map key hex 00 00 00 00'; echo "    diagnostics: service_config_map[0]:         $(echo "$LBX_OUT" | tr '\n' ' ' | cut -c1-200)"
+    lbx 'bpftool map lookup pinned /sys/fs/bpf/rivora-lb/drop_stats_map key hex 00 00 00 00'; echo "    diagnostics: drop_stats_map[0] (per CPU):   $(echo "$LBX_OUT" | tr '\n' ' ' | cut -c1-240)"
 fi
 
 section "4. invariant: per-reason drops == node-wide drops; unserved excluded"
