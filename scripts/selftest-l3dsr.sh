@@ -239,6 +239,28 @@ run_checks() {   # run_checks <expected v4 outer source> <expected v6 outer sour
     expect "IPv6 GRE over IPv6" fd00:87::104 100 "gre6:100"
     expect "IPv6 GRE over IPv6" fd00:87::104 1300 "gre6:1300"
 
+    # Each mode must use its OWN encapsulation on the wire: the backend accepts both IP-in-IP and GRE,
+    # so a VIP encapsulated the wrong way would still be answered.
+    local gre4 gre6 ipip4
+    in_ns "$NS_BE" timeout -s INT 4 tcpdump -nn -i ldr-be -c 1 'ip proto 47' >"${WORK}/gre4.txt" 2>&1 &
+    local q1=$!
+    in_ns "$NS_BE" timeout -s INT 4 tcpdump -nn -i ldr-be -c 1 'ip6 proto 47' >"${WORK}/gre6.txt" 2>&1 &
+    local q2=$!
+    in_ns "$NS_BE" timeout -s INT 4 tcpdump -nn -i ldr-be -c 1 'ip proto 4 and dst 10.88.0.11' >"${WORK}/ipip4.txt" 2>&1 &
+    local q3=$!
+    sleep 1; request 10.87.0.104 100 >/dev/null; request fd00:87::104 100 >/dev/null
+    wait "$q1" "$q2" "$q3" 2>/dev/null
+    gre4=$(grep -c "10.87.0.104.8080" "${WORK}/gre4.txt"); gre6=$(grep -c "fd00:87::104.8080" "${WORK}/gre6.txt")
+    [ "$gre4" -ge 1 ] && pass "the dsr-gre VIP is carried in GRE (IP protocol 47) over IPv4" || fail "no GRE packet for the dsr-gre IPv4 VIP was seen on the wire"
+    [ "$gre6" -ge 1 ] && pass "the dsr-gre VIP is carried in GRE (next header 47) over IPv6" || fail "no GRE packet for the dsr-gre IPv6 VIP was seen on the wire"
+    request 10.87.0.103 100 >/dev/null
+    # (the IP-in-IP capture above is started before the GRE requests, so it must have stayed empty for them)
+    if grep -q "10.87.0.104" "${WORK}/ipip4.txt"; then
+        fail "the dsr-gre VIP also appeared as IP-in-IP"
+    else
+        pass "the dsr-gre VIP never appears as IP-in-IP"
+    fi
+
     # What rivorad says it uses, then what is actually on the wire.
     if grep -q "L3 DSR tunnel sources.*ipv4=${want4}.*ipv6=${want6}" "$LOG"; then
         pass "rivorad reports tunnel sources ${want4} and ${want6}"
