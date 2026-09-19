@@ -28,6 +28,11 @@ rules:
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["gatewayclasses", "gateways"]
     verbs: ["get", "list", "watch"]
+  # The IPAM reconciler adds/removes its finalizer on the Gateway itself
+  # (metadata.finalizers, not /status), so it needs patch on the main resource.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gateways"]
+    verbs: ["patch"]
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["gatewayclasses/status", "gateways/status"]
     verbs: ["get", "update", "patch"]

@@ -5,7 +5,6 @@ import Login from './components/Login';
 import Overview from './pages/Overview';
 import VIPs from './pages/VIPs';
 import Backends from './pages/Backends';
-import { token } from './api';
 import { logout } from './auth';
 import { applyTheme, readStoredTheme, toggleTheme, type Theme } from './theme';
 
@@ -26,7 +25,7 @@ const pageHero: Partial<Record<Page, { eyebrow: string; title: string; lede: str
 
 export default function App() {
   const [page, setPage] = useState<Page>('overview');
-  const [loggedIn, setLoggedIn] = useState(() => Boolean(token()));
+  const [loggedIn, setLoggedIn] = useState(false);
   const [theme, setTheme] = useState<Theme>(() => {
     const t = readStoredTheme();
     applyTheme(t);

@@ -616,10 +616,12 @@ config.
 v0.2 (Kubernetes integration) is implemented and verified end-to-end
 against a live cluster (IPAM allocation/release, Service/EndpointSlice
 reconciliation, Maglev spread across scaling backends, ARP resolution via
-the speaker) — see [Kubernetes (v0.2)](#kubernetes-v02) for usage. Still
-ahead: publishing the container images the Helm chart's
-`image.rivorad`/`image.controller` values reference (verification so far
-used locally-built images, not a published registry).
+the speaker) — see [Kubernetes (v0.2)](#kubernetes-v02) for usage. The
+container images the Helm chart's `image.rivorad`/`image.controller`
+values reference are now published to `ghcr.io/zyvorai/` on every version
+tag (cosign-signed, with an SBOM) by `.github/workflows/release.yml`; the
+original live-cluster verification predates that and used locally-built
+images.
 
 v0.3 is underway. KubeVirt VMs and external/physical backends are done —
 see [Backends beyond Pods](#backends-beyond-pods-kubevirt-vms-and-externalphysical-ips)

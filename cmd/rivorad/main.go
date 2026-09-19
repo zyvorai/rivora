@@ -318,7 +318,7 @@ func main() {
 	// 127.0.0.1 is unreachable to anything but the local kubelet, and an
 	// in-cluster Prometheus needs a routable, plain-HTTP address instead.
 	// /healthz, /readyz and /metrics carry no sensitive data, so no auth here.
-	metricsSrv := &http.Server{Addr: *metricsListen, Handler: apiServer.MetricsHandler()}
+	metricsSrv := &http.Server{Addr: *metricsListen, Handler: apiServer.MetricsHandler(), ReadHeaderTimeout: readHeaderTimeout}
 	go func() {
 		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("metrics server", "err", err)
@@ -326,7 +326,7 @@ func main() {
 	}()
 	defer metricsSrv.Close()
 
-	srv := &http.Server{Addr: cfg.APIListen, Handler: apiServer.Handler()}
+	srv := &http.Server{Addr: cfg.APIListen, Handler: apiServer.Handler(), ReadHeaderTimeout: readHeaderTimeout}
 	tlsMode := "off"
 	switch {
 	case tlsCert != "" && tlsKey != "":
@@ -364,7 +364,14 @@ func main() {
 
 	<-ctx.Done()
 	logger.Info("shutting down")
-	_ = srv.Close()
+	// Let in-flight API requests finish, but never hold up exit (and the BPF
+	// detach in the deferred dp.Close) for longer than shutdownTimeout.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("api graceful shutdown incomplete, closing", "err", err)
+		_ = srv.Close()
+	}
 }
 
 func envOr(key, fallback string) string {
@@ -373,6 +380,14 @@ func envOr(key, fallback string) string {
 	}
 	return fallback
 }
+
+const (
+	// readHeaderTimeout bounds how long a client may take to send request
+	// headers, closing the slowloris hole on the API and metrics listeners.
+	readHeaderTimeout = 10 * time.Second
+	// shutdownTimeout bounds the graceful drain of the API server on SIGTERM.
+	shutdownTimeout = 5 * time.Second
+)
 
 func bpfDirPath(dir, prog string) string {
 	name := "xdp_ingress.o"

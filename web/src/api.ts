@@ -1,8 +1,10 @@
-// localStorage, not sessionStorage — same rationale as Netra's web/src/api.ts.
-export const token = () => localStorage.getItem('rivora-token') || '';
+// The bearer token is held in memory only: it is never written to
+// localStorage/sessionStorage, so a page reload signs the operator out and the
+// token can't be lifted from browser storage by another script on the origin.
+let currentToken = '';
+export const token = () => currentToken;
 export function setToken(v: string) {
-  if (v) localStorage.setItem('rivora-token', v);
-  else localStorage.removeItem('rivora-token');
+  currentToken = v;
 }
 function headers(extra: Record<string, string> = {}) {
   const h: { [k: string]: string } = { ...extra };

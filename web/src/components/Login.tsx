@@ -1,21 +1,22 @@
 import { useState } from 'react';
-import { checkCredentials } from '../auth';
-import { setToken } from '../api';
+import { login } from '../auth';
 
 export default function Login({ onLogin }: { onLogin: () => void }) {
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
+  const [apiToken, setApiToken] = useState('');
   const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
   const host = window.location.host || window.location.hostname;
 
-  function submit(e: React.FormEvent) {
+  async function submit(e: React.FormEvent) {
     e.preventDefault();
-    const token = checkCredentials(username, password);
-    if (!token) {
-      setError('Invalid username or password.');
+    setBusy(true);
+    setError('');
+    const result = await login(apiToken);
+    setBusy(false);
+    if (!result.ok) {
+      setError(result.error);
       return;
     }
-    setToken(token);
     onLogin();
   }
 
@@ -36,26 +37,19 @@ export default function Login({ onLogin }: { onLogin: () => void }) {
       <form className="card login-card" onSubmit={submit}>
         <h1>Sign in.</h1>
         <label className="tokenbox">
-          Username
-          <input
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            autoFocus
-            autoComplete="username"
-          />
-        </label>
-        <label className="tokenbox">
-          Password
+          API token
           <input
             type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            autoComplete="current-password"
+            value={apiToken}
+            onChange={(e) => setApiToken(e.target.value)}
+            autoFocus
+            autoComplete="off"
+            placeholder="RIVORA_API_KEY (leave empty if auth is off)"
           />
         </label>
         {error && <p className="warning">{error}</p>}
-        <button type="submit" className="primary">
-          Sign in
+        <button type="submit" className="primary" disabled={busy}>
+          {busy ? 'Checking…' : 'Sign in'}
         </button>
       </form>
     </div>
