@@ -224,7 +224,9 @@ jobs:
         for f in config/examples/*.yaml; do /tmp/rivoractl validate "$f"; done
     - name: No hardcoded console credentials
       run: |
-        if grep -rIn 'Admin@321' --exclude-dir=node_modules --exclude-dir=.git .; then
+        # The [1] keeps this line from matching itself: a plain literal would match the
+        # command that searches for it, in this very file.
+        if grep -rIn 'Admin@32[1]' --exclude-dir=node_modules --exclude-dir=.git .; then
           echo "::error::the hardcoded console login is back"; exit 1
         fi
     - name: Workflows are valid (actionlint)
@@ -270,29 +272,43 @@ jobs:
         command -v bpftool
         bpftool version || true
     - run: make bpf build
+    # Every selftest step below runs even if an earlier one failed (`!cancelled()`),
+    # so one red step can't hide the rest; the job still fails if any of them did.
     - name: Functional selftest (veth/netns, DSR + full-NAT)
       run: sudo bash scripts/selftest.sh
     - name: Multi-VIP + draining selftest (veth/netns)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-multivip.sh
     - name: Weighted Maglev selftest (veth/netns)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-weighted.sh
     - name: Rate limit selftest (veth/netns)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-ratelimit.sh
     - name: IPv6 dataplane selftest (veth/netns, DSR + full-NAT)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-ipv6.sh
     - name: NDP speaker selftest (veth)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-ndp.sh
     - name: Restart selftest (persisted datapath, veth/netns)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-restart.sh
     - name: Restart reconciliation selftest (stale VIPs, shifted IDs, veth/netns)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-adopt.sh
     - name: Drop-reason counters selftest (rate limit, no backend, unserved, veth/netns)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-drops.sh
     - name: XDP attach mode selftest (generic, native, auto, mode change, veth/netns)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-xdpmode.sh
     - name: HTTP health check selftest (open port + failing app, reload, bad config, veth/netns)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-httpcheck.sh
     - name: API auth selftest (roles, key rotation, failure metric, cert pinning, bad key config)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-apiauth.sh
     - name: Session affinity selftest (clientIP stickiness, reload, restart, failover, veth/netns)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-affinity.sh
