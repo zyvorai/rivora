@@ -339,6 +339,52 @@ time.sleep(0.5)
 ' "$1" "$2" "$3"
 }
 
+
+# icmp_checksum_ok <v4|v6> <vip> <vport>: sends the ICMP error for a live flow and reports, from a packet
+# capture on the backend-facing interface, whether the ICMP message that ARRIVED there has a valid
+# checksum. The backend's kernel accepting it (above) shows the checksum is right; this reads it
+# independently, so a checksum fold that goes missing cannot hide behind offload state.
+icmp_checksum_ok() {
+    local fam="$1" vip="$2" vport="$3" filter=icmp
+    [ "$fam" = v6 ] && filter=icmp6
+    in_ns "$NS_BE" timeout -s INT 6 tcpdump -ni ecg-be -w "${WORK}/icmp-${fam}.pcap" "$filter" >/dev/null 2>&1 &
+    local p=$!
+    sleep 1
+    icmp_error "$vip" "$vport" real
+    sleep 1
+    wait "$p" 2>/dev/null
+    python3 - "${WORK}/icmp-${fam}.pcap" "$fam" <<'PY'
+import socket, struct, sys
+path, fam = sys.argv[1], sys.argv[2]
+def total(b):
+    if len(b) % 2: b += b"\0"
+    s = sum(struct.unpack("!%dH" % (len(b) // 2), b))
+    while s >> 16: s = (s & 0xffff) + (s >> 16)
+    return s
+data = open(path, "rb").read()
+off, seen, bad = 24, 0, 0
+while off + 16 <= len(data):
+    _, _, cl, _ = struct.unpack("<IIII", data[off:off + 16]); off += 16
+    pkt = data[off:off + cl]; off += cl
+    if fam == "v4" and pkt[12:14] == b"\x08\x00":
+        ip = pkt[14:]; ihl = (ip[0] & 15) * 4
+        icmp = ip[ihl:struct.unpack("!H", ip[2:4])[0]]
+        if icmp[0] != 3: continue                       # only the errors under test, not unrelated ICMP
+        seen += 1
+        if total(icmp) != 0xffff: bad += 1
+        inner = icmp[8:]                                # the quoted IPv4 header must also still be self-consistent
+        if total(inner[:20]) != 0xffff: bad += 1
+    elif fam == "v6" and pkt[12:14] == b"\x86\xdd":
+        ip = pkt[14:54]; plen = struct.unpack("!H", ip[4:6])[0]
+        icmp = pkt[54:54 + plen]
+        if ip[6] != 58 or icmp[0] != 2: continue        # packet-too-big only
+        seen += 1
+        pseudo = ip[8:40] + struct.pack("!I", plen) + b"\0\0\0\x3a"
+        if total(pseudo + icmp) != 0xffff: bad += 1
+print("%d %d" % (seen, bad))
+PY
+}
+
 # backend_pmtu <v4|v6> prints the path MTU the backend has cached towards the client, or "none".
 backend_pmtu() {
     local out
@@ -451,6 +497,18 @@ for c in "v4 10.83.0.101 9000 nat 1000" "v4 10.83.0.104 9000 dsr 1000" "v6 fd00:
     got=$(backend_pmtu "$fam")
     [ "$got" = "$want" ] && pass "$fam $mode: the backend learned the path MTU ($got) from an ICMP sent to the VIP" \
         || fail "$fam $mode: the backend's path MTU is '$got', want $want (ICMP not delivered, or its checksum wrong)"
+done
+
+# The checksum of the ICMP that reached the backend, read straight off the wire for the NAT'd cases
+# (DSR forwards it untouched, so there is nothing to have got wrong).
+for c in "v4 10.83.0.101 9000" "v4 10.83.0.105 9100" "v6 fd00:83::101 9000" "v6 fd00:83::105 9100"; do
+    set -- $c
+    read -r seen bad <<<"$(icmp_checksum_ok "$1" "$2" "$3")"
+    if [ "${seen:-0}" -ge 1 ] && [ "${bad:-1}" = 0 ]; then
+        pass "$1 NAT: the ICMP that reached the backend for $2:$3 has a valid checksum ($seen seen)"
+    else
+        fail "$1 NAT: the ICMP that reached the backend for $2:$3 has a bad checksum or none arrived (seen=${seen:-0} bad=${bad:-?})"
+    fi
 done
 
 echo ""
