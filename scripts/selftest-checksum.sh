@@ -76,6 +76,7 @@ BE_PIDS=()
 cleanup() {
     [ -n "$RIVORAD_PID" ] && kill "$RIVORAD_PID" 2>/dev/null
     for p in "${BE_PIDS[@]:-}"; do [ -n "$p" ] && ip netns exec "$NS_BE" kill "$p" 2>/dev/null; done
+    for ns in "$NS_LB" "$NS_CLIENT" "$NS_BE"; do ip netns pids "$ns" 2>/dev/null | xargs -r kill 2>/dev/null; done
     for ns in "$NS_LB" "$NS_CLIENT" "$NS_BE"; do ip netns del "$ns" 2>/dev/null; done
     ip link del "$BR" 2>/dev/null
     rm -rf "$WORK"
@@ -157,8 +158,8 @@ while True:
         pass
 '
 for a in 10.86.0.11 fd00:86::11; do
-    in_ns "$NS_BE" python3 -c "$TCP_SERVER" "$a" "$BE_PORT" >/dev/null 2>&1 & BE_PIDS+=($!)
-    in_ns "$NS_BE" python3 -c "$UDP_SERVER" "$a" "$BE_PORT" >/dev/null 2>&1 & BE_PIDS+=($!)
+    ip netns exec "$NS_BE" python3 -c "$TCP_SERVER" "$a" "$BE_PORT" >/dev/null 2>&1 & BE_PIDS+=($!)
+    ip netns exec "$NS_BE" python3 -c "$UDP_SERVER" "$a" "$BE_PORT" >/dev/null 2>&1 & BE_PIDS+=($!)
 done
 sleep 0.6
 
@@ -173,7 +174,7 @@ sleep 0.6
     done
 } >"$CONFIG"
 
-in_ns "$NS_LB" bash -c "mount -t bpf bpf /sys/fs/bpf 2>/dev/null; exec '$RIVORAD' -config '$CONFIG' -bpf-dir '$BPF_DIR'" >"$LOG" 2>&1 &
+ip netns exec "$NS_LB" bash -c "mount -t bpf bpf /sys/fs/bpf 2>/dev/null; exec '$RIVORAD' -config '$CONFIG' -bpf-dir '$BPF_DIR'" >"$LOG" 2>&1 &
 RIVORAD_PID=$!
 up=0
 for _ in $(seq 1 40); do

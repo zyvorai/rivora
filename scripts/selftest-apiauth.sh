@@ -19,6 +19,12 @@
 #   5. rivoractl       --ca-file verifies the certificate (a good one passes, a
 #                      different one and no CA both fail with advice); a read-only key
 #                      gets a clear refusal; https is implied for a bare address.
+#   8. named keys      "id:alice=KEY" keys are audited by name: every state change logs who made
+#                      it (never the key), and a refused change names the caller.
+#   9. client certs    RIVORA_TLS_CLIENT_CA: a certificate signed by that CA authenticates by
+#                      common name with no key (listed names are admins, others read-only), one
+#                      from another CA is refused, rivoractl --cert/--key works, and
+#                      RIVORA_TLS_CLIENT_REQUIRED turns away a caller with no certificate.
 #   6. refusals        rivorad won't start with a read-only key but no admin key, a
 #                      key in both roles, or a key setting that holds no usable key
 #                      (which would otherwise silently switch auth OFF).
@@ -211,6 +217,70 @@ lb "start:RIVORA_API_KEY=short-key RIVORA_TLS_CERT=${CERT} RIVORA_TLS_KEY=${KEY}
 grep -q "shorter than recommended" "$LOG" && pass "a short-key warning was logged" || fail "no short-key warning"
 grep -q "short-key" "$LOG" && fail "the short key itself was logged" || pass "the key value was not logged"
 lb stop
+
+section "8. named keys are audited by name"
+ALICE="alice-secret-key-0123456789abcdef"; BOB="bob-secret-key-0123456789abcdef"; VIEW="viewer-secret-key-0123456789abcdef"
+lb "start:RIVORA_API_KEY=id:alice=${ALICE},id:bob=${BOB} RIVORA_API_READONLY_KEY=id:viewer=${VIEW} RIVORA_TLS_CERT=${CERT} RIVORA_TLS_KEY=${KEY}" || { fail "rivorad did not start with named keys"; tail -10 "$LOG"; }
+check_eq "alice's drain" "$(adrain "$ALICE" drain)" 200
+check_eq "bob's undrain" "$(adrain "$BOB" undrain)" 200
+check_eq "the read-only key's drain is forbidden" "$(adrain "$VIEW" drain)" 403
+check_eq "a read still works with the read-only key" "$(api -H "Authorization: Bearer ${VIEW}" "$U/api/v1/vips")" 200
+grep -q 'msg="api change" user=alice role=admin method=POST path=/api/v1/backends/0/drain status=200' "$LOG" \
+    && pass "alice's change is in the audit log by name" || fail "no audit line for alice: $(grep 'api change' "$LOG" | tail -2)"
+grep -q 'msg="api change" user=bob role=admin method=POST path=/api/v1/backends/0/undrain status=200' "$LOG" \
+    && pass "bob's change is in the audit log by name" || fail "no audit line for bob"
+grep -q 'reason=forbidden user=viewer' "$LOG" && pass "the refused change names the read-only caller" || fail "the refusal did not name the caller"
+grep -q 'method=GET' <(grep 'api change' "$LOG") && fail "a read was audited as a change" || pass "reads are not audited as changes"
+for k in "$ALICE" "$BOB" "$VIEW"; do grep -q "$k" "$LOG" && fail "a key was written to the log"; done; pass "no key appears in the log"
+metrics | grep -q 'rivora_api_changes_total{code="200",user="alice"} 1' && pass "rivora_api_changes_total counts alice's change" || fail "no metric for alice's change: $(metrics | grep changes_total)"
+refuse_named() { local before; before=$(grep -c 'api key configuration' "$LOG"); lb "try:$1"; local x; x=$(cat "${WORK}/exit-${CMDN}" 2>/dev/null); local after; after=$(grep -c 'api key configuration' "$LOG")
+    [ "$x" = 1 ] && [ "$after" -gt "$before" ] && pass "$2 refused" || fail "$2 was not refused (exit '${x}')"; }
+lb stop
+refuse_named "RIVORA_API_KEY=id:same=${ALICE},id:same=${BOB}" "two keys with one name"
+refuse_named "RIVORA_API_KEY=id:bad name=${ALICE}" "a malformed key name"
+
+section "9. client certificates"
+CA="${WORK}/ca.pem"; CAKEY="${WORK}/ca.key"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$CAKEY" -out "$CA" -days 2 -subj "/CN=rivora selftest CA" >/dev/null 2>&1
+issue() {   # issue <name> <CN> [ca cert] [ca key]  -> ${WORK}/<name>.pem and .key
+    local name="$1" cn="$2" cacert="${3:-$CA}" cakey="${4:-$CAKEY}"
+    openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "${WORK}/${name}.key" -out "${WORK}/${name}.csr" -subj "/CN=${cn}" >/dev/null 2>&1
+    printf 'extendedKeyUsage=clientAuth\n' > "${WORK}/${name}.ext"
+    openssl x509 -req -in "${WORK}/${name}.csr" -CA "$cacert" -CAkey "$cakey" -CAcreateserial -out "${WORK}/${name}.pem" -days 2 -extfile "${WORK}/${name}.ext" >/dev/null 2>&1
+}
+issue ops ops; issue viewer viewer
+OTHERCA="${WORK}/otherca.pem"; OTHERCAKEY="${WORK}/otherca.key"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$OTHERCAKEY" -out "$OTHERCA" -days 2 -subj "/CN=some other CA" >/dev/null 2>&1
+issue stranger ops "$OTHERCA" "$OTHERCAKEY"
+[ -s "${WORK}/ops.pem" ] && [ -s "${WORK}/viewer.pem" ] && [ -s "${WORK}/stranger.pem" ] || fail "could not issue the test certificates"
+
+# Certificates only: no bearer keys at all.
+lb "start:RIVORA_TLS_CERT=${CERT} RIVORA_TLS_KEY=${KEY} RIVORA_TLS_CLIENT_CA=${CA} RIVORA_API_CERT_ADMIN_CNS=ops" || { fail "rivorad did not start with a client CA"; tail -10 "$LOG"; }
+grep -q "client certificates accepted" "$LOG" && pass "rivorad reports accepting client certificates" || fail "no client-certificate log line"
+cert_api() { local c="$1"; shift; api --cert "${WORK}/${c}.pem" --key "${WORK}/${c}.key" "$@"; }
+check_eq "no certificate and no key: refused" "$(api "$U/api/v1/vips")" 401
+check_eq "an admin certificate can read" "$(cert_api ops "$U/api/v1/vips")" 200
+check_eq "an admin certificate can drain (no key sent)" "$(cert_api ops -X POST -H "$JSON" "$U/api/v1/backends/0/drain")" 200
+check_eq "another verified certificate can read" "$(cert_api viewer "$U/api/v1/vips")" 200
+check_eq "another verified certificate cannot change anything" "$(cert_api viewer -X POST -H "$JSON" "$U/api/v1/backends/0/undrain")" 403
+st=$(cert_api stranger -X POST -H "$JSON" "$U/api/v1/backends/0/undrain")
+[ "$st" = 401 ] || [ "$st" = 000 ] && pass "a certificate from another CA is refused (${st})" || fail "a certificate from another CA got ${st}"
+grep -q 'msg="api change" user=cert:ops role=admin method=POST path=/api/v1/backends/0/drain status=200' "$LOG" \
+    && pass "the certificate's change is audited by common name" || fail "no audit line for cert:ops"
+grep -q 'reason=forbidden user=cert:viewer' "$LOG" && pass "the refused certificate change names its holder" || fail "the refusal did not name cert:viewer"
+ctl_out=$(ctl --api 127.0.0.1:9870 --ca-file "$CERT" --cert "${WORK}/ops.pem" --key "${WORK}/ops.key" undrain 0)
+echo "$ctl_out" | grep -qi "error" && fail "rivoractl --cert/--key failed: $ctl_out" || pass "rivoractl --cert/--key can undrain with no api key"
+ctl --api 127.0.0.1:9870 --ca-file "$CERT" --cert "${WORK}/ops.pem" vips >/dev/null 2>&1 && fail "--cert without --key was accepted" || pass "--cert without --key is refused"
+lb stop
+
+# The listener can demand a certificate outright.
+lb "start:RIVORA_API_KEY=${NEW} RIVORA_TLS_CERT=${CERT} RIVORA_TLS_KEY=${KEY} RIVORA_TLS_CLIENT_CA=${CA} RIVORA_TLS_CLIENT_REQUIRED=1 RIVORA_API_CERT_ADMIN_CNS=ops" || fail "rivorad did not start with client certificates required"
+st=$(api -H "Authorization: Bearer ${NEW}" "$U/api/v1/vips"); [ "$st" = 000 ] && pass "with a certificate required, a valid key alone cannot even connect" || fail "a caller with no certificate got ${st}"
+check_eq "a certificate holder connects" "$(cert_api ops "$U/api/v1/vips")" 200
+lb stop
+refuse_tls() { lb "try:$1"; local x; x=$(cat "${WORK}/exit-${CMDN}" 2>/dev/null); [ "$x" = 1 ] && pass "$2 refused" || fail "$2 was not refused (exit '${x}')"; }
+refuse_tls "RIVORA_TLS_CLIENT_CA=${CA}" "a client CA without TLS"
+refuse_tls "RIVORA_TLS_CERT=${CERT} RIVORA_TLS_KEY=${KEY} RIVORA_TLS_CLIENT_CA=${WORK}/does-not-exist" "a client CA file that cannot be read"
 
 echo ""
 echo "summary: pass=${PASS} fail=${FAIL}"

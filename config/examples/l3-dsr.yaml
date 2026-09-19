@@ -1,0 +1,40 @@
+# L3 DSR: tunnel to backends that are not on the load balancer's L2 segment.
+#
+# The load balancer wraps each packet in IP-in-IP (dsr-ipip) or GRE (dsr-gre) addressed to the
+# backend. The backend unwraps it and answers the client directly from the VIP, so replies never
+# go back through the load balancer. Unlike mode: dsr, backends need no `mac` (they are reached by
+# address, across routers) and may be several hops away.
+#
+# On each backend: a tunnel endpoint for the chosen mode, the VIP on lo, and reverse-path
+# filtering off on it, e.g.
+#   ip tunnel add tun0 mode ipip local <backend-ip>    # or: mode gre
+#   ip link set tun0 up
+#   ip addr add 192.0.2.30/32 dev lo
+#   sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.tun0.rp_filter=0
+# (IPv6 uses `ip -6 tunnel add ... mode ip6ip6` or `mode ip6gre`.)
+interface: eth0
+
+# The outer header's source address. Unset, each family defaults to eth0's own address.
+tunnelSource: 198.51.100.1
+tunnelSource6: "2001:db8:1::1"
+
+vips:
+  - address: 192.0.2.30
+    port: 443
+    protocol: tcp
+    mode: dsr-ipip
+    backends:
+      - {address: 10.20.0.11, port: 443}   # a routed hop away
+      - {address: 10.21.0.12, port: 443}
+
+  - address: 192.0.2.31
+    port: 443
+    protocol: tcp
+    mode: dsr-gre
+    backends: [{address: 10.20.0.11, port: 443}]
+
+  - address: "2001:db8:2::30"
+    port: 443
+    protocol: tcp
+    mode: dsr-ipip
+    backends: [{address: "2001:db8:3::11", port: 443}]

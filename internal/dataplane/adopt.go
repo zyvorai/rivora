@@ -146,15 +146,22 @@ type adoptedBackend struct {
 	isV4    bool
 }
 
-// rawVIP is one vip_map / vip_map6 entry before validation.
+// rawVIP is one vip_map / vip_map6 entry, or one range VIP's worth of trie blocks,
+// before validation.
 type rawVIP struct {
-	addr  string
-	port  uint16
-	proto config.Protocol
-	sid   uint32
-	is4   bool
-	key4  bpfmaps.VipKey
-	key6  bpfmaps.VipKey6
+	addr    string
+	port    uint16
+	portEnd uint16 // non-zero for a range VIP
+	proto   config.Protocol
+	sid     uint32
+	is4     bool
+	key4    bpfmaps.VipKey
+	key6    bpfmaps.VipKey6
+	// A range VIP's trie keys, one per block (blocks4 if is4, else blocks6).
+	blocks4 []bpfmaps.VipRangeKey
+	blocks6 []bpfmaps.VipRangeKey6
+	// bad marks a range whose blocks don't tile a range: it is deleted, not adopted.
+	bad bool
 }
 
 // AdoptSummary reports what start-up found already programmed.
@@ -205,10 +212,20 @@ func (d *Dataplane) adoptLocked() (AdoptSummary, error) {
 			return sum, fmt.Errorf("scan vip_map6: %w", err)
 		}
 	}
+	ranges, err := d.scanRanges()
+	if err != nil {
+		return sum, err
+	}
+	raws = append(raws, ranges...)
 	// Deterministic order so a run with a corrupt map behaves the same twice.
-	sort.Slice(raws, func(i, j int) bool { return raws[i].sid < raws[j].sid })
+	sort.SliceStable(raws, func(i, j int) bool { return raws[i].sid < raws[j].sid })
 
 	for _, r := range raws {
+		if r.bad {
+			d.dropRawVIP(r)
+			sum.Dropped++
+			continue
+		}
 		if err := d.adoptOneLocked(r); err != nil {
 			d.dropRawVIP(r)
 			sum.Dropped++
@@ -220,11 +237,14 @@ func (d *Dataplane) adoptLocked() (AdoptSummary, error) {
 }
 
 func (d *Dataplane) adoptOneLocked(r rawVIP) error {
-	key := fmt.Sprintf("%s:%d:%s", r.addr, r.port, r.proto)
+	key := vipKeyString(config.VIP{Address: r.addr, Port: r.port, PortEnd: r.portEnd, Protocol: r.proto})
 
 	var sc bpfmaps.ServiceConfig
 	if err := d.dp.Maps[bpfmaps.MapServiceConfig].Lookup(&r.sid, &sc); err != nil {
 		return fmt.Errorf("service_config[%d]: %w", r.sid, err)
+	}
+	if (sc.Flags&bpfmaps.SvcRange != 0) != (r.portEnd != 0) {
+		return errors.New("service_config's range flag disagrees with the VIP's map entry")
 	}
 	ext := extent{offset: sc.MaglevOffset, size: sc.MaglevSize}
 	if ext.size == 0 {
@@ -281,7 +301,7 @@ func (d *Dataplane) adoptOneLocked(r rawVIP) error {
 		backendIDs: make(map[string]uint32, len(backends)),
 		extent:     ext,
 		vip: config.VIP{
-			Address: r.addr, Port: r.port, Protocol: r.proto,
+			Address: r.addr, Port: r.port, PortEnd: r.portEnd, Protocol: r.proto,
 			Mode: modeFromByte(sc.Mode), SessionAffinity: affinityFromByte(sc.Affinity),
 		},
 	}
@@ -333,6 +353,20 @@ func (d *Dataplane) readBackend(id uint32) (adoptedBackend, error) {
 // dropRawVIP deletes an entry adoption couldn't trust. Best-effort, like the
 // other teardown paths.
 func (d *Dataplane) dropRawVIP(r rawVIP) {
+	if r.portEnd != 0 {
+		if r.is4 {
+			m := d.dp.Maps[bpfmaps.MapVIPRange]
+			for i := range r.blocks4 {
+				_ = m.Delete(&r.blocks4[i])
+			}
+			return
+		}
+		m := d.dp.Maps[bpfmaps.MapVIPRange6]
+		for i := range r.blocks6 {
+			_ = m.Delete(&r.blocks6[i])
+		}
+		return
+	}
 	if r.is4 {
 		_ = d.dp.Maps[bpfmaps.MapVIP].Delete(&r.key4)
 		return
@@ -341,8 +375,13 @@ func (d *Dataplane) dropRawVIP(r rawVIP) {
 }
 
 func modeFromByte(m uint8) config.Mode {
-	if m == bpfmaps.ModeNAT {
+	switch m {
+	case bpfmaps.ModeNAT:
 		return config.ModeNAT
+	case bpfmaps.ModeTunnelIPIP:
+		return config.ModeDSRIPIP
+	case bpfmaps.ModeTunnelGRE:
+		return config.ModeDSRGRE
 	}
 	return config.ModeDSR
 }
@@ -352,4 +391,129 @@ func affinityFromByte(b uint8) config.SessionAffinity {
 		return config.AffinityClientIP
 	}
 	return config.AffinityNone
+}
+
+// scanRanges reads the port-range tries back into one rawVIP per range VIP. A range
+// is stored as several blocks pointing at one service, so blocks are grouped by
+// (service, address, protocol) and the range recovered as first..last. A group whose
+// blocks are not exactly the tiling of that range is inconsistent (a torn write, or
+// something that isn't ours) and comes back with the blocks intact so the caller
+// drops it. Like the vip_map scans, a scan that stops early is an error: adopting a
+// partial picture would bring the service-ID collisions adoption exists to prevent.
+func (d *Dataplane) scanRanges() ([]rawVIP, error) {
+	var out []rawVIP
+
+	type group struct {
+		sid      uint32
+		is4      bool
+		addr     string
+		proto    config.Protocol
+		blocks   []portBlock
+		keys4    []bpfmaps.VipRangeKey
+		keys6    []bpfmaps.VipRangeKey6
+		foreign  bool // a key that isn't a well-formed range block
+		firstIdx int
+	}
+	groups := map[string]*group{}
+	var order []string
+	add := func(id string, g *group) *group {
+		if e, ok := groups[id]; ok {
+			return e
+		}
+		g.firstIdx = len(order)
+		groups[id] = g
+		order = append(order, id)
+		return g
+	}
+
+	if m := d.dp.Maps[bpfmaps.MapVIPRange]; m != nil {
+		var k bpfmaps.VipRangeKey
+		var sid uint32
+		it := m.Iterate()
+		for it.Next(&k, &sid) {
+			proto, okp := protoFromByte(k.Proto)
+			ip := make(net.IP, 4)
+			ip[0], ip[1], ip[2], ip[3] = byte(k.Addr), byte(k.Addr>>8), byte(k.Addr>>16), byte(k.Addr>>24)
+			g := add(fmt.Sprintf("4|%d|%s|%d", sid, ip, k.Proto), &group{sid: sid, is4: true, addr: ip.String(), proto: proto})
+			bits := int(k.PrefixLen) - bpfmaps.RangePrefixBase4
+			if !okp || bits < 0 || bits > 16 {
+				g.foreign = true
+			}
+			g.blocks = append(g.blocks, portBlock{Port: htons(k.Port), Bits: bits})
+			g.keys4 = append(g.keys4, k)
+		}
+		if err := it.Err(); err != nil {
+			return nil, fmt.Errorf("scan vip_range_map: %w", err)
+		}
+	}
+	if m := d.dp.Maps[bpfmaps.MapVIPRange6]; m != nil {
+		var k bpfmaps.VipRangeKey6
+		var sid uint32
+		it := m.Iterate()
+		for it.Next(&k, &sid) {
+			proto, okp := protoFromByte(k.Proto)
+			addr := net.IP(k.Addr[:]).String()
+			g := add(fmt.Sprintf("6|%d|%s|%d", sid, addr, k.Proto), &group{sid: sid, addr: addr, proto: proto})
+			bits := int(k.PrefixLen) - bpfmaps.RangePrefixBase6
+			if !okp || bits < 0 || bits > 16 {
+				g.foreign = true
+			}
+			g.blocks = append(g.blocks, portBlock{Port: htons(k.Port), Bits: bits})
+			g.keys6 = append(g.keys6, k)
+		}
+		if err := it.Err(); err != nil {
+			return nil, fmt.Errorf("scan vip_range_map6: %w", err)
+		}
+	}
+
+	for _, id := range order {
+		g := groups[id]
+		r := rawVIP{addr: g.addr, proto: g.proto, sid: g.sid, is4: g.is4, blocks4: g.keys4, blocks6: g.keys6}
+		lo, hi, ok := blocksSpan(g.blocks)
+		if g.foreign || !ok {
+			r.portEnd, r.bad = 1, true // portEnd only routes dropRawVIP to the trie
+			out = append(out, r)
+			continue
+		}
+		r.port, r.portEnd = lo, hi
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// blocksSpan recovers first..last from a set of blocks, and reports whether those
+// blocks are exactly the tiling rangeBlocks would produce for that span.
+func blocksSpan(blocks []portBlock) (lo, hi uint16, ok bool) {
+	if len(blocks) == 0 {
+		return 0, 0, false
+	}
+	minP, maxP := uint32(1<<16), uint32(0)
+	for _, b := range blocks {
+		if b.Bits < 0 || b.Bits > 16 {
+			return 0, 0, false
+		}
+		if uint32(b.Port) < minP {
+			minP = uint32(b.Port)
+		}
+		if end := uint32(b.Port) + b.size() - 1; end > maxP {
+			maxP = end
+		}
+	}
+	if maxP > 0xffff || minP == 0 || minP >= maxP {
+		return 0, 0, false
+	}
+	want := rangeBlocks(uint16(minP), uint16(maxP))
+	if len(want) != len(blocks) {
+		return 0, 0, false
+	}
+	have := map[portBlock]bool{}
+	for _, b := range blocks {
+		have[b] = true
+	}
+	for _, w := range want {
+		if !have[w] {
+			return 0, 0, false
+		}
+	}
+	return uint16(minP), uint16(maxP), true
 }

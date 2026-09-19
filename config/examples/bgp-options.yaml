@@ -1,0 +1,41 @@
+# BGP peer options and route attributes, on top of config/examples/bgp-ha.yaml.
+interface: eth0
+
+bgp:
+  enabled: true
+  asn: 65001
+  routerId: 10.0.0.11
+  # Attached to every route this node originates; a VIP's own bgpCommunities are added for its route.
+  communities: ["65001:100"]
+  # Only sent to iBGP peers (peers in AS 65001); an eBGP peer never receives it.
+  localPref: 200
+  # Advertise a covering /24 while at least one VIP inside it is healthy, instead of (with
+  # suppressSpecifics) or as well as its /32s. It is withdrawn when none is.
+  aggregates:
+    - {prefix: 192.0.2.0/24, suppressSpecifics: true, communities: ["65001:24"]}
+  peers:
+    # A top-of-rack router: directly connected, TCP MD5, graceful restart, this node's own peer.
+    - address: 10.0.0.1
+      asn: 65000
+      bfd: true
+      passwordFile: /etc/rivora/bgp-tor-password   # a mounted Secret; or `password:` inline
+      gracefulRestart: {enabled: true, restartTime: 120}
+      nodes: [node-a, node-b]        # only these nodes peer with this router
+    # A route reflector two hops away: eBGP multihop, TTL 3.
+    - address: 10.9.0.1
+      asn: 65010
+      multihop: 3
+
+vips:
+  - address: 192.0.2.10
+    port: 443
+    protocol: tcp
+    mode: nat
+    bgpCommunities: ["65001:7", "no-export"]   # for this VIP's route only
+    bgpPeers: [10.0.0.1]                       # ...and sent only to the top-of-rack router, not the route reflector
+    backends: [{address: 10.0.0.21, port: 8443}]
+  - address: 192.0.2.11
+    port: 443
+    protocol: tcp
+    mode: nat
+    backends: [{address: 10.0.0.22, port: 8443}]
