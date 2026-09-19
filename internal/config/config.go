@@ -56,6 +56,29 @@ type VIP struct {
 	// HealthCheck says how this VIP's backends are probed. Unset means the
 	// default: a TCP connect to the backend's service port, exactly as before.
 	HealthCheck ProbeSpec `yaml:"healthCheck,omitempty"`
+	// RateLimit is this VIP's own per-source SYN limit. Unset (zero) means the VIP
+	// follows the node-wide rateLimit; set, it replaces that limit for this VIP,
+	// whether or not the node-wide one is enabled.
+	RateLimit VIPRateLimit `yaml:"rateLimit,omitempty"`
+}
+
+// VIPRateLimit is a per-source-IP token bucket on one VIP's new TCP connections
+// (SYN packets). Like the node-wide RateLimit it leaves established connections and
+// UDP alone. The zero value means "not set", not "limit to nothing".
+type VIPRateLimit struct {
+	PerSourcePacketsPerSecond uint64 `yaml:"perSourcePacketsPerSecond,omitempty"`
+	Burst                     uint64 `yaml:"burst,omitempty"`
+}
+
+// Set reports whether a limit is configured.
+func (r VIPRateLimit) Set() bool { return r != (VIPRateLimit{}) }
+
+// Validate accepts the zero value or a limit with both fields positive.
+func (r VIPRateLimit) Validate() error {
+	if r.Set() && (r.PerSourcePacketsPerSecond == 0 || r.Burst == 0) {
+		return fmt.Errorf("rateLimit: perSourcePacketsPerSecond and burst must both be > 0")
+	}
+	return nil
 }
 
 // SessionAffinity is how a VIP chooses a backend for a new connection.
@@ -442,6 +465,9 @@ func (c Config) Validate() error {
 			return fmt.Errorf("vip %s:%d: %w", v.Address, v.Port, err)
 		}
 		if err := v.HealthCheck.Validate(); err != nil {
+			return fmt.Errorf("vip %s:%d: %w", v.Address, v.Port, err)
+		}
+		if err := v.RateLimit.Validate(); err != nil {
 			return fmt.Errorf("vip %s:%d: %w", v.Address, v.Port, err)
 		}
 		vipIsV4 := vipIP.To4() != nil

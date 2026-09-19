@@ -236,23 +236,52 @@ func (d *Dataplane) writeIfaceMAC(iface *net.Interface) error {
 func (d *Dataplane) applyRateLimit() error {
 	rl := bpfmaps.RLConfig{}
 	if d.cfg.RateLimit.Enabled {
-		cpus := uint64(runtime.NumCPU())
-		if cpus == 0 {
-			cpus = 1
-		}
-		rate := d.cfg.RateLimit.PerSourcePacketsPerSecond / cpus
-		burst := d.cfg.RateLimit.Burst / cpus
-		if rate == 0 {
-			rate = 1
-		}
-		if burst == 0 {
-			burst = 1
-		}
-		rl = bpfmaps.RLConfig{RatePerSec: rate, Burst: burst, Enabled: 1}
+		rl = scaleRateLimit(d.cfg.RateLimit.PerSourcePacketsPerSecond, d.cfg.RateLimit.Burst)
 	}
 	var zero uint32
 	if err := d.dp.Maps[bpfmaps.MapRateLimitConfig].Update(&zero, &rl, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update rl_config_map: %w", err)
+	}
+	return nil
+}
+
+// scaleRateLimit turns a configured per-source rate and burst into what the BPF
+// program enforces. Each CPU keeps its own bucket, so both are divided by the CPU
+// count (see applyRateLimit), with a floor of 1 so a small limit still admits
+// something.
+func scaleRateLimit(pps, burst uint64) bpfmaps.RLConfig {
+	cpus := uint64(runtime.NumCPU())
+	if cpus == 0 {
+		cpus = 1
+	}
+	rate, b := pps/cpus, burst/cpus
+	if rate == 0 {
+		rate = 1
+	}
+	if b == 0 {
+		b = 1
+	}
+	return bpfmaps.RLConfig{RatePerSec: rate, Burst: b, Enabled: 1}
+}
+
+// applyServiceRateLimitLocked writes (or, for the zero value, clears) service id's
+// own SYN limit. A datapath object built before per-service limits existed has no
+// svc_rl_config_map: a VIP that asks for one then fails loudly rather than being
+// quietly left unlimited.
+func (d *Dataplane) applyServiceRateLimitLocked(id uint32, rl config.VIPRateLimit) error {
+	m := d.dp.Maps[bpfmaps.MapServiceRateLimit]
+	if m == nil {
+		if rl.Set() {
+			return fmt.Errorf("this datapath object has no per-VIP rate limit support; rebuild the BPF objects")
+		}
+		return nil
+	}
+	val := bpfmaps.RLConfig{}
+	if rl.Set() {
+		val = scaleRateLimit(rl.PerSourcePacketsPerSecond, rl.Burst)
+	}
+	if err := m.Update(&id, &val, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("update svc_rl_config_map[%d]: %w", id, err)
 	}
 	return nil
 }
@@ -347,6 +376,9 @@ func (d *Dataplane) upsertVIPLocked(spec config.VIP) error {
 	}
 	if err := d.dp.Maps[bpfmaps.MapServiceConfig].Update(&entry.serviceID, &sc, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update service_config_map: %w", err)
+	}
+	if err := d.applyServiceRateLimitLocked(entry.serviceID, vip.RateLimit); err != nil {
+		return fmt.Errorf("vip %s: %w", key, err)
 	}
 
 	if err := d.vipMapWrite(vip, entry.serviceID); err != nil {
@@ -680,6 +712,7 @@ func (d *Dataplane) removeVIPLocked(key string) error {
 	_ = d.vipMapDelete(entry.vip)
 	var zero bpfmaps.ServiceConfig
 	_ = d.dp.Maps[bpfmaps.MapServiceConfig].Update(&entry.serviceID, &zero, ebpf.UpdateAny)
+	_ = d.applyServiceRateLimitLocked(entry.serviceID, config.VIPRateLimit{}) // a freed ID must not keep the last VIP's limit
 	d.resetDropStatsLocked(entry.serviceID)
 
 	if entry.extent.size > 0 {

@@ -20,6 +20,9 @@ const (
 	MapDropStats          = "drop_stats_map"
 	MapRateLimitConfig    = "rl_config_map"
 	MapRateLimitBuckets   = "rl_buckets_map"
+	// MapServiceRateLimit holds one Service's own SYN limit (RLConfig, indexed by
+	// service_id); a Service with none set falls back to MapRateLimitConfig.
+	MapServiceRateLimit = "svc_rl_config_map"
 
 	// IPv6 siblings (v0.3) of the address-keyed-or-valued maps above.
 	// service_config_map, maglev_table, backend_health_map, stats_map,
@@ -150,6 +153,19 @@ type RLConfig struct {
 	Burst      uint64
 	Enabled    uint8
 	Pad        [7]uint8
+}
+
+// SvcRLKey — struct svc_rl_key. 8 bytes. Only the BPF side builds it today;
+// mirrored for ABI completeness like RLBucket.
+type SvcRLKey struct {
+	ServiceID uint32
+	Saddr     uint32
+}
+
+// SvcRLKey6 — struct svc_rl_key6. 20 bytes.
+type SvcRLKey6 struct {
+	ServiceID uint32
+	Saddr     [16]byte
 }
 
 // RLBucket — struct rl_bucket. 16 bytes. Read/written per-CPU (the map is

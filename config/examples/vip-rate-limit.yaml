@@ -1,0 +1,29 @@
+# Per-VIP SYN rate limits. A VIP's own rateLimit replaces the node-wide one for
+# that VIP (in either direction); a VIP with none follows the node-wide limit,
+# and with the node-wide limit off it is unlimited.
+interface: eth0
+rateLimit: {enabled: true, perSourcePacketsPerSecond: 200, burst: 400}   # node-wide default
+
+vips:
+  # Public login endpoint: tighter than the default.
+  - address: 192.0.2.10
+    port: 443
+    protocol: tcp
+    mode: nat
+    rateLimit: {perSourcePacketsPerSecond: 20, burst: 40}
+    backends: [{address: 10.0.0.11, port: 8443}]
+
+  # Internal RPC: exempt in practice (a very high own limit) despite the node-wide one.
+  - address: 192.0.2.11
+    port: 9000
+    protocol: tcp
+    mode: nat
+    rateLimit: {perSourcePacketsPerSecond: 1000000, burst: 1000000}
+    backends: [{address: 10.0.0.12, port: 9000}]
+
+  # No rateLimit: follows the node-wide limit above.
+  - address: 192.0.2.12
+    port: 80
+    protocol: tcp
+    mode: nat
+    backends: [{address: 10.0.0.13, port: 8080}]

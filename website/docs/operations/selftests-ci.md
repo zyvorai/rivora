@@ -14,6 +14,7 @@ runs `rivorad` (or a focused Go test) as root.
 | `make selftest-multivip` | Two VIPs; draining excludes new flows |
 | `make selftest-weighted` | 9:1 Maglev skew |
 | `make selftest-ratelimit` | Tight per-source limit; disabled = no-op |
+| `make selftest-vipratelimit` | Per-VIP limits: own limit, per-VIP buckets, override of the node-wide limit, reload lifts it; IPv4 + IPv6 |
 | `make selftest-ipv6` | Same as first over all-IPv6 |
 | `make selftest-ndp` | NS → NA for NAT IPv6 VIP |
 | `make selftest-all` | All of the above |

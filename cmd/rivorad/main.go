@@ -64,7 +64,8 @@ func main() {
 		workers       = flag.Int("workers", 2, "number of concurrent Service reconcile workers; only used with -kubernetes")
 		speakerOn     = flag.Bool("speaker", true, "run the L2 ARP+NDP speaker (requires CAP_NET_RAW); only used with -kubernetes")
 
-		gatewayAPIOn = flag.Bool("gateway-api", false, "also watch GatewayClass/Gateway/TCPRoute/UDPRoute and program their VIPs; only used with -kubernetes; requires the Gateway API CRDs to be installed")
+		servicePolicyOn = flag.Bool("service-policy", false, "honour ServicePolicy objects (per-Service health probe, per-source rate limit and endpoint weights); only used with -kubernetes; requires the ServicePolicy CRD (the Helm chart installs it)")
+		gatewayAPIOn    = flag.Bool("gateway-api", false, "also watch GatewayClass/Gateway/TCPRoute/UDPRoute and program their VIPs; only used with -kubernetes; requires the Gateway API CRDs to be installed")
 
 		healthInterval = flag.Duration("health-interval", 3*time.Second, "active health check interval; only used with -kubernetes")
 		healthTimeout  = flag.Duration("health-timeout", time.Second, "active health check timeout; only used with -kubernetes")
@@ -344,6 +345,11 @@ func main() {
 			logger.Info("externalTrafficPolicy: Local is honoured: Services that ask for it use only this node's endpoints", "node", localPolicy.Node)
 		} else {
 			logger.Info("externalTrafficPolicy: Local is not honoured on this node; such Services are treated as Cluster (each is warned about once)", "why", localPolicy.NotHonouredReason)
+		}
+
+		if *servicePolicyOn {
+			reconciler.EnableServicePolicies(clients.Dynamic)
+			logger.Info("ServicePolicy objects are honoured")
 		}
 
 		var gwReconciler *gatewayapi.Reconciler

@@ -85,6 +85,9 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
   probes an HTTP endpoint and judges its status instead of only a TCP connect
   (see `config/examples/http-healthcheck.yaml`). `xdpMode: native` (or `auto`)
   attaches XDP in the NIC driver instead of the default generic mode.
+  A `ServicePolicy` (CRD) sets a Service's health probe, per-source SYN rate limit and
+  endpoint weights; a VIP's `rateLimit` block does the same for static configs
+  (see the [ServicePolicy guide](website/docs/kubernetes/service-policy.md)).
   `rivorad -persist-datapath` keeps
   the datapath attached across restarts (no traffic gap; see the runbook).
   `rivorad` and `rivora-controller` take `-log-level` and `-log-format text|json`.

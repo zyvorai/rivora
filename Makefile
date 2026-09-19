@@ -1,7 +1,7 @@
 # Copyright 2026 Zyvor AI Labs · https://zyvor.dev
 # SPDX-License-Identifier: Apache-2.0
 
-.PHONY: build bpf test fmt vet selftest selftest-multivip selftest-weighted selftest-ratelimit selftest-ipv6 selftest-ndp selftest-restart selftest-adopt selftest-drops selftest-xdpmode selftest-httpcheck selftest-apiauth selftest-all \
+.PHONY: build bpf test fmt vet selftest selftest-multivip selftest-weighted selftest-ratelimit selftest-ipv6 selftest-ndp selftest-restart selftest-adopt selftest-drops selftest-xdpmode selftest-httpcheck selftest-apiauth selftest-affinity selftest-vipratelimit selftest-all \
 	web web-install docs-serve docs-build \
 	deploy deploy-remote deploy-remote-quick deploy-remote-preflight deploy-remote-verify deploy-remote-uninstall deploy-remote-fleet \
 	sync-chart check-chart-sync build-cli release-cli install
@@ -106,6 +106,12 @@ selftest-weighted:
 selftest-ratelimit:
 	bash scripts/selftest-ratelimit.sh
 
+selftest-affinity:
+	bash scripts/selftest-affinity.sh
+
+selftest-vipratelimit:
+	bash scripts/selftest-vipratelimit.sh
+
 selftest-ipv6:
 	bash scripts/selftest-ipv6.sh
 
@@ -130,7 +136,7 @@ selftest-httpcheck:
 selftest-apiauth:
 	bash scripts/selftest-apiauth.sh
 
-selftest-all: selftest selftest-multivip selftest-weighted selftest-ratelimit selftest-ipv6 selftest-ndp selftest-restart selftest-adopt selftest-drops selftest-xdpmode selftest-httpcheck selftest-apiauth
+selftest-all: selftest selftest-multivip selftest-weighted selftest-ratelimit selftest-ipv6 selftest-ndp selftest-restart selftest-adopt selftest-drops selftest-xdpmode selftest-httpcheck selftest-apiauth selftest-affinity selftest-vipratelimit
 
 docs-serve: ## Local Docusaurus preview (website/)
 	npm --prefix website start

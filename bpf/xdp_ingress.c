@@ -155,6 +155,29 @@ struct {
     __type(value, struct rl_bucket);
 } rl_buckets_map6 SEC(".maps");
 
+/* Per-Service SYN limits (see struct svc_rl_key in rivora_common.h). New maps, so
+ * an already-pinned deployment simply gains them on upgrade. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 4096); /* bpfmaps.MaxVIPs */
+    __type(key, __u32); /* service_id */
+    __type(value, struct rl_config);
+} svc_rl_config_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_PERCPU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct svc_rl_key);
+    __type(value, struct rl_bucket);
+} svc_rl_buckets_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_PERCPU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct svc_rl_key6);
+    __type(value, struct rl_bucket);
+} svc_rl_buckets_map6 SEC(".maps");
+
 static __always_inline void bump_drop(__u32 service_id, __u32 reason)
 {
     struct drop_stats *d = bpf_map_lookup_elem(&drop_stats_map, &service_id);
@@ -176,61 +199,56 @@ static __always_inline void bump_stats(__u32 idx, __u32 bytes, __u8 dropped)
     }
 }
 
-/* Beyond this, a bucket is treated as fully refilled regardless of its
- * configured rate — caps the refill multiply below against overflow
- * without needing to reason about how long a source IP has been idle
- * (which, for a long-uptime LB, could otherwise be an arbitrarily large
- * nanosecond count). Any sane rate/burst combination refills in well
- * under 10s anyway. */
-#define RIVORA_RL_MAX_ELAPSED_NS 10000000000ULL
-
-/* Per-source-IP SYN token bucket: consult rl_config_map (a cheap single
- * array lookup, near-zero cost when the feature is off) and, if enabled,
- * refill-then-consume one token from saddr's bucket in rl_buckets_map,
- * reporting whether it was empty. Only ever called for TCP SYN packets —
- * see rivora_xdp_ingress — so established connections' data packets and
- * all UDP traffic are unaffected regardless of this limiter's state. */
-static __always_inline int rate_limit_exceeded(__u32 saddr)
+/* SYN token bucket. A Service with its own limit (svc_rl_config_map[sid].enabled)
+ * is governed by that alone; every other Service falls back to the node-wide
+ * limit in rl_config_map, which is a single cheap array lookup and does nothing
+ * when the feature is off. Only ever called for TCP SYN packets — see
+ * rivora_xdp_ingress — so established connections' data packets and all UDP
+ * traffic are unaffected regardless of the limiter's state. */
+static __always_inline int rate_limit_exceeded(__u32 sid, __u32 saddr)
 {
+    struct rl_bucket updated;
+    __u64 now;
+
+    struct rl_config *scfg = bpf_map_lookup_elem(&svc_rl_config_map, &sid);
+    if (scfg && scfg->enabled) {
+        struct svc_rl_key sk = {.service_id = sid, .saddr = saddr};
+        now = bpf_ktime_get_ns();
+        int exceeded = rl_take(scfg, bpf_map_lookup_elem(&svc_rl_buckets_map, &sk), &updated, now);
+        bpf_map_update_elem(&svc_rl_buckets_map, &sk, &updated, BPF_ANY);
+        return exceeded;
+    }
+
     __u32 zero = 0;
     struct rl_config *cfg = bpf_map_lookup_elem(&rl_config_map, &zero);
     if (!cfg || !cfg->enabled)
         return 0;
 
-    __u64 now = bpf_ktime_get_ns();
-    struct rl_bucket *b = bpf_map_lookup_elem(&rl_buckets_map, &saddr);
-    struct rl_bucket fresh = {.tokens = cfg->burst, .last_refill_ns = now};
-    if (!b)
-        b = &fresh;
-
-    __u64 elapsed_ns = now > b->last_refill_ns ? now - b->last_refill_ns : 0;
-    if (elapsed_ns > RIVORA_RL_MAX_ELAPSED_NS)
-        elapsed_ns = RIVORA_RL_MAX_ELAPSED_NS;
-
-    __u64 tokens = b->tokens + (elapsed_ns * cfg->rate_per_sec) / 1000000000ULL;
-    if (tokens > cfg->burst)
-        tokens = cfg->burst;
-
-    int exceeded = tokens < 1;
-    if (!exceeded)
-        tokens -= 1;
-
-    struct rl_bucket updated = {.tokens = tokens, .last_refill_ns = now};
+    now = bpf_ktime_get_ns();
+    int exceeded = rl_take(cfg, bpf_map_lookup_elem(&rl_buckets_map, &saddr), &updated, now);
     bpf_map_update_elem(&rl_buckets_map, &saddr, &updated, BPF_ANY);
     return exceeded;
 }
 
-/* IPv6 sibling of rate_limit_exceeded: identical token-bucket math against
- * rl_buckets_map6 instead of rl_buckets_map, sharing the same rl_config_map
- * on/off switch and rate/burst (rate limiting is a single cluster-wide
- * per-source-address feature, not per-VIP or per-family — v4 and v6
- * sources are governed by the same configured rate, just tracked in
- * separate bucket maps since the key width differs). Duplicated rather
- * than parameterized over map/key type, matching this file's existing
- * style of explicit per-branch logic over generic helpers (see the
- * TCP/UDP duplication throughout rivora_xdp_ingress). */
-static __always_inline int rate_limit_exceeded_v6(const __u8 saddr[16])
+/* IPv6 sibling of rate_limit_exceeded: the same limiter over the same configs
+ * (v4 and v6 sources are governed by one configured rate), tracked in separate
+ * bucket maps because the key width differs. */
+static __always_inline int rate_limit_exceeded_v6(__u32 sid, const __u8 saddr[16])
 {
+    struct rl_bucket updated;
+    __u64 now;
+
+    struct rl_config *scfg = bpf_map_lookup_elem(&svc_rl_config_map, &sid);
+    if (scfg && scfg->enabled) {
+        struct svc_rl_key6 sk;
+        sk.service_id = sid;
+        __builtin_memcpy(sk.saddr, saddr, 16);
+        now = bpf_ktime_get_ns();
+        int exceeded = rl_take(scfg, bpf_map_lookup_elem(&svc_rl_buckets_map6, &sk), &updated, now);
+        bpf_map_update_elem(&svc_rl_buckets_map6, &sk, &updated, BPF_ANY);
+        return exceeded;
+    }
+
     __u32 zero = 0;
     struct rl_config *cfg = bpf_map_lookup_elem(&rl_config_map, &zero);
     if (!cfg || !cfg->enabled)
@@ -238,26 +256,8 @@ static __always_inline int rate_limit_exceeded_v6(const __u8 saddr[16])
 
     struct addr6_key key;
     __builtin_memcpy(key.addr, saddr, 16);
-
-    __u64 now = bpf_ktime_get_ns();
-    struct rl_bucket *b = bpf_map_lookup_elem(&rl_buckets_map6, &key);
-    struct rl_bucket fresh = {.tokens = cfg->burst, .last_refill_ns = now};
-    if (!b)
-        b = &fresh;
-
-    __u64 elapsed_ns = now > b->last_refill_ns ? now - b->last_refill_ns : 0;
-    if (elapsed_ns > RIVORA_RL_MAX_ELAPSED_NS)
-        elapsed_ns = RIVORA_RL_MAX_ELAPSED_NS;
-
-    __u64 tokens = b->tokens + (elapsed_ns * cfg->rate_per_sec) / 1000000000ULL;
-    if (tokens > cfg->burst)
-        tokens = cfg->burst;
-
-    int exceeded = tokens < 1;
-    if (!exceeded)
-        tokens -= 1;
-
-    struct rl_bucket updated = {.tokens = tokens, .last_refill_ns = now};
+    now = bpf_ktime_get_ns();
+    int exceeded = rl_take(cfg, bpf_map_lookup_elem(&rl_buckets_map6, &key), &updated, now);
     bpf_map_update_elem(&rl_buckets_map6, &key, &updated, BPF_ANY);
     return exceeded;
 }
@@ -337,7 +337,7 @@ static __always_inline int handle_ipv4(struct xdp_md *ctx, void *data, void *dat
      * traffic are untouched regardless of this limiter's state. A no-op,
      * one-array-lookup cost when rl_config_map's enabled bit is unset
      * (the default). */
-    if (is_syn && rate_limit_exceeded(iph->saddr)) {
+    if (is_syn && rate_limit_exceeded(sid, iph->saddr)) {
         bump_stats(RIVORA_STATS_GLOBAL, 0, 1);
         bump_drop(sid, RIVORA_DROP_RATE_LIMITED);
         return XDP_DROP;
@@ -492,7 +492,7 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
         return XDP_PASS; /* not a VIP we own */
     __u32 sid = *service_id;
 
-    if (is_syn && rate_limit_exceeded_v6((__u8 *)&iph->saddr)) {
+    if (is_syn && rate_limit_exceeded_v6(sid, (__u8 *)&iph->saddr)) {
         bump_stats(RIVORA_STATS_GLOBAL, 0, 1);
         bump_drop(sid, RIVORA_DROP_RATE_LIMITED);
         return XDP_DROP;
