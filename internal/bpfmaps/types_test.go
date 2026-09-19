@@ -35,6 +35,10 @@ func TestStructSizesMatchCABI(t *testing.T) {
 		{"NATReverseKey6", unsafe.Sizeof(NATReverseKey6{}), 40},
 		{"NATReverseVal6", unsafe.Sizeof(NATReverseVal6{}), 20},
 		{"Addr6Key", unsafe.Sizeof(Addr6Key{}), 16},
+		{"VipRangeKey", unsafe.Sizeof(VipRangeKey{}), 12},
+		{"VipRangeKey6", unsafe.Sizeof(VipRangeKey6{}), 24},
+		{"SvcRLKey", unsafe.Sizeof(SvcRLKey{}), 8},
+		{"SvcRLKey6", unsafe.Sizeof(SvcRLKey6{}), 20},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -84,10 +88,14 @@ func TestServiceConfigFieldOffsetsMatchCABI(t *testing.T) {
 		"MaglevSize":   {unsafe.Offsetof(sc.MaglevSize), 8},
 		"Mode":         {unsafe.Offsetof(sc.Mode), 12},
 		"Affinity":     {unsafe.Offsetof(sc.Affinity), 13},
+		"Flags":        {unsafe.Offsetof(sc.Flags), 14},
 	} {
 		if c.got != c.want {
 			t.Errorf("ServiceConfig.%s at offset %d, want %d (struct service_config in bpf/rivora_common.h)", name, c.got, c.want)
 		}
+	}
+	if SvcRange != 1 {
+		t.Error("SvcRange must match RIVORA_SVC_RANGE in bpf/rivora_common.h")
 	}
 	if AffinityNone != 0 {
 		t.Error("AffinityNone must be 0: an older pinned service_config has zero there and must mean no affinity")

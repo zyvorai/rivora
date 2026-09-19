@@ -35,6 +35,10 @@ const (
 	MapNATReverse6         = "nat_reverse_map6"
 	MapRateLimitBuckets6   = "rl_buckets_map6"
 
+	// Port-range VIPs live in LPM tries (see VipRangeKey), one per family.
+	MapVIPRange  = "vip_range_map"
+	MapVIPRange6 = "vip_range_map6"
+
 	ProgXDPIngress  = "rivora_xdp_ingress"
 	ProgTCNATEgress = "rivora_tc_nat_egress"
 
@@ -55,7 +59,11 @@ const (
 	// Map capacities compiled into bpf/xdp_ingress.c — mirrored here so Go
 	// code (the ID allocators) can enforce the same ceiling before ever
 	// attempting a map write that the kernel would reject.
-	MaxVIPs     = 4096 // vip_map / service_config_map max_entries
+	MaxVIPs = 4096 // vip_map / service_config_map max_entries
+	// MaxRangeBlocks is vip_range_map's max_entries. A port range is stored as aligned
+	// power-of-two blocks (at most 30 for any range), so a few thousand ranges fit.
+	MaxRangeBlocks = 16384
+
 	MaxBackends = 8192 // backend_map / backend_health_map / stats_map max_entries
 
 	StatsGlobalIdx = 0
@@ -69,6 +77,33 @@ type VipKey struct {
 	Pad   uint8
 }
 
+// VipRangeKey — struct vip_range_key. 12 bytes. The key of an LPM trie:
+// PrefixLen counts the bits of what follows that must match (48 plus the leading
+// bits of Port). Port is in network byte order, so its high bits come first.
+type VipRangeKey struct {
+	PrefixLen uint32
+	Addr      uint32
+	Proto     uint8
+	Pad       uint8
+	Port      uint16
+}
+
+// VipRangeKey6 — struct vip_range_key6. 24 bytes; PrefixLen is 144 plus port bits.
+type VipRangeKey6 struct {
+	PrefixLen uint32
+	Addr      [16]byte
+	Proto     uint8
+	Pad       uint8
+	Port      uint16
+}
+
+// Prefix lengths of a range key's fixed part (address, protocol, pad), to which a
+// block adds the leading bits of its port.
+const (
+	RangePrefixBase4 = 48
+	RangePrefixBase6 = 144
+)
+
 // ServiceConfig — struct service_config. 16 bytes.
 type ServiceConfig struct {
 	BackendCount uint32
@@ -76,8 +111,17 @@ type ServiceConfig struct {
 	MaglevSize   uint32 // must be nonzero and match the extent actually written into maglev_table
 	Mode         uint8
 	Affinity     uint8 // AffinityNone / AffinityClientIP
-	Pad          [2]uint8
+	Flags        uint8 // SvcRange
+	Pad          uint8
 }
+
+// service_config.flags. Mirrors RIVORA_SVC_* in bpf/rivora_common.h. An older pinned
+// service_config has 0 here, which is a plain single-port VIP.
+const (
+	// SvcRange marks a VIP that owns a port range: the destination port is kept as
+	// the client sent it instead of being rewritten to the backend's port.
+	SvcRange = 0x1
+)
 
 // Session affinity: what the Maglev slot is chosen from. Mirrors
 // RIVORA_AFFINITY_* in bpf/rivora_common.h. The zero value is none, so a

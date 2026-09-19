@@ -159,7 +159,7 @@ func cmdStatus(c *apiclient.Client, format string) error {
 			healthy++
 		}
 	}
-	fmt.Printf("VIP        %s:%d/%s\n", st.VIPAddress, st.VIPPort, st.Protocol)
+	fmt.Printf("VIP        %s:%s/%s\n", st.VIPAddress, st.PortLabel(), st.Protocol)
 	fmt.Printf("mode       %s\n", st.Mode)
 	fmt.Printf("interface  %s\n", st.Interface)
 	fmt.Printf("backends   %d/%d healthy\n", healthy, len(st.Backends))
@@ -179,7 +179,7 @@ func cmdVIPs(c *apiclient.Client, format string) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 	fmt.Fprintln(w, "VIP\tPORT\tPROTO\tMODE\tBACKENDS\tPACKETS")
 	for _, st := range vips {
-		fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%d\t%d\n", st.VIPAddress, st.VIPPort, st.Protocol, st.Mode, len(st.Backends), st.Packets)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d\n", st.VIPAddress, st.PortLabel(), st.Protocol, st.Mode, len(st.Backends), st.Packets)
 	}
 	return w.Flush()
 }

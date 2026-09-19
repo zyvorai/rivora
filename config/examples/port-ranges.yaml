@@ -1,0 +1,38 @@
+# Port-range VIPs and the ports shorthand.
+interface: eth0
+
+vips:
+  # Passive-FTP data ports: every port 30000-30100 goes to the same port on the backend.
+  # A range VIP keeps the port the client used, so the backend has no port of its own
+  # and healthCheck.port says what to probe.
+  - address: 192.0.2.20
+    portRange: "30000-30100"
+    protocol: tcp
+    mode: nat
+    healthCheck: {port: 21}
+    backends:
+      - {address: 10.0.0.21}
+      - {address: 10.0.0.22}
+
+  # An exact-port VIP may sit inside a range and takes precedence for its one port:
+  # here 30050 goes to a different backend than the rest of the range.
+  - address: 192.0.2.20
+    port: 30050
+    protocol: tcp
+    mode: nat
+    backends: [{address: 10.0.0.23, port: 30050}]
+
+  # UDP (RTP media) works the same way.
+  - address: 192.0.2.21
+    portRange: "16384-16483"
+    protocol: udp
+    mode: nat
+    healthCheck: {port: 5060}
+    backends: [{address: 10.0.0.24}]
+
+  # ports: [a, b] is shorthand for one VIP per port, sharing everything else.
+  - address: 192.0.2.22
+    ports: [80, 443]
+    protocol: tcp
+    mode: nat
+    backends: [{address: 10.0.0.25, port: 8080}]
