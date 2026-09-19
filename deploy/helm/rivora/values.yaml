@@ -30,6 +30,14 @@ rivorad:
   # isn't supported in v0.2; pin the DaemonSet to matching nodes via
   # nodeSelector if needed).
   interface: ""
+  # xdpMode is how the XDP program attaches to that interface:
+  #   generic  works on any interface, but runs after the driver and forgoes most
+  #            of XDP's speed. The default, so nothing changes unless you opt in.
+  #   native   runs in the NIC driver: much faster, needs driver support, and
+  #            rivorad refuses to start (rather than run slowly) if it's missing.
+  #   auto     try native, fall back to generic with a logged warning.
+  # Check `ip -d link show <iface>`: "xdp" means native, "xdpgeneric" generic.
+  xdpMode: generic
   bpfDir: /usr/local/share/rivora/bpf
   # loadBalancerClass must match controller.loadBalancerClass — both sides
   # need to agree on which Services they manage. "" manages every

@@ -102,6 +102,42 @@ rivoractl weight 12 0              # clear the override; configured weight appli
 - Check a config file before deploying it with `rivoractl validate FILE`; it
   runs the same loader `rivorad` starts with and needs no running daemon.
 
+## XDP attach mode (generic, native, auto)
+
+The XDP program can attach in two ways, chosen with `xdpMode` (or `-xdp-mode`
+under `-kubernetes`, and `rivorad.xdpMode` in the Helm chart):
+
+| Mode | What it is | When |
+| --- | --- | --- |
+| `generic` (default) | Runs in the kernel's network stack after the driver has already built an skb. Works on any interface, including veth, VLANs and bonds. | Anything without native support, and the safe default. |
+| `native` | Runs inside the NIC driver, before an skb exists. Much faster, and the reason to use XDP on real hardware. Needs driver support. | Physical NICs and SR-IOV VFs whose driver supports XDP. |
+| `auto` | Tries native, falls back to generic and logs a warning. | When you want native where available without a per-host setting. |
+
+`generic` stays the default so nothing changes unless you opt in. `native` is
+strict on purpose: if the driver can't do it, `rivorad` refuses to start and
+says so, rather than quietly running at generic speed. Use `auto` if you want the
+fallback.
+
+**Check what is really attached** rather than trusting the config: the mode flag
+on the interface's first `ip link` line (`xdp` is native, `xdpgeneric` is
+generic), or `bpftool net list` (`driver` or `generic`). The start-up log also
+reports `xdp_mode=`, and warns when `auto` fell back. Note the `prog/xdp` line
+under it appears for both modes and doesn't tell them apart.
+
+Things to know:
+
+- **Forwarding modes still matter.** DSR forwards with `XDP_TX`; the loader's
+  own notes record that native `XDP_TX` on veth does not reliably cross a bridge
+  (which is why generic is the default). Full-NAT forwards with `XDP_PASS` and
+  is exercised natively on veth by `scripts/selftest-xdpmode.sh`. DSR under
+  native mode has not been tested here: try it on your own hardware first.
+- **Changing the mode is a one-off gap.** The kernel allows only one mode per
+  interface, so switching replaces the link. With `-persist-datapath` the old
+  pin is dropped and the new mode's link pinned (exactly one XDP pin remains);
+  restarting in the *same* mode afterwards hot-swaps as usual. `xdpMode` is read
+  at start-up, so a reload (SIGHUP) that changes it logs `NOT applied`.
+- **Multiple interfaces** are still not supported: one `interface` per node.
+
 ## Reloading the config without a restart
 
 For a static-YAML node, edit `/etc/rivora/config.yaml`, check it, then reload:

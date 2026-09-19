@@ -225,3 +225,5 @@ jobs:
       run: sudo bash scripts/selftest-adopt.sh
     - name: Drop-reason counters selftest (rate limit, no backend, unserved, veth/netns)
       run: sudo bash scripts/selftest-drops.sh
+    - name: XDP attach mode selftest (generic, native, auto, mode change, veth/netns)
+      run: sudo bash scripts/selftest-xdpmode.sh

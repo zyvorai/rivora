@@ -50,6 +50,7 @@ func main() {
 		logFormat  = flag.String("log-format", "text", "log format: text or json")
 
 		persistDatapath = flag.Bool("persist-datapath", false, "pin the XDP/TCX links so the datapath keeps forwarding while rivorad is down, and hot-swap the program on the next start (no traffic gap on restart). The datapath then stays attached after rivorad exits — use -detach to remove it")
+		xdpModeFlag     = flag.String("xdp-mode", "generic", "how the XDP program attaches: generic (works on any interface; the default), native (in the NIC driver: much faster, needs driver support, fails if unavailable) or auto (try native, fall back to generic); only used with -kubernetes (static-YAML mode reads xdpMode from -config)")
 		detach          = flag.Bool("detach", false, "remove datapath links left attached by a -persist-datapath run, then exit (maps are kept)")
 
 		kubeMode      = flag.Bool("kubernetes", false, "run the Kubernetes reconciler + ARP speaker instead of loading -config; VIPs come from Service/EndpointSlice")
@@ -125,6 +126,7 @@ func main() {
 		}
 		cfg = config.Config{
 			Interface: *ifaceFlag,
+			XDPMode:   config.XDPMode(*xdpModeFlag),
 			APIListen: *apiListen,
 			HealthCheck: config.HealthCheck{
 				Interval:         *healthInterval,
@@ -137,6 +139,10 @@ func main() {
 				PerSourcePacketsPerSecond: *rateLimitPPS,
 				Burst:                     *rateLimitBurst,
 			},
+		}
+		if err := cfg.XDPMode.Validate(); err != nil {
+			logger.Error("-xdp-mode", "err", err)
+			os.Exit(1)
 		}
 		if *rateLimitOn && (*rateLimitPPS == 0 || *rateLimitBurst == 0) {
 			logger.Error("-rate-limit-pps and -rate-limit-burst must both be > 0 with -rate-limit")
@@ -189,6 +195,7 @@ func main() {
 	}
 	defer dp.Close()
 	dp.Persist = *persistDatapath
+	dp.XDPMode = cfg.XDPMode
 
 	if err := dp.AttachXDP(iface); err != nil {
 		logger.Error("attach xdp", "err", err)
@@ -200,7 +207,11 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	logger.Info("attached", "interface", cfg.Interface, "vips", len(cfg.VIPs), "nat_egress", natObj != "")
+	logger.Info("attached", "interface", cfg.Interface, "xdp_mode", dp.XDPActive, "vips", len(cfg.VIPs), "nat_egress", natObj != "")
+	if dp.XDPFallback != nil {
+		logger.Warn("native XDP is unavailable on this interface; fell back to generic mode (much slower). Use a driver with native XDP support, or set xdpMode: generic to silence this",
+			"interface", cfg.Interface, "err", dp.XDPFallback)
+	}
 	if dp.Persist {
 		// "swapped" are links whose running program was replaced in place
 		// (no detach, no gap); anything else was attached fresh this start.

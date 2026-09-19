@@ -1,7 +1,7 @@
 # Copyright 2026 Zyvor AI Labs · https://zyvor.dev
 # SPDX-License-Identifier: Apache-2.0
 
-.PHONY: build bpf test fmt vet selftest selftest-multivip selftest-weighted selftest-ratelimit selftest-ipv6 selftest-ndp selftest-restart selftest-adopt selftest-drops selftest-all \
+.PHONY: build bpf test fmt vet selftest selftest-multivip selftest-weighted selftest-ratelimit selftest-ipv6 selftest-ndp selftest-restart selftest-adopt selftest-drops selftest-xdpmode selftest-all \
 	web web-install docs-serve docs-build \
 	deploy deploy-remote deploy-remote-quick deploy-remote-preflight deploy-remote-verify deploy-remote-uninstall deploy-remote-fleet \
 	sync-chart check-chart-sync build-cli release-cli install
@@ -121,7 +121,10 @@ selftest-adopt:
 selftest-drops:
 	bash scripts/selftest-drops.sh
 
-selftest-all: selftest selftest-multivip selftest-weighted selftest-ratelimit selftest-ipv6 selftest-ndp selftest-restart selftest-adopt selftest-drops
+selftest-xdpmode:
+	bash scripts/selftest-xdpmode.sh
+
+selftest-all: selftest selftest-multivip selftest-weighted selftest-ratelimit selftest-ipv6 selftest-ndp selftest-restart selftest-adopt selftest-drops selftest-xdpmode
 
 docs-serve: ## Local Docusaurus preview (website/)
 	npm --prefix website start

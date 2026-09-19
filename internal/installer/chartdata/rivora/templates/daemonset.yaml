@@ -38,6 +38,7 @@ spec:
           args:
             - -kubernetes
             - -interface={{ .Values.rivorad.interface }}
+            - -xdp-mode={{ .Values.rivorad.xdpMode }}
             - -bpf-dir={{ .Values.rivorad.bpfDir }}
             - -loadbalancer-class={{ .Values.rivorad.loadBalancerClass }}
             - -workers={{ .Values.rivorad.workers }}

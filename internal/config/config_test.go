@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 package config
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 func validConfig() Config {
 	return Config{
@@ -183,12 +186,13 @@ func TestRestartRequired(t *testing.T) {
 
 	next := base
 	next.Interface = "eth1"
+	next.XDPMode = XDPNative
 	next.APIListen = "0.0.0.0:9870"
 	next.HealthCheck.FailThreshold = 5
 	next.RateLimit.Enabled = true
 	next.BGP = BGP{Enabled: true, ASN: 65001, Peers: []BGPPeer{{Address: "10.0.0.2", ASN: 65000}}}
 	got := RestartRequired(base, next)
-	want := []string{"interface", "apiListen", "healthCheck", "rateLimit", "bgp"}
+	want := []string{"interface", "xdpMode", "apiListen", "healthCheck", "rateLimit", "bgp"}
 	if len(got) != len(want) {
 		t.Fatalf("RestartRequired = %v, want %v", got, want)
 	}
@@ -196,5 +200,61 @@ func TestRestartRequired(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("RestartRequired[%d] = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+func TestXDPModeValidation(t *testing.T) {
+	for _, m := range []XDPMode{XDPGeneric, XDPNative, XDPAuto} {
+		if err := m.Validate(); err != nil {
+			t.Errorf("%q rejected: %v", m, err)
+		}
+	}
+	for _, m := range []XDPMode{"driver", "GENERIC", "offload", "skb"} {
+		if err := m.Validate(); err == nil {
+			t.Errorf("%q accepted; only generic, native and auto are modes", m)
+		}
+	}
+}
+
+func TestXDPModeEffective(t *testing.T) {
+	// A Config built in code (zero value) must behave as generic, not as invalid.
+	if got := XDPMode("").Effective(); got != XDPGeneric {
+		t.Errorf("empty mode effective = %q, want generic", got)
+	}
+	if err := XDPMode("").Validate(); err != nil {
+		t.Errorf("the zero value must validate as the default, got %v", err)
+	}
+	for _, m := range []XDPMode{XDPGeneric, XDPNative, XDPAuto} {
+		if m.Effective() != m {
+			t.Errorf("%q changed by Effective()", m)
+		}
+	}
+}
+
+func TestXDPModeDefaultsToGenericAndLoads(t *testing.T) {
+	// Unset means generic: the only mode that works on every interface, so an
+	// existing config keeps doing exactly what it did.
+	if got := defaults().XDPMode; got != XDPGeneric {
+		t.Errorf("default xdpMode = %q, want generic", got)
+	}
+	dir := t.TempDir()
+	write := func(name, extra string) string {
+		p := dir + "/" + name
+		body := "interface: eth0\n" + extra + "vips:\n  - {address: 10.0.0.1, port: 80, protocol: tcp, mode: nat, backends: [{address: 10.1.0.1, port: 80}]}\n"
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	cfg, err := Load(write("unset.yaml", ""))
+	if err != nil || cfg.XDPMode != XDPGeneric {
+		t.Fatalf("unset: mode %q, err %v; want generic", cfg.XDPMode, err)
+	}
+	cfg, err = Load(write("native.yaml", "xdpMode: native\n"))
+	if err != nil || cfg.XDPMode != XDPNative {
+		t.Fatalf("native: mode %q, err %v", cfg.XDPMode, err)
+	}
+	if _, err := Load(write("bad.yaml", "xdpMode: driver\n")); err == nil {
+		t.Error("an unknown xdpMode loaded; a typo must fail at start-up, not silently mean generic")
 	}
 }

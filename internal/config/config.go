@@ -140,8 +140,44 @@ func (b BGP) Validate() error {
 	return nil
 }
 
+// XDPMode is how the XDP ingress program attaches to the interface.
+//
+// Generic (the default) runs XDP in the kernel's network stack after the driver:
+// it works on any interface, including veth, but skips most of the performance
+// advantage of XDP. Native runs it inside the NIC driver before an skb is even
+// allocated, which needs driver support. Auto tries native and falls back to
+// generic (with a warning) when the driver can't.
+type XDPMode string
+
+const (
+	XDPGeneric XDPMode = "generic"
+	XDPNative  XDPMode = "native"
+	XDPAuto    XDPMode = "auto"
+)
+
+// Effective returns the mode to use: the empty value (a Config built in code
+// rather than loaded from a file) means the default, generic.
+func (m XDPMode) Effective() XDPMode {
+	if m == "" {
+		return XDPGeneric
+	}
+	return m
+}
+
+// Validate rejects anything but the three modes (or empty, meaning generic).
+func (m XDPMode) Validate() error {
+	switch m.Effective() {
+	case XDPGeneric, XDPNative, XDPAuto:
+		return nil
+	}
+	return fmt.Errorf("xdpMode %q: must be generic, native or auto", string(m))
+}
+
 type Config struct {
-	Interface   string      `yaml:"interface"`
+	Interface string `yaml:"interface"`
+	// XDPMode defaults to generic, the only mode that works on every interface
+	// (native XDP_TX on veth, for one, does not reliably cross a bridge).
+	XDPMode     XDPMode     `yaml:"xdpMode,omitempty"`
 	APIListen   string      `yaml:"apiListen"`
 	HealthCheck HealthCheck `yaml:"healthCheck"`
 	RateLimit   RateLimit   `yaml:"rateLimit"`
@@ -163,13 +199,16 @@ func HasNATVIP(vips []VIP) bool {
 
 // RestartRequired names the top-level settings that differ between the running
 // config and a reloaded one but are only read once, at startup: the attached
-// interface, the API listener, health-check parameters, the SYN rate limit and
-// the BGP speaker. A reload applies the VIP set only; callers report these so
+// interface, the XDP attach mode, the API listener, health-check parameters, the
+// SYN rate limit and the BGP speaker. A reload applies the VIP set only; callers report these so
 // an operator isn't left believing an edit took effect.
 func RestartRequired(running, next Config) []string {
 	var changed []string
 	if running.Interface != next.Interface {
 		changed = append(changed, "interface")
+	}
+	if running.XDPMode.Effective() != next.XDPMode.Effective() {
+		changed = append(changed, "xdpMode")
 	}
 	if running.APIListen != next.APIListen {
 		changed = append(changed, "apiListen")
@@ -188,6 +227,7 @@ func RestartRequired(running, next Config) []string {
 
 func defaults() Config {
 	return Config{
+		XDPMode:   XDPGeneric,
 		APIListen: "127.0.0.1:9870",
 		HealthCheck: HealthCheck{
 			Interval:         3 * time.Second,
@@ -216,6 +256,9 @@ func Load(path string) (Config, error) {
 func (c Config) Validate() error {
 	if c.Interface == "" {
 		return fmt.Errorf("interface is required")
+	}
+	if err := c.XDPMode.Validate(); err != nil {
+		return err
 	}
 	if c.RateLimit.Enabled && (c.RateLimit.PerSourcePacketsPerSecond == 0 || c.RateLimit.Burst == 0) {
 		return fmt.Errorf("rateLimit: perSourcePacketsPerSecond and burst must both be > 0 when enabled")
