@@ -78,7 +78,10 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
   `rivoractl drain|undrain ID` and `rivoractl weight ID N` (see the
   [runbook](website/docs/operations/runbook.md)); `rivoractl validate FILE`
   checks a static config offline, and `systemctl reload rivorad` (SIGHUP)
-  applies an edited config's VIP set live. A VIP's `healthCheck: {type: http, ...}`
+  applies an edited config's VIP set live. `sessionAffinity: clientIP` pins a client
+  to one backend (and maps a Service's `sessionAffinity: ClientIP`);
+  `externalTrafficPolicy: Local` is honoured with BGP and the L2 speaker off (see the
+  [runbook](website/docs/operations/runbook.md)). A VIP's `healthCheck: {type: http, ...}`
   probes an HTTP endpoint and judges its status instead of only a TCP connect
   (see `config/examples/http-healthcheck.yaml`). `xdpMode: native` (or `auto`)
   attaches XDP in the NIC driver instead of the default generic mode.
