@@ -667,3 +667,166 @@ func TestTunnelSourceValidation(t *testing.T) {
 		t.Errorf("RestartRequired = %v, want [tunnelSource]", got)
 	}
 }
+
+func TestParseCommunities(t *testing.T) {
+	got, err := ParseCommunities([]string{"65000:100", "no-export", " NO-ADVERTISE ", "0:0", "65535:65535"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []uint32{65000<<16 | 100, 0xFFFFFF01, 0xFFFFFF02, 0, 0xFFFFFFFF}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("community %d = %#x, want %#x", i, got[i], want[i])
+		}
+	}
+	for _, bad := range []string{"", "65000", "65536:1", "1:65536", "a:b", "no-such-name", "1:2:3", "-1:1"} {
+		if _, err := ParseCommunities([]string{bad}); err == nil {
+			t.Errorf("community %q must be rejected", bad)
+		}
+	}
+}
+
+func TestBGPPeerOptionValidation(t *testing.T) {
+	mk := func(p BGPPeer) BGP {
+		p.Address, p.ASN = "192.0.2.1", 65100
+		return BGP{Enabled: true, ASN: 65000, RouterID: "1.1.1.1", Peers: []BGPPeer{p}}
+	}
+	ok := func(name string, p BGPPeer) {
+		if err := mk(p).Validate(); err != nil {
+			t.Errorf("%s: unexpected error %v", name, err)
+		}
+	}
+	bad := func(name string, p BGPPeer, want string) {
+		if err := mk(p).Validate(); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: error %v, want it to contain %q", name, err, want)
+		}
+	}
+	ok("password", BGPPeer{Password: "s3cret"})
+	ok("password file", BGPPeer{PasswordFile: "/run/secrets/bgp"})
+	ok("multihop", BGPPeer{Multihop: 4})
+	ok("graceful restart", BGPPeer{GracefulRestart: &BGPGracefulRestart{Enabled: true, RestartTime: 300}})
+	bad("both password forms", BGPPeer{Password: "a", PasswordFile: "/x"}, "not both")
+	bad("password too long", BGPPeer{Password: strings.Repeat("x", 81)}, "80 bytes")
+	bad("multihop 1", BGPPeer{Multihop: 1}, "2-255")
+	bad("multihop 256", BGPPeer{Multihop: 256}, "2-255")
+	bad("restart time too big", BGPPeer{GracefulRestart: &BGPGracefulRestart{Enabled: true, RestartTime: 5000}}, "4095")
+	// Multihop is an eBGP setting: a peer in our own AS is iBGP.
+	ibgp := mk(BGPPeer{Multihop: 3})
+	ibgp.Peers[0].ASN = 65000
+	if err := ibgp.Validate(); err == nil || !strings.Contains(err.Error(), "eBGP") {
+		t.Errorf("multihop on an iBGP peer must be rejected, got %v", err)
+	}
+}
+
+func TestBGPAggregatesAndCommunitiesValidate(t *testing.T) {
+	base := func() BGP {
+		return BGP{Enabled: true, ASN: 65000, RouterID: "1.1.1.1", Peers: []BGPPeer{{Address: "192.0.2.1", ASN: 65100}}}
+	}
+	b := base()
+	b.Communities = []string{"65000:1", "no-export"}
+	b.Aggregates = []BGPAggregate{{Prefix: "192.0.2.0/24", SuppressSpecifics: true, Communities: []string{"65000:2"}}, {Prefix: "2001:db8::/48"}}
+	if err := b.Validate(); err != nil {
+		t.Errorf("valid options rejected: %v", err)
+	}
+	b = base()
+	b.Communities = []string{"nonsense"}
+	if err := b.Validate(); err == nil {
+		t.Error("a bad global community must be rejected")
+	}
+	b = base()
+	b.Aggregates = []BGPAggregate{{Prefix: "192.0.2.0"}}
+	if err := b.Validate(); err == nil || !strings.Contains(err.Error(), "aggregate") {
+		t.Errorf("an aggregate that is not a prefix must be rejected, got %v", err)
+	}
+	// A VIP's own communities are validated with the config.
+	c := validConfig()
+	c.VIPs[0].BGPCommunities = []string{"65000:x"}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "bgpCommunities") {
+		t.Errorf("a bad VIP community must be rejected, got %v", err)
+	}
+}
+
+func TestBGPForNodeFiltersPeers(t *testing.T) {
+	b := BGP{Peers: []BGPPeer{
+		{Address: "10.0.0.1", ASN: 1},                            // everywhere
+		{Address: "10.0.1.1", ASN: 1, Nodes: []string{"a", "b"}}, // only a and b
+		{Address: "10.0.2.1", ASN: 1, Nodes: []string{"c"}},      // only c
+	}}
+	names := func(x BGP) []string {
+		var out []string
+		for _, p := range x.Peers {
+			out = append(out, p.Address)
+		}
+		return out
+	}
+	for node, want := range map[string]string{
+		"a": "10.0.0.1 10.0.1.1", "c": "10.0.0.1 10.0.2.1", "z": "10.0.0.1", "": "10.0.0.1",
+	} {
+		if got := strings.Join(names(b.ForNode(node)), " "); got != want {
+			t.Errorf("ForNode(%q) = %q, want %q", node, got, want)
+		}
+	}
+	if len(b.Peers) != 3 {
+		t.Error("ForNode must not modify the receiver")
+	}
+}
+
+func TestParsePeerAddrs(t *testing.T) {
+	got, err := ParsePeerAddrs([]string{"192.0.2.2", "2001:DB8::1", "192.0.2.2", "::ffff:192.0.2.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"192.0.2.1", "192.0.2.2", "2001:db8::1"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("ParsePeerAddrs = %v, want %v (canonical, sorted, no repeats, v4-mapped unmapped)", got, want)
+	}
+	if out, err := ParsePeerAddrs(nil); out != nil || err != nil {
+		t.Errorf("no peers should mean no limit: %v %v", out, err)
+	}
+	if _, err := ParsePeerAddrs([]string{"192.0.2.1", "tor-1"}); err == nil {
+		t.Error("a name that is not an address must be rejected")
+	}
+}
+
+func TestVIPBGPPeersMustBeConfiguredPeers(t *testing.T) {
+	c := validConfig()
+	c.BGP = BGP{Enabled: true, ASN: 65000, RouterID: "1.1.1.1", Peers: []BGPPeer{{Address: "192.0.2.1", ASN: 65100}, {Address: "2001:db8::1", ASN: 65100}}}
+	c.VIPs[0].BGPPeers = []string{"192.0.2.1", "2001:DB8::1"}
+	if err := c.Validate(); err != nil {
+		t.Errorf("configured peers (in any spelling) rejected: %v", err)
+	}
+	c.VIPs[0].BGPPeers = []string{"192.0.2.9"}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "bgpPeers") || !strings.Contains(err.Error(), "192.0.2.9") {
+		t.Errorf("a peer that is not configured must be named and rejected, got %v", err)
+	}
+	c.VIPs[0].BGPPeers = []string{"not-an-ip"}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "bgpPeers") {
+		t.Errorf("a non-address must be rejected, got %v", err)
+	}
+	// Peers that arrive at run time (BGPPeer resources) cannot be checked here.
+	c.VIPs[0].BGPPeers = []string{"192.0.2.9"}
+	c.BGP.PeersFromResources = true
+	if err := c.Validate(); err != nil {
+		t.Errorf("with peers coming from resources the list cannot be checked: %v", err)
+	}
+	// An aggregate's list is checked the same way.
+	b := BGP{Enabled: true, ASN: 65000, RouterID: "1.1.1.1", Peers: []BGPPeer{{Address: "192.0.2.1", ASN: 65100}},
+		Aggregates: []BGPAggregate{{Prefix: "10.0.0.0/24", Peers: []string{"192.0.2.9"}}}}
+	if err := b.Validate(); err == nil || !strings.Contains(err.Error(), "aggregate") {
+		t.Errorf("an aggregate limited to an unknown peer must be rejected, got %v", err)
+	}
+}
+
+func TestBGPWithoutPeersNeedsResources(t *testing.T) {
+	b := BGP{Enabled: true, ASN: 65000, RouterID: "1.1.1.1"}
+	if err := b.Validate(); err == nil {
+		t.Error("BGP with no peers at all must be rejected")
+	}
+	b.PeersFromResources = true
+	if err := b.Validate(); err != nil {
+		t.Errorf("BGP with peers to come from resources is valid: %v", err)
+	}
+}

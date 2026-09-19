@@ -36,6 +36,7 @@ import (
 	"github.com/zyvorai/rivora/api/v1alpha1"
 	"github.com/zyvorai/rivora/internal/config"
 	"github.com/zyvorai/rivora/internal/dataplane"
+	"github.com/zyvorai/rivora/internal/initsync"
 )
 
 // serviceNameLabel is set by Kubernetes on every EndpointSlice to the name
@@ -100,7 +101,14 @@ type Reconciler struct {
 	// active health checker's target list, since Targets() only reflects
 	// whatever's currently in the maps.
 	OnChange func()
+
+	// init, if set, is told when each Service present at start-up has been reconciled once.
+	init *initsync.Tracker
 }
+
+// SetInitTracker makes Run report, through t, when every Service that existed once the caches
+// synced has been reconciled successfully. Set before Run.
+func (r *Reconciler) SetInitTracker(t *initsync.Tracker) { r.init = t }
 
 // New builds a Reconciler. lbClass selects which LoadBalancer Services this
 // node manages (see managed()); pass "" for "every LoadBalancer Service
@@ -292,6 +300,20 @@ func (r *Reconciler) Run(ctx context.Context, factory informers.SharedInformerFa
 	}
 	r.logger.Info("controller caches synced")
 
+	if r.init != nil {
+		// Armed before any worker runs, so a fast worker cannot finish a key before it is pending.
+		// Every Service in the cache has an add event on its way to the queue, so each will be seen.
+		var keys []string
+		if svcs, err := r.serviceLister.List(labels.Everything()); err == nil {
+			for _, svc := range svcs {
+				keys = append(keys, svc.Namespace+"/"+svc.Name)
+			}
+		} else {
+			r.logger.Error("list services for the initial sync", "err", err)
+		}
+		r.init.Arm(keys)
+	}
+
 	for i := 0; i < workers; i++ {
 		go r.worker(ctx)
 	}
@@ -317,6 +339,9 @@ func (r *Reconciler) processNextItem(ctx context.Context) bool {
 		return true
 	}
 	r.queue.Forget(key)
+	if r.init != nil {
+		r.init.Finished(key)
+	}
 	return true
 }
 

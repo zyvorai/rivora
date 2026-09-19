@@ -45,6 +45,9 @@ spec:
             - -speaker={{ .Values.rivorad.speaker }}
             - -gateway-api={{ .Values.gatewayApi.enabled }}
             - -service-policy={{ .Values.servicePolicy.enabled }}
+            {{- if and .Values.bgp.enabled .Values.bgp.configSecret }}
+            - -bgp-config=/etc/rivora/bgp/bgp.yaml
+            {{- else }}
             - -bgp={{ .Values.bgp.enabled }}
             {{- if .Values.bgp.enabled }}
             - -bgp-asn={{ .Values.bgp.asn }}
@@ -53,6 +56,10 @@ spec:
             - -bgp-ipv6-next-hop={{ .Values.bgp.ipv6NextHop }}
             {{- end }}
             - -bgp-peers={{ $bgpPeers | join "," }}
+            {{- end }}
+            {{- end }}
+            {{- if and .Values.bgp.enabled .Values.bgp.peerResources }}
+            - -bgp-peer-resources=true
             {{- end }}
           env:
             - name: POD_NAMESPACE
@@ -94,6 +101,11 @@ spec:
           volumeMounts:
             - name: bpffs
               mountPath: /sys/fs/bpf
+            {{- if and .Values.bgp.enabled .Values.bgp.configSecret }}
+            - name: bgp-config
+              mountPath: /etc/rivora/bgp
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.rivorad.resources | nindent 12 }}
       volumes:
@@ -101,6 +113,14 @@ spec:
           hostPath:
             path: /sys/fs/bpf
             type: DirectoryOrCreate
+        {{- if and .Values.bgp.enabled .Values.bgp.configSecret }}
+        - name: bgp-config
+          secret:
+            secretName: {{ .Values.bgp.configSecret }}
+            items:
+              - key: bgp.yaml
+                path: bgp.yaml
+        {{- end }}
       {{- with .Values.rivorad.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

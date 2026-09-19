@@ -36,11 +36,21 @@ var (
 	// TCPRoute/UDPRoute are part of the "experimental" channel — v1alpha2
 	// is, as of writing, the only version they've shipped at.
 	gatewayV1alpha2 = schema.GroupVersion{Group: GroupName, Version: "v1alpha2"}
+	gatewayV1beta1  = schema.GroupVersion{Group: GroupName, Version: "v1beta1"}
 
 	GatewayClassResource = gatewayV1.WithResource("gatewayclasses")
 	GatewayResource      = gatewayV1.WithResource("gateways")
 	TCPRouteResource     = gatewayV1alpha2.WithResource("tcproutes")
 	UDPRouteResource     = gatewayV1alpha2.WithResource("udproutes")
+
+	// ReferenceGrant is part of the standard channel, at v1beta1.
+	ReferenceGrantResource = gatewayV1beta1.WithResource("referencegrants")
+)
+
+// Route kinds Rivora serves.
+const (
+	KindTCPRoute = "TCPRoute"
+	KindUDPRoute = "UDPRoute"
 )
 
 // GatewayClass — spec.controllerName only; status is written, not read.
@@ -83,6 +93,28 @@ type GatewayListener struct {
 	Name     string `json:"name"`
 	Protocol string `json:"protocol"` // "TCP" or "UDP" — anything else is skipped, not an error
 	Port     int32  `json:"port"`
+	// AllowedRoutes says which routes may attach to this listener: by namespace (the Gateway's
+	// own by default) and by kind (the kind matching the listener's protocol by default).
+	AllowedRoutes *AllowedRoutes `json:"allowedRoutes,omitempty"`
+}
+
+// AllowedRoutes mirrors the upstream field of the same name.
+type AllowedRoutes struct {
+	Namespaces *RouteNamespaces `json:"namespaces,omitempty"`
+	Kinds      []RouteGroupKind `json:"kinds,omitempty"`
+}
+
+// RouteNamespaces selects the namespaces routes may attach from: From is Same (the default: the
+// Gateway's own namespace), All, or Selector (namespaces whose labels match Selector).
+type RouteNamespaces struct {
+	From     *string               `json:"from,omitempty"`
+	Selector *metav1.LabelSelector `json:"selector,omitempty"`
+}
+
+// RouteGroupKind names a route kind; Group defaults to gateway.networking.k8s.io.
+type RouteGroupKind struct {
+	Group *string `json:"group,omitempty"`
+	Kind  string  `json:"kind"`
 }
 
 type GatewayAddress struct {
@@ -93,6 +125,16 @@ type GatewayAddress struct {
 type GatewayStatus struct {
 	Addresses  []GatewayAddress   `json:"addresses,omitempty"`
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	// Listeners reports, per listener, the kinds it serves and how many routes are attached.
+	Listeners []ListenerStatus `json:"listeners,omitempty"`
+}
+
+// ListenerStatus is one listener's entry in Gateway.status.listeners.
+type ListenerStatus struct {
+	Name           string             `json:"name"`
+	SupportedKinds []RouteGroupKind   `json:"supportedKinds"`
+	AttachedRoutes int32              `json:"attachedRoutes"`
+	Conditions     []metav1.Condition `json:"conditions"`
 }
 
 // TCPRoute / UDPRoute share an identical shape upstream (RouteSpec +
@@ -102,26 +144,60 @@ type GatewayStatus struct {
 type TCPRoute struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
-	Spec              RouteSpec `json:"spec"`
+	Spec              RouteSpec   `json:"spec"`
+	Status            RouteStatus `json:"status,omitempty"`
 }
 
 type UDPRoute struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
-	Spec              RouteSpec `json:"spec"`
+	Spec              RouteSpec   `json:"spec"`
+	Status            RouteStatus `json:"status,omitempty"`
 }
+
+// RouteStatus is the per-parent status of a route. Several controllers may share one route, each
+// owning the entries carrying its own ControllerName; a writer must leave the others' alone.
+type RouteStatus struct {
+	Parents []RouteParentStatus `json:"parents"`
+}
+
+// RouteParentStatus says whether one parentRef was accepted and whether the route's references
+// resolved.
+type RouteParentStatus struct {
+	ParentRef      ParentRef          `json:"parentRef"`
+	ControllerName string             `json:"controllerName"`
+	Conditions     []metav1.Condition `json:"conditions"`
+}
+
+// Route condition types and reasons Rivora sets.
+const (
+	ConditionAccepted     = "Accepted"
+	ConditionResolvedRefs = "ResolvedRefs"
+
+	ReasonAccepted              = "Accepted"
+	ReasonNoMatchingParent      = "NoMatchingParent"
+	ReasonNotAllowedByListeners = "NotAllowedByListeners"
+	ReasonResolvedRefs          = "ResolvedRefs"
+	ReasonRefNotPermitted       = "RefNotPermitted"
+	ReasonInvalidKind           = "InvalidKind"
+	ReasonBackendNotFound       = "BackendNotFound"
+	ReasonUnsupportedProtocol   = "UnsupportedProtocol"
+	ReasonListenerAccepted      = "Accepted"
+	ReasonListenerResolvedRefs  = "ResolvedRefs"
+)
 
 type RouteSpec struct {
 	ParentRefs []ParentRef `json:"parentRefs,omitempty"`
 	Rules      []RouteRule `json:"rules"`
 }
 
-// ParentRef identifies the Gateway (and, optionally, one specific
-// listener by name) this route attaches to. Namespace is deliberately
-// not read here — v1 only supports a route attaching to a Gateway in its
-// own namespace (see reconciler doc comments); a cross-namespace
-// ParentRef is simply never matched, not specially rejected.
+// ParentRef identifies the Gateway (and, optionally, one specific listener by name) this route
+// attaches to. Namespace is the Gateway's namespace, defaulting to the route's own; a route in
+// another namespace attaches only if the listener's allowedRoutes permits it.
 type ParentRef struct {
+	Group       *string `json:"group,omitempty"`
+	Kind        *string `json:"kind,omitempty"`
+	Namespace   *string `json:"namespace,omitempty"`
 	Name        string  `json:"name"`
 	SectionName *string `json:"sectionName,omitempty"`
 }
@@ -130,14 +206,9 @@ type RouteRule struct {
 	BackendRefs []BackendRef `json:"backendRefs,omitempty"`
 }
 
-// BackendRef targets a Service (Group/Kind are read implicitly as the
-// core-API Service default — any other Kind is skipped rather than
-// erroring, since Rivora has nothing else to route to) in the Route's own
-// namespace only (Namespace set = cross-namespace = requires a
-// ReferenceGrant Rivora doesn't check yet — skipped, not rejected
-// outright, matching the "unsupported input yields no VIP for that piece,
-// not a hard failure" pattern internal/controller's buildDesiredVIPs
-// already uses for e.g. SCTP ports).
+// BackendRef targets a Service (any other Kind is rejected: Rivora has nothing else to route to).
+// Namespace defaults to the route's own; a Service in another namespace is used only if a
+// ReferenceGrant in that namespace allows this route's kind and namespace to reference it.
 type BackendRef struct {
 	Group     *string `json:"group,omitempty"`
 	Kind      *string `json:"kind,omitempty"`
@@ -145,4 +216,31 @@ type BackendRef struct {
 	Namespace *string `json:"namespace,omitempty"`
 	Port      *int32  `json:"port,omitempty"`
 	Weight    *int32  `json:"weight,omitempty"`
+}
+
+// ReferenceGrant lets objects of the kinds/namespaces in From reference objects of the kinds in To,
+// in the ReferenceGrant's own namespace.
+type ReferenceGrant struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              ReferenceGrantSpec `json:"spec"`
+}
+
+type ReferenceGrantSpec struct {
+	From []ReferenceGrantFrom `json:"from"`
+	To   []ReferenceGrantTo   `json:"to"`
+}
+
+type ReferenceGrantFrom struct {
+	Group     string `json:"group"`
+	Kind      string `json:"kind"`
+	Namespace string `json:"namespace"`
+}
+
+// ReferenceGrantTo names a kind (and, optionally, one object) that may be referenced. An empty
+// Group is the core API.
+type ReferenceGrantTo struct {
+	Group string  `json:"group"`
+	Kind  string  `json:"kind"`
+	Name  *string `json:"name,omitempty"`
 }

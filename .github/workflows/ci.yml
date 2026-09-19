@@ -30,6 +30,16 @@ jobs:
     # -race covers the product IPv6 follow-ons (IPAM sparse alloc, BGP,
     # speaker VIP selection) plus the rest of the tree in one pass.
     - run: go test -race ./...
+    # The BGP tests that need CAP_NET_ADMIN (TCP MD5) skip themselves unprivileged; run them for real.
+    - name: BGP TCP MD5 tests (privileged)
+      run: sudo env "PATH=$PATH" "GOCACHE=$(go env GOCACHE)" "GOMODCACHE=$(go env GOMODCACHE)" go test -count=1 -run 'TestMD5' -v ./internal/bgp
+    # Adoption after a restart, against real kernel maps (unpinned, so nothing is shared with the
+    # runner). Without the compiled objects and root these tests skip, as they do in `go test ./...` above.
+    - name: Datapath adoption tests against kernel maps (privileged)
+      run: |
+        sudo apt-get update -qq && sudo apt-get install -y -qq clang llvm libelf-dev
+        make bpf
+        sudo env "PATH=$PATH" "GOCACHE=$(go env GOCACHE)" "GOMODCACHE=$(go env GOMODCACHE)" go test -count=1 -run 'TestKubernetesModeAdopts|TestPruneUnclaimed' -v ./internal/dataplane
     - run: gofmt -l . | tee /tmp/fmt.out && [ ! -s /tmp/fmt.out ]
   security:
     runs-on: ubuntu-latest
@@ -264,7 +274,9 @@ jobs:
       # basis, since on a host where it does work the multivip step then runs.
       run: |
         sudo apt-get update -qq
-        sudo apt-get install -y -qq clang llvm libelf-dev
+        # ethtool and tcpdump: the edge-case, checksum and L3 DSR selftests switch offloads off
+        # and read packet captures.
+        sudo apt-get install -y -qq clang llvm libelf-dev ethtool tcpdump
         sudo apt-get install -y -qq bpftool || true
         command -v bpftool || sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" || true
         command -v bpftool || sudo apt-get install -y -qq linux-tools-common linux-tools-generic || true
@@ -320,9 +332,18 @@ jobs:
     - name: Edge-case selftest (VLAN/QinQ, IP options, fragments, ICMP path-MTU)
       if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-edgecases.sh
+    - name: IPv6 affinity and drop-counter selftest
+      if: ${{ !cancelled() }}
+      run: sudo bash scripts/selftest-ipv6-policy.sh
+    - name: IPv6 extension-header and fragment selftest
+      if: ${{ !cancelled() }}
+      run: sudo bash scripts/selftest-ipv6-ext.sh
     - name: L3 DSR selftest (IP-in-IP and GRE, IPv4 + IPv6, routed backend)
       if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-l3dsr.sh
+    - name: BGP selftest (multihop + TCP MD5 across a router, communities)
+      if: ${{ !cancelled() }}
+      run: sudo env "PATH=$PATH" "GOCACHE=$(go env GOCACHE)" "GOMODCACHE=$(go env GOMODCACHE)" bash scripts/selftest-bgp.sh
     - name: NAT checksum selftest (TCP/UDP over IPv4 and IPv6, checksum offload off)
       if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-checksum.sh

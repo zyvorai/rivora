@@ -162,7 +162,7 @@ def handle(c):
                 d = c.recv(4096)
                 if not d: break
                 n += len(d)
-                if n >= 1300 or d.endswith(b"\n"): break
+                if d.endswith(b"\n"): break
         except OSError:
             pass
         c.sendall(("%s:%d\n" % (ident, n)).encode())
@@ -180,10 +180,12 @@ serve ipip6 fd00:87::103; serve gre6 fd00:87::104
 serve health 10.88.0.11; serve health6 fd00:88::11 # the health checker probes the backend's real address
 sleep 0.6
 
+XDP_MODE=""   # set to "native" for the native-XDP scenario
 write_config() {   # write_config <explicit-source: yes|no>
     {
         echo "interface: ldr-lb"
         echo "apiListen: ${API}"
+        [ -n "$XDP_MODE" ] && echo "xdpMode: ${XDP_MODE}"
         if [ "$1" = yes ]; then echo "tunnelSource: 10.88.0.1"; echo "tunnelSource6: 'fd00:88::1'"; fi
         echo "healthCheck: {interval: 1s, timeout: 500ms, failThreshold: 2, successThreshold: 1}"
         echo "vips:"
@@ -212,7 +214,7 @@ import socket, sys
 vip, n = sys.argv[1], int(sys.argv[2])
 fam = socket.AF_INET6 if ":" in vip else socket.AF_INET
 try:
-    s = socket.socket(fam, socket.SOCK_STREAM); s.settimeout(2.0)
+    s = socket.socket(fam, socket.SOCK_STREAM); s.settimeout(8.0 if n > 5000 else 2.0)
     s.connect((vip, 8080))
     s.sendall(b"x" * (n - 1) + b"\n")
     print(s.recv(64).decode().strip() or "fail")
@@ -313,6 +315,75 @@ else
     run_checks 10.87.0.1 fd00:87::1
     stop_rivorad
 fi
+
+# ---------------------------------------------------------------------------
+section "3. Native XDP (tunnelled frames redirected out of another interface)"
+# ---------------------------------------------------------------------------
+# A veth can only take a redirected frame in native mode if its PEER also runs an XDP program (a
+# property of veth, not of rivora: a physical NIC does not need this). Attach a do-nothing one to
+# the backend's end.
+if ! command -v clang >/dev/null 2>&1; then
+    skip "clang not available to build the do-nothing XDP program the veth peer needs"
+else
+    cat >"${WORK}/pass.c" <<'CEOF'
+#include <linux/bpf.h>
+__attribute__((section("xdp"), used)) int pass(struct xdp_md *c) { return XDP_PASS; }
+char _license[] __attribute__((section("license"), used)) = "GPL";
+CEOF
+    if clang -target bpfel -O2 -c "${WORK}/pass.c" -o "${WORK}/pass.o" -I"/usr/include/$(uname -m)-linux-gnu" 2>"${WORK}/pass.log" \
+        && in_ns "$NS_BE" ip link set dev ldr-be xdp obj "${WORK}/pass.o" sec xdp 2>"${WORK}/attach.log"; then
+        XDP_MODE=native
+        write_config yes
+        in_ns "$NS_LB" rm -rf /sys/fs/bpf/rivora-lb 2>/dev/null
+        if ! start_rivorad; then
+            fail "rivorad did not come up in native XDP mode"; tail -n 20 "$LOG"
+        else
+            if grep -q "xdp_mode=native" "$LOG"; then
+                pass "rivorad attached in native XDP mode"
+            else
+                fail "rivorad did not attach natively: $(grep -m1 xdp_mode "$LOG")"
+            fi
+            sleep 3
+            expect "IPv4 IP-in-IP (native)" 10.87.0.103 1300 "ipip:1300"
+            expect "IPv4 GRE (native)" 10.87.0.104 1300 "gre:1300"
+            expect "IPv6 IPv6-in-IPv6 (native)" fd00:87::103 1300 "ipip6:1300"
+            expect "IPv6 GRE over IPv6 (native)" fd00:87::104 1300 "gre6:1300"
+            stop_rivorad
+        fi
+        XDP_MODE=""
+    else
+        skip "could not prepare a native XDP setup on this kernel: $(head -c 200 "${WORK}/pass.log" "${WORK}/attach.log" 2>/dev/null | tr '\n' ' ')"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+section "3b. Path MTU: the path to the backend is smaller than the client's"
+# ---------------------------------------------------------------------------
+# The client sends full 1500-byte packets, but the load balancer's link to the backend only carries 1400,
+# and the tunnel adds 20-44 bytes: XDP cannot fragment. A full-size segment must therefore be answered
+# with "fragmentation needed" / "packet too big" (as a router would), so the client's own path-MTU
+# discovery shrinks its segments. Without it a large transfer stalls for good.
+in_ns "$NS_LB" ip link set ldr-lb2 mtu 1400; in_ns "$NS_BE" ip link set ldr-be mtu 1400
+write_config yes
+in_ns "$NS_LB" rm -rf /sys/fs/bpf/rivora-lb 2>/dev/null
+if ! start_rivorad; then
+    fail "rivorad did not come up for the path-MTU scenario"; tail -n 20 "$LOG"
+else
+    sleep 3
+    for c in "10.87.0.103 ipip4 1380" "10.87.0.104 gre4 1376" "fd00:87::103 ipip6 1360" "fd00:87::104 gre6 1356"; do
+        set -- $c; vip="$1"; name="$2"; want="$3"
+        got=$(request "$vip" 20000)
+        case "$name" in ipip4) ident=ipip ;; gre4) ident=gre ;; ipip6) ident=ipip6 ;; gre6) ident=gre6 ;; esac
+        [ "$got" = "${ident}:20000" ] && pass "a 20000-byte request to the $name VIP completed over the smaller path ($got)" \
+            || fail "a 20000-byte request to the $name VIP answered '$got', want ${ident}:20000 (no path-MTU reply reached the client?)"
+        if [[ "$vip" == *:* ]]; then mtu=$(in_ns "$NS_CLIENT" ip -6 route get "$vip" 2>/dev/null | grep -o 'mtu [0-9]*' | head -1 | cut -d' ' -f2)
+        else mtu=$(in_ns "$NS_CLIENT" ip route get "$vip" 2>/dev/null | grep -o 'mtu [0-9]*' | head -1 | cut -d' ' -f2); fi
+        [ "$mtu" = "$want" ] && pass "the client learned a path MTU of $mtu towards the $name VIP (link 1400 less the tunnel overhead)" \
+            || fail "the client's path MTU towards the $name VIP is '${mtu:-unset}', want $want"
+    done
+    stop_rivorad
+fi
+in_ns "$NS_LB" ip link set ldr-lb2 mtu 1500; in_ns "$NS_BE" ip link set ldr-be mtu 1500
 
 # ---------------------------------------------------------------------------
 section "4. A bad config is refused"
