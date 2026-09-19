@@ -44,6 +44,9 @@ type BGPPolicy struct {
 	// speaker's own: "65000:100" (both halves 0-65535) or no-export, no-advertise,
 	// no-export-subconfed.
 	Communities []string `json:"communities,omitempty"`
+	// Peers limits the route advertised for this Service's VIPs to the BGP peers with these
+	// addresses. Unset means every peer.
+	Peers []string `json:"peers,omitempty"`
 }
 
 // PolicyTargetRef points a policy at a Service.

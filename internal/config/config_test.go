@@ -773,3 +773,60 @@ func TestBGPForNodeFiltersPeers(t *testing.T) {
 		t.Error("ForNode must not modify the receiver")
 	}
 }
+
+func TestParsePeerAddrs(t *testing.T) {
+	got, err := ParsePeerAddrs([]string{"192.0.2.2", "2001:DB8::1", "192.0.2.2", "::ffff:192.0.2.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"192.0.2.1", "192.0.2.2", "2001:db8::1"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("ParsePeerAddrs = %v, want %v (canonical, sorted, no repeats, v4-mapped unmapped)", got, want)
+	}
+	if out, err := ParsePeerAddrs(nil); out != nil || err != nil {
+		t.Errorf("no peers should mean no limit: %v %v", out, err)
+	}
+	if _, err := ParsePeerAddrs([]string{"192.0.2.1", "tor-1"}); err == nil {
+		t.Error("a name that is not an address must be rejected")
+	}
+}
+
+func TestVIPBGPPeersMustBeConfiguredPeers(t *testing.T) {
+	c := validConfig()
+	c.BGP = BGP{Enabled: true, ASN: 65000, RouterID: "1.1.1.1", Peers: []BGPPeer{{Address: "192.0.2.1", ASN: 65100}, {Address: "2001:db8::1", ASN: 65100}}}
+	c.VIPs[0].BGPPeers = []string{"192.0.2.1", "2001:DB8::1"}
+	if err := c.Validate(); err != nil {
+		t.Errorf("configured peers (in any spelling) rejected: %v", err)
+	}
+	c.VIPs[0].BGPPeers = []string{"192.0.2.9"}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "bgpPeers") || !strings.Contains(err.Error(), "192.0.2.9") {
+		t.Errorf("a peer that is not configured must be named and rejected, got %v", err)
+	}
+	c.VIPs[0].BGPPeers = []string{"not-an-ip"}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "bgpPeers") {
+		t.Errorf("a non-address must be rejected, got %v", err)
+	}
+	// Peers that arrive at run time (BGPPeer resources) cannot be checked here.
+	c.VIPs[0].BGPPeers = []string{"192.0.2.9"}
+	c.BGP.PeersFromResources = true
+	if err := c.Validate(); err != nil {
+		t.Errorf("with peers coming from resources the list cannot be checked: %v", err)
+	}
+	// An aggregate's list is checked the same way.
+	b := BGP{Enabled: true, ASN: 65000, RouterID: "1.1.1.1", Peers: []BGPPeer{{Address: "192.0.2.1", ASN: 65100}},
+		Aggregates: []BGPAggregate{{Prefix: "10.0.0.0/24", Peers: []string{"192.0.2.9"}}}}
+	if err := b.Validate(); err == nil || !strings.Contains(err.Error(), "aggregate") {
+		t.Errorf("an aggregate limited to an unknown peer must be rejected, got %v", err)
+	}
+}
+
+func TestBGPWithoutPeersNeedsResources(t *testing.T) {
+	b := BGP{Enabled: true, ASN: 65000, RouterID: "1.1.1.1"}
+	if err := b.Validate(); err == nil {
+		t.Error("BGP with no peers at all must be rejected")
+	}
+	b.PeersFromResources = true
+	if err := b.Validate(); err != nil {
+		t.Errorf("BGP with peers to come from resources is valid: %v", err)
+	}
+}

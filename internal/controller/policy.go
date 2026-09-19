@@ -19,6 +19,7 @@ type servicePolicy struct {
 	probe       config.ProbeSpec
 	rateLimit   config.VIPRateLimit
 	communities []string          // BGP communities for this Service's routes
+	bgpPeers    []string          // BGP peers this Service's routes go to (empty: all)
 	weights     map[string]uint32 // node name -> weight
 	defaultW    uint32
 	sourceName  string // "namespace/name", for logs
@@ -56,6 +57,11 @@ func compilePolicy(p *v1alpha1.ServicePolicy) (*servicePolicy, error) {
 			return nil, fmt.Errorf("bgp.communities: %w", err)
 		}
 		out.communities = append([]string(nil), b.Communities...)
+		peers, err := config.ParsePeerAddrs(b.Peers)
+		if err != nil {
+			return nil, fmt.Errorf("bgp.peers: %w", err)
+		}
+		out.bgpPeers = peers
 	}
 	if w := p.Spec.Weights; w != nil {
 		check := func(what string, v uint32) error {
@@ -129,6 +135,13 @@ func (sp *servicePolicy) vipRateLimit() config.VIPRateLimit {
 		return config.VIPRateLimit{}
 	}
 	return sp.rateLimit
+}
+
+func (sp *servicePolicy) bgpPeerList() []string {
+	if sp == nil {
+		return nil
+	}
+	return sp.bgpPeers
 }
 
 func (sp *servicePolicy) bgpCommunities() []string {

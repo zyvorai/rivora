@@ -199,6 +199,8 @@ helm upgrade rivora deploy/helm/rivora \
 | `bgp.routerId` | BGP identifier + IPv4 next-hop for `/32` |
 | `bgp.ipv6NextHop` | IPv6 next-hop for `/128` (omit → IPv6 VIPs not advertised) |
 | `bgp.peers[].address` / `.asn` / `.bfd` | Peer list; `bfd: true` enables BFD on that peer |
+| `bgp.peerResources` | Also read cluster-scoped `BGPPeer` resources (password from a Secret, multihop, graceful restart, node selector); default `true`. `bgp.peers` may then be empty. Apply `crds/bgppeer-crd.yaml` yourself on an upgrade |
+| `bgp.configSecret` | A Secret holding a `bgp:` section for what the values cannot say; replaces `asn`, `routerId`, `ipv6NextHop` and `peers` |
 
 Read the top-level README's [BGP/BFD HA](../../../README.md#bgpbfd-ha-v03)
 section before enabling this — it covers the health-gated

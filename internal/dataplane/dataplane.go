@@ -84,8 +84,10 @@ type Status struct {
 	Backends   []BackendStatus `json:"backends"`
 	// BGPCommunities are the VIP's own bgpCommunities, read by the BGP speaker.
 	BGPCommunities []string `json:"bgpCommunities,omitempty"`
-	Packets        uint64   `json:"packets"`
-	Bytes          uint64   `json:"bytes"`
+	// BGPPeers are the peers the VIP's route is limited to; empty means every peer.
+	BGPPeers []string `json:"bgpPeers,omitempty"`
+	Packets  uint64   `json:"packets"`
+	Bytes    uint64   `json:"bytes"`
 	// Dropped is node-wide (stats_map's global slot), the sum of every VIP's
 	// drops, not this VIP's own count — the fields below are this VIP's own.
 	Dropped uint64 `json:"dropped"`
@@ -1076,6 +1078,7 @@ func (d *Dataplane) Statuses() ([]Status, error) {
 			VIPPort:        vip.Port,
 			VIPPortEnd:     vip.PortEnd,
 			BGPCommunities: vip.BGPCommunities,
+			BGPPeers:       vip.BGPPeers,
 			Protocol:       string(vip.Protocol),
 			Mode:           string(vip.Mode),
 			Interface:      d.cfg.Interface,

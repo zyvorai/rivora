@@ -28,6 +28,7 @@ import (
 	"github.com/zyvorai/rivora/api/v1alpha1"
 	"github.com/zyvorai/rivora/internal/api"
 	"github.com/zyvorai/rivora/internal/bgp"
+	"github.com/zyvorai/rivora/internal/bgppeers"
 	"github.com/zyvorai/rivora/internal/bpfmaps"
 	"github.com/zyvorai/rivora/internal/config"
 	"github.com/zyvorai/rivora/internal/controller"
@@ -84,6 +85,7 @@ func main() {
 		bgpRouterID    = flag.String("bgp-router-id", "", "this node's BGP router-id (an IPv4 address, need not be routable) when -bgp is set; only used with -kubernetes")
 		bgpIPv6NextHop = flag.String("bgp-ipv6-next-hop", "", "IPv6 next-hop for advertised IPv6 VIP /128 routes when -bgp is set; required to advertise IPv6 VIPs; only used with -kubernetes")
 		bgpConfigFile  = flag.String("bgp-config", "", "path to a YAML file with a bgp: section (the same schema as the static config's), for BGP options -bgp-peers cannot express: peer passwords, multihop, graceful restart, communities, local-pref, aggregates, per-node peers; replaces -bgp, -bgp-asn, -bgp-router-id, -bgp-ipv6-next-hop and -bgp-peers; only used with -kubernetes")
+		bgpPeerRes     = flag.Bool("bgp-peer-resources", false, "also read BGPPeer resources: each adds a BGP neighbour (with password, multihop, graceful restart and a node selector) to the peers this node started with; needs BGP (-bgp or -bgp-config) and the BGPPeer CRD (the Helm chart installs it); only used with -kubernetes")
 		bgpPeers       = flag.String("bgp-peers", "", "comma-separated BGP peers when -bgp is set, each addr:asn or addr:asn:bfd (e.g. \"10.0.0.1:65000:bfd,10.0.0.2:65001\"); only used with -kubernetes")
 	)
 	flag.Parse()
@@ -176,7 +178,7 @@ func main() {
 				logger.Error("-bgp-config replaces -bgp, -bgp-asn, -bgp-router-id, -bgp-ipv6-next-hop and -bgp-peers; set one or the other")
 				os.Exit(1)
 			}
-			b, berr := config.LoadBGP(*bgpConfigFile)
+			b, berr := config.LoadBGPWith(*bgpConfigFile, *bgpPeerRes)
 			if berr != nil {
 				logger.Error("load -bgp-config", "err", berr)
 				os.Exit(1)
@@ -195,6 +197,8 @@ func main() {
 				RouterID:    *bgpRouterID,
 				IPv6NextHop: *bgpIPv6NextHop,
 				Peers:       peers,
+
+				PeersFromResources: *bgpPeerRes,
 			}
 			if err := cfg.BGP.Validate(); err != nil {
 				logger.Error("bgp flags", "err", err)
@@ -277,6 +281,7 @@ func main() {
 	// from whichever mode populated cfg.BGP (the YAML file's bgp: section,
 	// or the -bgp* flags above).
 	var bgpSpeaker *bgp.Speaker
+	var bgpStartupPeers []config.BGPPeer // the peers the speaker was started with, which BGPPeer resources add to
 	if cfg.BGP.Enabled {
 		var err error
 		node := *nodeName
@@ -284,6 +289,7 @@ func main() {
 			node, _ = os.Hostname()
 		}
 		bgpCfg := cfg.BGP.ForNode(node)
+		bgpStartupPeers = bgpCfg.Peers
 		if len(bgpCfg.Peers) == 0 {
 			logger.Warn("no configured BGP peer applies to this node, so it will advertise nothing", "node", node)
 		} else if len(bgpCfg.Peers) != len(cfg.BGP.Peers) {
@@ -386,6 +392,26 @@ func main() {
 			} else {
 				reconciler.EnableServicePolicies(clients.Dynamic)
 				logger.Info("ServicePolicy objects are honoured")
+			}
+		}
+
+		if *bgpPeerRes {
+			switch {
+			case bgpSpeaker == nil:
+				logger.Error("-bgp-peer-resources needs BGP: set -bgp or -bgp-config; BGPPeer resources are ignored")
+			default:
+				// Like ServicePolicy: Helm does not upgrade CRDs, so probe rather than let an informer
+				// on a missing resource wait forever.
+				if perr := k8s.CheckResource(ctx, clients.Dynamic, v1alpha1.BGPPeerResource); perr != nil {
+					logger.Error("BGPPeer resources are ignored: the CRD is not installed or not readable; apply deploy/helm/rivora/crds/bgppeer-crd.yaml and restart", "err", perr)
+				} else {
+					peers := bgppeers.New(clients.Dynamic, clients.Clientset, bgpSpeaker, bgpStartupPeers, cfg.BGP.ASN, *nodeName, *namespace, logger)
+					go func() {
+						if err := peers.Run(ctx); err != nil {
+							logger.Error("BGPPeer controller exited", "err", err)
+						}
+					}()
+				}
 			}
 		}
 
