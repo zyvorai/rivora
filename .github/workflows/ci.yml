@@ -320,6 +320,9 @@ jobs:
     - name: Edge-case selftest (VLAN/QinQ, IP options, fragments, ICMP path-MTU)
       if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-edgecases.sh
+    - name: L3 DSR selftest (IP-in-IP and GRE, IPv4 + IPv6, routed backend)
+      if: ${{ !cancelled() }}
+      run: sudo bash scripts/selftest-l3dsr.sh
     - name: NAT checksum selftest (TCP/UDP over IPv4 and IPv6, checksum offload off)
       if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-checksum.sh

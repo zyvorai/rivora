@@ -609,3 +609,61 @@ func TestSharedBackendMACsMustAgree(t *testing.T) {
 		t.Errorf("two different MACs for one backend must be rejected, got %v", err)
 	}
 }
+
+func TestTunnelModes(t *testing.T) {
+	mk := func(mode Mode, mac string) Config {
+		return Config{Interface: "eth0", VIPs: []VIP{{Address: "10.0.0.100", Port: 80, Protocol: ProtoTCP, Mode: mode,
+			Backends: []Backend{{Address: "10.9.0.11", Port: 80, MAC: mac}}}}}
+	}
+	for _, m := range []Mode{ModeDSRIPIP, ModeDSRGRE} {
+		if err := mk(m, "").Validate(); err != nil {
+			t.Errorf("%s: a tunnel VIP needs no MAC: %v", m, err)
+		}
+		if err := mk(m, "aa:bb:cc:dd:ee:01").Validate(); err == nil || !strings.Contains(err.Error(), "only applies to mode dsr") {
+			t.Errorf("%s: a MAC on a tunnel backend must be rejected, got %v", m, err)
+		}
+		if !m.IsTunnel() || !m.Valid() {
+			t.Errorf("%s must be a valid tunnel mode", m)
+		}
+	}
+	if err := mk("dsr-vxlan", "").Validate(); err == nil || !strings.Contains(err.Error(), "dsr-ipip") {
+		t.Errorf("an unknown mode must be rejected and name the tunnel modes, got %v", err)
+	}
+	if ModeDSR.IsTunnel() || ModeNAT.IsTunnel() {
+		t.Error("dsr and nat are not tunnel modes")
+	}
+	// A DSR (L2) backend still needs its MAC.
+	if err := mk(ModeDSR, "").Validate(); err == nil {
+		t.Error("mode dsr without a MAC must still be rejected")
+	}
+}
+
+func TestTunnelSourceValidation(t *testing.T) {
+	base := func() Config {
+		c := validConfig()
+		return c
+	}
+	c := base()
+	c.TunnelSource, c.TunnelSource6 = "192.0.2.1", "2001:db8::1"
+	if err := c.Validate(); err != nil {
+		t.Errorf("valid sources rejected: %v", err)
+	}
+	for _, bad := range []struct{ v4, v6, want string }{
+		{"2001:db8::1", "", "tunnelSource"},
+		{"nonsense", "", "tunnelSource"},
+		{"", "192.0.2.1", "tunnelSource6"},
+		{"", "nonsense", "tunnelSource6"},
+	} {
+		c := base()
+		c.TunnelSource, c.TunnelSource6 = bad.v4, bad.v6
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), bad.want) {
+			t.Errorf("v4=%q v6=%q: got %v, want an error naming %s", bad.v4, bad.v6, err, bad.want)
+		}
+	}
+	// Changing a tunnel source needs a restart, like the interface.
+	a, b := base(), base()
+	b.TunnelSource = "192.0.2.9"
+	if got := RestartRequired(a, b); len(got) != 1 || got[0] != "tunnelSource" {
+		t.Errorf("RestartRequired = %v, want [tunnelSource]", got)
+	}
+}

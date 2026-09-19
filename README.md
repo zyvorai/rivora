@@ -91,6 +91,9 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
   VLAN-tagged (802.1Q/QinQ) traffic, IPv4 options and IPv4 fragments are balanced, and ICMP
   path-MTU errors reach the backend that owns the connection they quote (see the
   [runbook](website/docs/operations/runbook.md#vlans-fragments-ip-options-and-icmp)).
+  `mode: dsr-ipip` / `dsr-gre` (L3 DSR) tunnels to backends any number of routed hops away
+  and lets them answer the client directly, IPv4 and IPv6
+  ([runbook](website/docs/operations/runbook.md#l3-dsr-ip-in-ip-and-gre)).
   A VIP can own a port range (`portRange: "30000-30100"`) or list several ports
   (`ports: [80, 443]`); see the [runbook](website/docs/operations/runbook.md#port-ranges-and-multiple-ports).
   `rivorad -persist-datapath` keeps

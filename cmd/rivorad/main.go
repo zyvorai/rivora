@@ -250,6 +250,10 @@ func main() {
 		os.Exit(1)
 	}
 	logStartup(logger, plane.Startup())
+	if config.HasTunnelVIP(cfg.VIPs) {
+		v4, v6 := plane.TunnelSources()
+		logger.Info("L3 DSR tunnel sources (outer header source addresses)", "ipv4", ipString(v4), "ipv6", ipString(v6))
+	}
 
 	// bgpSpeaker is not Kubernetes-specific (unlike the ARP speaker, which
 	// needs a K8s Lease for its cluster-wide mutual exclusion) — a
@@ -635,4 +639,12 @@ func parseBGPPeers(s string) ([]config.BGPPeer, error) {
 		peers = append(peers, peer)
 	}
 	return peers, nil
+}
+
+// ipString renders an optional address for a log line.
+func ipString(ip net.IP) string {
+	if ip == nil {
+		return "none"
+	}
+	return ip.String()
 }

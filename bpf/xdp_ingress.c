@@ -178,6 +178,14 @@ struct {
     __type(value, struct rl_bucket);
 } svc_rl_buckets_map6 SEC(".maps");
 
+/* Outer-header source addresses for the tunnel modes (see struct tunnel_config). */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct tunnel_config);
+} tunnel_config_map SEC(".maps");
+
 /* IPv4 fragment steering (see struct frag_key). */
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -361,6 +369,234 @@ static __always_inline __u32 *v6_service(const __u8 addr[16], __u16 port, __u8 p
     return bpf_map_lookup_elem(&vip_range_map6, &rgk);
 }
 
+/* ---- L3 DSR: encapsulate and forward ---------------------------------------------------
+ *
+ * The packet becomes  [L2][outer IP][GRE?][inner IP...]  addressed to the backend. Room is made
+ * at the front with bpf_xdp_adjust_head; that leaves the old L2 header sitting where the outer
+ * header must go, so it is saved first and rewritten at the new front. Nothing in the packet
+ * survives an adjust_head as a pointer, so everything is re-derived from ctx afterwards.
+ *
+ * The outer header is then routed with bpf_fib_lookup, which yields the next hop's MACs and the
+ * egress interface: the frame goes straight out (XDP_TX on the same interface, else redirect),
+ * never up the load balancer's own stack. That matters: a packet whose source is one of the
+ * load balancer's own addresses would be dropped as a martian on the way back in. If the lookup
+ * cannot answer (no neighbour yet, VLAN sub-interface, too big for the egress MTU) the packet is
+ * passed to the kernel, which can resolve, forward and fragment it (the outer DF bit is clear).
+ * The path from the load balancer to the backends must carry the inner packet plus the outer
+ * header (20 bytes, 24 with GRE, 40 with IPv6): XDP cannot fragment. */
+
+static __always_inline __u16 rivora_ip_csum(void *hdr, __u32 len)
+{
+    __u32 sum = (__u32)bpf_csum_diff(0, 0, (__be32 *)hdr, len, 0);
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    return (__u16)~sum;
+}
+
+static __always_inline int tunnel_v4_l2(struct xdp_md *ctx, struct ethhdr *eth, struct iphdr *iph,
+                                        __u8 mode, __u32 be_addr, const __u32 l2len)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    if ((void *)eth + 22 > data_end || (void *)(iph + 1) > data_end)
+        return XDP_PASS;
+
+    __u32 zero = 0;
+    struct tunnel_config *tc = bpf_map_lookup_elem(&tunnel_config_map, &zero);
+    if (!tc || !tc->src4) {
+        bump_stats(RIVORA_STATS_GLOBAL, 0, 1);
+        return XDP_DROP;
+    }
+    __u32 src4 = tc->src4;
+
+    __u8 gre = mode == RIVORA_MODE_TUNNEL_GRE;
+    __u32 encap = gre ? 24 : 20;
+    __u8 tos = iph->tos;
+    __u16 inner_len = __builtin_bswap16(iph->tot_len);
+    __u8 l2buf[22];
+    __builtin_memcpy(l2buf, eth, 22);
+
+    if (bpf_xdp_adjust_head(ctx, 0 - (int)encap))
+        return XDP_DROP;
+    data = (void *)(long)ctx->data;
+    data_end = (void *)(long)ctx->data_end;
+    if (data + 22 > data_end)
+        return XDP_DROP;
+    __builtin_memcpy(data, l2buf, 22);
+
+    struct iphdr hdr = {};
+    hdr.version = 4;
+    hdr.ihl = 5;
+    hdr.tos = tos;
+    hdr.tot_len = __builtin_bswap16((__u16)(inner_len + encap));
+    hdr.id = (__u16)bpf_get_prandom_u32(); /* the outer header may be fragmented downstream: give it an id */
+    hdr.ttl = 64;
+    hdr.protocol = gre ? 47 : 4;
+    hdr.saddr = src4;
+    hdr.daddr = be_addr;
+    hdr.check = rivora_ip_csum(&hdr, 20);
+
+    struct iphdr *o = data + l2len;
+    if ((void *)(o + 1) > data_end)
+        return XDP_DROP;
+    __builtin_memcpy(o, &hdr, 20);
+    if (gre) {
+        __be16 *g = (void *)(o + 1);
+        if ((void *)(g + 2) > data_end)
+            return XDP_DROP;
+        g[0] = 0;                        /* no checksum, key or sequence */
+        g[1] = __constant_htons(0x0800); /* the payload is IPv4 */
+    }
+
+    if (l2len != 14)
+        return XDP_PASS;
+    struct ethhdr *e2 = data;
+    if ((void *)(e2 + 1) > data_end)
+        return XDP_DROP;
+    struct bpf_fib_lookup fib = {};
+    fib.family = 2; /* AF_INET */
+    fib.tos = tos;
+    fib.l4_protocol = hdr.protocol;
+    fib.tot_len = __builtin_bswap16(hdr.tot_len);
+    fib.ifindex = ctx->ingress_ifindex;
+    fib.ipv4_src = src4;
+    fib.ipv4_dst = be_addr;
+    if (bpf_fib_lookup(ctx, &fib, sizeof(fib), 0) != BPF_FIB_LKUP_RET_SUCCESS)
+        return XDP_PASS;
+    __builtin_memcpy(e2->h_dest, fib.dmac, 6);
+    __builtin_memcpy(e2->h_source, fib.smac, 6);
+    if (fib.ifindex == ctx->ingress_ifindex)
+        return XDP_TX;
+    return bpf_redirect(fib.ifindex, 0);
+}
+
+static __always_inline int tunnel_v6_l2(struct xdp_md *ctx, struct ethhdr *eth, struct ipv6hdr *iph,
+                                        __u8 mode, const __u8 be_addr[16], const __u32 l2len)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    if ((void *)eth + 22 > data_end || (void *)(iph + 1) > data_end)
+        return XDP_PASS;
+
+    __u32 zero = 0;
+    struct tunnel_config *tc = bpf_map_lookup_elem(&tunnel_config_map, &zero);
+    if (!tc) {
+        bump_stats(RIVORA_STATS_GLOBAL, 0, 1);
+        return XDP_DROP;
+    }
+    __u8 src6[16];
+    __builtin_memcpy(src6, tc->src6, 16);
+    if ((src6[0] | src6[1] | src6[2] | src6[3] | src6[4] | src6[5] | src6[6] | src6[7] | src6[8] | src6[9] |
+         src6[10] | src6[11] | src6[12] | src6[13] | src6[14] | src6[15]) == 0) {
+        bump_stats(RIVORA_STATS_GLOBAL, 0, 1);
+        return XDP_DROP;
+    }
+
+    __u8 gre = mode == RIVORA_MODE_TUNNEL_GRE;
+    __u32 encap = gre ? 44 : 40;
+    __u8 b0 = ((__u8 *)iph)[0], b1 = ((__u8 *)iph)[1];
+    __u16 inner_payload = __builtin_bswap16(iph->payload_len);
+    __u8 l2buf[22];
+    __builtin_memcpy(l2buf, eth, 22);
+
+    if (bpf_xdp_adjust_head(ctx, 0 - (int)encap))
+        return XDP_DROP;
+    data = (void *)(long)ctx->data;
+    data_end = (void *)(long)ctx->data_end;
+    if (data + 22 > data_end)
+        return XDP_DROP;
+    __builtin_memcpy(data, l2buf, 22);
+
+    struct ipv6hdr hdr = {};
+    ((__u8 *)&hdr)[0] = 0x60 | (b0 & 0x0f); /* version 6, the inner traffic class... */
+    ((__u8 *)&hdr)[1] = b1 & 0xf0;          /* ...and a zero flow label */
+    hdr.payload_len = __builtin_bswap16((__u16)(inner_payload + 40 + (gre ? 4 : 0)));
+    hdr.nexthdr = gre ? 47 : 41;
+    hdr.hop_limit = 64;
+    __builtin_memcpy(&hdr.saddr, src6, 16);
+    __builtin_memcpy(&hdr.daddr, be_addr, 16);
+
+    struct ipv6hdr *o = data + l2len;
+    if ((void *)(o + 1) > data_end)
+        return XDP_DROP;
+    __builtin_memcpy(o, &hdr, 40);
+    if (gre) {
+        __be16 *g = (void *)(o + 1);
+        if ((void *)(g + 2) > data_end)
+            return XDP_DROP;
+        g[0] = 0;
+        g[1] = __constant_htons(0x86dd); /* the payload is IPv6 */
+    }
+
+    if (l2len != 14)
+        return XDP_PASS;
+    struct ethhdr *e2 = data;
+    if ((void *)(e2 + 1) > data_end)
+        return XDP_DROP;
+    struct bpf_fib_lookup fib = {};
+    fib.family = 10; /* AF_INET6 */
+    fib.l4_protocol = hdr.nexthdr;
+    fib.tot_len = __builtin_bswap16(hdr.payload_len) + 40;
+    fib.ifindex = ctx->ingress_ifindex;
+    __builtin_memcpy(fib.ipv6_src, src6, 16);
+    __builtin_memcpy(fib.ipv6_dst, be_addr, 16);
+    if (bpf_fib_lookup(ctx, &fib, sizeof(fib), 0) != BPF_FIB_LKUP_RET_SUCCESS)
+        return XDP_PASS;
+    __builtin_memcpy(e2->h_dest, fib.dmac, 6);
+    __builtin_memcpy(e2->h_source, fib.smac, 6);
+    if (fib.ifindex == ctx->ingress_ifindex)
+        return XDP_TX;
+    return bpf_redirect(fib.ifindex, 0);
+}
+
+/* The verifier can only bound a packet offset it can see is constant or freshly range-checked, and
+ * the L2 length is neither once a helper call has spilled it. So each supported length (plain
+ * Ethernet, one VLAN tag, two) gets its own instance with the length as a compile-time constant. */
+static __always_inline int tunnel_v4(struct xdp_md *ctx, struct ethhdr *eth, struct iphdr *iph,
+                                     __u8 mode, __u32 be_addr)
+{
+    __u32 l2len = (void *)iph - (void *)eth;
+    if (l2len == 14)
+        return tunnel_v4_l2(ctx, eth, iph, mode, be_addr, 14);
+    if (l2len == 18)
+        return tunnel_v4_l2(ctx, eth, iph, mode, be_addr, 18);
+    if (l2len == 22)
+        return tunnel_v4_l2(ctx, eth, iph, mode, be_addr, 22);
+    return XDP_PASS;
+}
+
+static __always_inline int tunnel_v6(struct xdp_md *ctx, struct ethhdr *eth, struct ipv6hdr *iph,
+                                     __u8 mode, const __u8 be_addr[16])
+{
+    __u32 l2len = (void *)iph - (void *)eth;
+    if (l2len == 14)
+        return tunnel_v6_l2(ctx, eth, iph, mode, be_addr, 14);
+    if (l2len == 18)
+        return tunnel_v6_l2(ctx, eth, iph, mode, be_addr, 18);
+    if (l2len == 22)
+        return tunnel_v6_l2(ctx, eth, iph, mode, be_addr, 22);
+    return XDP_PASS;
+}
+
+/* The forwarding step of every non-NAT mode: a MAC rewrite (DSR) or an encapsulation. */
+static __always_inline int forward_v4(struct xdp_md *ctx, struct ethhdr *eth, struct iphdr *iph,
+                                      __u8 mode, const struct backend_info *be)
+{
+    if (mode == RIVORA_MODE_DSR)
+        return dsr_forward(ctx, eth, be->mac);
+    return tunnel_v4(ctx, eth, iph, mode, be->addr);
+}
+
+static __always_inline int forward_v6(struct xdp_md *ctx, struct ethhdr *eth, struct ipv6hdr *iph,
+                                      __u8 mode, const struct backend_info6 *be)
+{
+    if (mode == RIVORA_MODE_DSR)
+        return dsr_forward(ctx, eth, be->mac);
+    return tunnel_v6(ctx, eth, iph, mode, be->addr);
+}
+
 /* A later IPv4 fragment (offset > 0) has no L4 header, so it can't be matched to a VIP by
  * port. It follows the backend its datagram's first fragment was given. In full-NAT only the
  * destination address changes: the L4 header, and the checksum in it, live in the first
@@ -390,8 +626,8 @@ static __always_inline int handle_v4_later_fragment(struct xdp_md *ctx, void *da
     bump_stats(RIVORA_STATS_GLOBAL, pkt_len, 0);
     bump_stats(1 + backend_id, pkt_len, 0);
 
-    if (cfg->mode == RIVORA_MODE_DSR)
-        return dsr_forward(ctx, eth, be->mac);
+    if (cfg->mode != RIVORA_MODE_NAT)
+        return forward_v4(ctx, eth, iph, cfg->mode, be);
 
     __u32 old_daddr = iph->daddr;
     __u32 new_daddr = be->addr;
@@ -459,8 +695,8 @@ static __always_inline int handle_v4_icmp(struct xdp_md *ctx, void *data, void *
     bump_stats(RIVORA_STATS_GLOBAL, (__u32)(data_end - data), 0);
     bump_stats(1 + backend_id, (__u32)(data_end - data), 0);
 
-    if (cfg->mode == RIVORA_MODE_DSR)
-        return dsr_forward(ctx, eth, be->mac);
+    if (cfg->mode != RIVORA_MODE_NAT)
+        return forward_v4(ctx, eth, iph, cfg->mode, be);
 
     /* Full NAT. Re-derive every pointer fresh next to its write. */
     __u32 vip_addr = in->saddr;
@@ -610,10 +846,10 @@ static __always_inline int handle_ipv4(struct xdp_md *ctx, void *data, void *dat
         bpf_map_update_elem(&frag_map, &fk, &fv, BPF_ANY);
     }
 
-    if (cfg->mode == RIVORA_MODE_DSR) {
-        /* DSR: VIP stays the destination IP — the backend must have the VIP
+    if (cfg->mode != RIVORA_MODE_NAT) {
+        /* DSR / L3 DSR: the VIP stays the destination IP — the backend must have the VIP
          * bound locally (loopback/dummy) so it accepts and replies directly. */
-        return dsr_forward(ctx, eth, be->mac);
+        return forward_v4(ctx, eth, iph, cfg->mode, be);
     }
 
     /* Full NAT: rewrite destination IP/port to the backend; record the
@@ -718,8 +954,8 @@ static __always_inline int handle_v6_icmp(struct xdp_md *ctx, void *data, void *
     bump_stats(RIVORA_STATS_GLOBAL, (__u32)(data_end - data), 0);
     bump_stats(1 + backend_id, (__u32)(data_end - data), 0);
 
-    if (cfg->mode == RIVORA_MODE_DSR)
-        return dsr_forward(ctx, eth, be->mac);
+    if (cfg->mode != RIVORA_MODE_NAT)
+        return forward_v6(ctx, eth, iph, cfg->mode, be);
 
     __u8 vip_addr[16], be_addr[16];
     __builtin_memcpy(vip_addr, &in->saddr, 16);
@@ -844,10 +1080,10 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
     bump_stats(RIVORA_STATS_GLOBAL, pkt_len, 0);
     bump_stats(1 + backend_id, pkt_len, 0);
 
-    if (cfg->mode == RIVORA_MODE_DSR) {
-        /* DSR: VIP stays the destination IP — the backend must have the VIP
+    if (cfg->mode != RIVORA_MODE_NAT) {
+        /* DSR / L3 DSR: the VIP stays the destination IP — the backend must have the VIP
          * bound locally so it accepts and replies directly. */
-        return dsr_forward(ctx, eth, be->mac);
+        return forward_v6(ctx, eth, iph, cfg->mode, be);
     }
 
     /* Full NAT (IPv6). Two real differences from handle_ipv4's NAT block,

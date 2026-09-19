@@ -28,6 +28,10 @@ static long (*bpf_map_update_elem)(void *map, const void *key, const void *value
 static long (*bpf_map_delete_elem)(void *map, const void *key) = (void *)BPF_FUNC_map_delete_elem;
 static __u64 (*bpf_ktime_get_ns)(void) = (void *)BPF_FUNC_ktime_get_ns;
 static __s64 (*bpf_csum_diff)(__be32 *from, __u32 from_size, __be32 *to, __u32 to_size, __u32 seed) = (void *)BPF_FUNC_csum_diff;
+static long (*bpf_xdp_adjust_head)(struct xdp_md *ctx, int delta) = (void *)BPF_FUNC_xdp_adjust_head;
+static long (*bpf_fib_lookup)(void *ctx, struct bpf_fib_lookup *params, int plen, __u32 flags) = (void *)BPF_FUNC_fib_lookup;
+static long (*bpf_redirect)(__u32 ifindex, __u64 flags) = (void *)BPF_FUNC_redirect;
+static __u32 (*bpf_get_prandom_u32)(void) = (void *)BPF_FUNC_get_prandom_u32;
 
 #define IPPROTO_ICMP_ 1
 #define IPPROTO_TCP_ 6
@@ -387,6 +391,21 @@ static __always_inline int rl_take(const struct rl_config *cfg, const struct rl_
 
 #define RIVORA_MODE_DSR 0
 #define RIVORA_MODE_NAT 1
+/* L3 DSR: the packet is wrapped in an IP-in-IP (2) or GRE (3) tunnel to the backend, which
+ * unwraps it and answers the client directly from the VIP. Unlike DSR (0) the backend need not
+ * be on the load balancer's L2 segment, only routable from it. IPv4 VIPs use an IPv4 outer
+ * header and IPv6 VIPs an IPv6 one. */
+#define RIVORA_MODE_TUNNEL_IPIP 2
+#define RIVORA_MODE_TUNNEL_GRE  3
+
+/* tunnel_config_map: the source address of the outer header, per family, written by rivorad at
+ * start-up (configured, or the attached interface's own address). A zero source means "none":
+ * a tunnel VIP then drops rather than send a packet nobody can attribute. */
+struct tunnel_config {
+    __u32 src4;     /* network byte order */
+    __u8  src6[16];
+};
+_Static_assert(sizeof(struct tunnel_config) == 20, "tunnel_config ABI");
 
 /* backend_health_map values — mirrors bpfmaps.Health{Down,Healthy,Draining}
  * on the Go side. Draining excludes a backend from pick_backend()'s *new*

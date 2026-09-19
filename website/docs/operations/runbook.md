@@ -237,6 +237,45 @@ below stated plainly. `scripts/selftest-edgecases.sh` exercises all of it.
   fragments. A packet whose IPv6 next header is not TCP or UDP is passed through untouched,
   as before.
 
+## L3 DSR (IP-in-IP and GRE)
+
+Plain `mode: dsr` rewrites the frame's MAC, so a backend must sit on the load balancer's own L2
+segment. **L3 DSR** lifts that: `mode: dsr-ipip` or `mode: dsr-gre` wraps each packet in a tunnel
+to the backend, which can be any number of routed hops away. The backend unwraps it and answers the
+client directly from the VIP, so replies still bypass the load balancer
+(`config/examples/l3-dsr.yaml`).
+
+```yaml
+tunnelSource: 198.51.100.1     # outer source; unset = the attached interface's own address
+vips:
+  - {address: 192.0.2.30, port: 443, protocol: tcp, mode: dsr-ipip,
+     backends: [{address: 10.20.0.11, port: 443}]}     # no mac: reached by address
+```
+
+- **IPv4 VIPs** get an IPv4 outer header (IP-in-IP, or GRE over IPv4); **IPv6 VIPs** get an IPv6
+  one (IPv6-in-IPv6, or GRE over IPv6). `tunnelSource` is the IPv4 source and `tunnelSource6` the
+  IPv6 one; each defaults to the attached interface's own address of that family. Start-up logs the
+  addresses in use. A tunnel VIP with no source to use is refused rather than sent unattributable.
+- **On each backend** you need a tunnel endpoint that accepts packets to its own address from any
+  remote (`ip tunnel add tun0 mode ipip local <backend-ip>`; `mode gre`; `ip -6 tunnel add ... mode
+  ip6ip6` or `ip6gre`), the VIP on `lo`, and reverse-path filtering off on the tunnel device.
+- **MTU is on you.** The tunnelled packet is 20 bytes larger (24 with GRE, 40/44 for IPv6) and XDP
+  cannot fragment it, so the path from the load balancer to the backends must carry the client's
+  packets plus that overhead, or full-size segments are dropped. Raise the MTU on that path (or clamp
+  the TCP MSS).
+- **How it is forwarded.** After encapsulation the outer header is routed with `bpf_fib_lookup`, and
+  the frame goes straight out of the egress interface, so the load balancer needs a route to the
+  backend and IP forwarding enabled. If the lookup cannot answer (next-hop neighbour not resolved
+  yet, a VLAN sub-interface, or too big for the egress MTU) the packet is handed to the kernel to
+  resolve and forward. The load balancer's own health probes to the backend keep the neighbour entry
+  warm, so this is the exception. That fallback path re-enters the load balancer's stack with one of
+  its own addresses as the source, which the kernel drops as a martian unless
+  `net.ipv4.conf.<if>.accept_local=1`; if you see the first packets to a backend vanish, that is why.
+- **Fragments, ICMP errors, VLANs and IP options** are handled as for the other modes (see above):
+  each fragment is tunnelled individually and the backend reassembles.
+- **Not supported:** GRE keys, checksums or sequence numbers, and VXLAN/Geneve. K8s-managed VIPs are
+  NAT-only, so these modes are for static configs. Changing `tunnelSource` needs a restart.
+
 ## Kubernetes Service semantics: session affinity and `externalTrafficPolicy`
 
 For `type: LoadBalancer` Services, `rivorad` reads two Service fields.

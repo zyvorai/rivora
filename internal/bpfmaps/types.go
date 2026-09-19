@@ -35,6 +35,9 @@ const (
 	MapNATReverse6         = "nat_reverse_map6"
 	MapRateLimitBuckets6   = "rl_buckets_map6"
 
+	// MapTunnelConfig holds the outer-header source address of the tunnel modes.
+	MapTunnelConfig = "tunnel_config_map"
+
 	// Port-range VIPs live in LPM tries (see VipRangeKey), one per family.
 	MapVIPRange  = "vip_range_map"
 	MapVIPRange6 = "vip_range_map6"
@@ -44,6 +47,10 @@ const (
 
 	ModeDSR = 0
 	ModeNAT = 1
+	// L3 DSR: the packet is tunnelled to the backend (IP-in-IP or GRE) instead of having its
+	// MAC rewritten. Mirrors RIVORA_MODE_TUNNEL_* in bpf/rivora_common.h.
+	ModeTunnelIPIP = 2
+	ModeTunnelGRE  = 3
 
 	// backend_health_map values. Draining excludes a backend from *new*
 	// Maglev flow selection (pick_backend() in bpf/xdp_ingress.c checks
@@ -75,6 +82,13 @@ type VipKey struct {
 	Port  uint16
 	Proto uint8
 	Pad   uint8
+}
+
+// TunnelConfig — struct tunnel_config. 20 bytes. Src4 is in the same in-memory order as an
+// IPv4 address (see ip4ToBE32); Src6 holds the raw network-order bytes. Zero means "none".
+type TunnelConfig struct {
+	Src4 uint32
+	Src6 [16]byte
 }
 
 // VipRangeKey — struct vip_range_key. 12 bytes. The key of an LPM trie:
