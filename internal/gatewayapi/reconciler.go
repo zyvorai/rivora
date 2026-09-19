@@ -36,6 +36,7 @@ import (
 	gwapi "github.com/zyvorai/rivora/api/gatewayapi"
 	"github.com/zyvorai/rivora/internal/config"
 	"github.com/zyvorai/rivora/internal/dataplane"
+	"github.com/zyvorai/rivora/internal/initsync"
 )
 
 const (
@@ -101,7 +102,14 @@ type Reconciler struct {
 	// wires both reconcilers' OnChange to the same health-checker-refresh
 	// callback.
 	OnChange func()
+
+	// init, if set, is told when each Gateway present at start-up has been reconciled once.
+	init *initsync.Tracker
 }
+
+// SetInitTracker makes Run report, through t, when every Gateway that existed once the caches
+// synced has been reconciled successfully. Set before Run.
+func (r *Reconciler) SetInitTracker(t *initsync.Tracker) { r.init = t }
 
 // New builds a Reconciler. Unlike internal/controller there's no lbClass
 // equivalent — a Gateway's "do we manage this" test is entirely
@@ -316,6 +324,20 @@ func (r *Reconciler) Run(ctx context.Context, factory informers.SharedInformerFa
 	}
 	r.logger.Info("gateway API controller caches synced")
 
+	if r.init != nil {
+		var keys []string
+		if objs, err := r.gatewayLister.List(labels.Everything()); err == nil {
+			for _, obj := range objs {
+				if k, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj); err == nil {
+					keys = append(keys, k)
+				}
+			}
+		} else {
+			r.logger.Error("list gateways for the initial sync", "err", err)
+		}
+		r.init.Arm(keys)
+	}
+
 	go r.classWorker(ctx)
 	for i := 0; i < workers; i++ {
 		go r.worker(ctx)
@@ -368,6 +390,9 @@ func (r *Reconciler) processNextItem(ctx context.Context) bool {
 		return true
 	}
 	r.queue.Forget(key)
+	if r.init != nil {
+		r.init.Finished(key)
+	}
 	return true
 }
 

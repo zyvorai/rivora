@@ -32,6 +32,7 @@ vips:
     protocol: tcp
     mode: nat
     bgpCommunities: ["65001:7", "no-export"]   # for this VIP's route only
+    bgpPeers: [10.0.0.1]                       # ...and sent only to the top-of-rack router, not the route reflector
     backends: [{address: 10.0.0.21, port: 8443}]
   - address: 192.0.2.11
     port: 443

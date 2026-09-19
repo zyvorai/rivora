@@ -118,3 +118,10 @@ spec:
                         Communities added to the route advertised for this Service's VIPs, on
                         top of the speaker's own ("65000:100", or no-export, no-advertise,
                         no-export-subconfed).
+                    peers:
+                      type: array
+                      items:
+                        type: string
+                      description: >-
+                        Addresses of the BGP peers this Service's route is advertised to.
+                        Unset means every peer.

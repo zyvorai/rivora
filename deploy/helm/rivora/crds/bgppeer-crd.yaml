@@ -1,0 +1,103 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: bgppeers.rivora.zyvor.dev
+spec:
+  group: rivora.zyvor.dev
+  scope: Cluster
+  names:
+    plural: bgppeers
+    singular: bgppeer
+    kind: BGPPeer
+    shortNames:
+      - rbp
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: Address
+          type: string
+          jsonPath: .spec.address
+        - name: ASN
+          type: integer
+          jsonPath: .spec.asn
+        - name: BFD
+          type: boolean
+          jsonPath: .spec.bfd
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [address, asn]
+              description: >-
+                A BGP neighbour for the rivorad speakers. Added to the peers a
+                node starts with; a peer with the same address as one of those
+                is ignored.
+              properties:
+                address:
+                  type: string
+                  description: The neighbour's IPv4 or IPv6 address.
+                asn:
+                  type: integer
+                  format: int64
+                  minimum: 1
+                  maximum: 4294967295
+                bfd:
+                  type: boolean
+                multihop:
+                  type: integer
+                  minimum: 2
+                  maximum: 255
+                  description: TTL for an eBGP neighbour more than one hop away.
+                gracefulRestart:
+                  type: object
+                  required: [enabled]
+                  properties:
+                    enabled:
+                      type: boolean
+                    restartTime:
+                      type: integer
+                      minimum: 1
+                      maximum: 4095
+                passwordSecretRef:
+                  type: object
+                  required: [name]
+                  description: >-
+                    TCP MD5 password, read from a Secret in the namespace rivorad
+                    runs in.
+                  properties:
+                    name:
+                      type: string
+                    key:
+                      type: string
+                      default: password
+                nodeSelector:
+                  type: object
+                  description: Limits the peer to nodes whose labels match. Unset means every node.
+                  properties:
+                    matchLabels:
+                      type: object
+                      additionalProperties:
+                        type: string
+                    matchExpressions:
+                      type: array
+                      items:
+                        type: object
+                        required: [key, operator]
+                        properties:
+                          key:
+                            type: string
+                          operator:
+                            type: string
+                            enum: [In, NotIn, Exists, DoesNotExist]
+                          values:
+                            type: array
+                            items:
+                              type: string

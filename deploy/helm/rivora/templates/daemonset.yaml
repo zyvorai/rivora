@@ -58,6 +58,9 @@ spec:
             - -bgp-peers={{ $bgpPeers | join "," }}
             {{- end }}
             {{- end }}
+            {{- if and .Values.bgp.enabled .Values.bgp.peerResources }}
+            - -bgp-peer-resources=true
+            {{- end }}
           env:
             - name: POD_NAMESPACE
               valueFrom:

@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -27,12 +28,14 @@ import (
 	"github.com/zyvorai/rivora/api/v1alpha1"
 	"github.com/zyvorai/rivora/internal/api"
 	"github.com/zyvorai/rivora/internal/bgp"
+	"github.com/zyvorai/rivora/internal/bgppeers"
 	"github.com/zyvorai/rivora/internal/bpfmaps"
 	"github.com/zyvorai/rivora/internal/config"
 	"github.com/zyvorai/rivora/internal/controller"
 	"github.com/zyvorai/rivora/internal/dataplane"
 	"github.com/zyvorai/rivora/internal/gatewayapi"
 	"github.com/zyvorai/rivora/internal/healthcheck"
+	"github.com/zyvorai/rivora/internal/initsync"
 	"github.com/zyvorai/rivora/internal/k8s"
 	"github.com/zyvorai/rivora/internal/loader"
 	"github.com/zyvorai/rivora/internal/logging"
@@ -82,6 +85,7 @@ func main() {
 		bgpRouterID    = flag.String("bgp-router-id", "", "this node's BGP router-id (an IPv4 address, need not be routable) when -bgp is set; only used with -kubernetes")
 		bgpIPv6NextHop = flag.String("bgp-ipv6-next-hop", "", "IPv6 next-hop for advertised IPv6 VIP /128 routes when -bgp is set; required to advertise IPv6 VIPs; only used with -kubernetes")
 		bgpConfigFile  = flag.String("bgp-config", "", "path to a YAML file with a bgp: section (the same schema as the static config's), for BGP options -bgp-peers cannot express: peer passwords, multihop, graceful restart, communities, local-pref, aggregates, per-node peers; replaces -bgp, -bgp-asn, -bgp-router-id, -bgp-ipv6-next-hop and -bgp-peers; only used with -kubernetes")
+		bgpPeerRes     = flag.Bool("bgp-peer-resources", false, "also read BGPPeer resources: each adds a BGP neighbour (with password, multihop, graceful restart and a node selector) to the peers this node started with; needs BGP (-bgp or -bgp-config) and the BGPPeer CRD (the Helm chart installs it); only used with -kubernetes")
 		bgpPeers       = flag.String("bgp-peers", "", "comma-separated BGP peers when -bgp is set, each addr:asn or addr:asn:bfd (e.g. \"10.0.0.1:65000:bfd,10.0.0.2:65001\"); only used with -kubernetes")
 	)
 	flag.Parse()
@@ -174,7 +178,7 @@ func main() {
 				logger.Error("-bgp-config replaces -bgp, -bgp-asn, -bgp-router-id, -bgp-ipv6-next-hop and -bgp-peers; set one or the other")
 				os.Exit(1)
 			}
-			b, berr := config.LoadBGP(*bgpConfigFile)
+			b, berr := config.LoadBGPWith(*bgpConfigFile, *bgpPeerRes)
 			if berr != nil {
 				logger.Error("load -bgp-config", "err", berr)
 				os.Exit(1)
@@ -193,6 +197,8 @@ func main() {
 				RouterID:    *bgpRouterID,
 				IPv6NextHop: *bgpIPv6NextHop,
 				Peers:       peers,
+
+				PeersFromResources: *bgpPeerRes,
 			}
 			if err := cfg.BGP.Validate(); err != nil {
 				logger.Error("bgp flags", "err", err)
@@ -275,6 +281,7 @@ func main() {
 	// from whichever mode populated cfg.BGP (the YAML file's bgp: section,
 	// or the -bgp* flags above).
 	var bgpSpeaker *bgp.Speaker
+	var bgpStartupPeers []config.BGPPeer // the peers the speaker was started with, which BGPPeer resources add to
 	if cfg.BGP.Enabled {
 		var err error
 		node := *nodeName
@@ -282,6 +289,7 @@ func main() {
 			node, _ = os.Hostname()
 		}
 		bgpCfg := cfg.BGP.ForNode(node)
+		bgpStartupPeers = bgpCfg.Peers
 		if len(bgpCfg.Peers) == 0 {
 			logger.Warn("no configured BGP peer applies to this node, so it will advertise nothing", "node", node)
 		} else if len(bgpCfg.Peers) != len(cfg.BGP.Peers) {
@@ -387,6 +395,26 @@ func main() {
 			}
 		}
 
+		if *bgpPeerRes {
+			switch {
+			case bgpSpeaker == nil:
+				logger.Error("-bgp-peer-resources needs BGP: set -bgp or -bgp-config; BGPPeer resources are ignored")
+			default:
+				// Like ServicePolicy: Helm does not upgrade CRDs, so probe rather than let an informer
+				// on a missing resource wait forever.
+				if perr := k8s.CheckResource(ctx, clients.Dynamic, v1alpha1.BGPPeerResource); perr != nil {
+					logger.Error("BGPPeer resources are ignored: the CRD is not installed or not readable; apply deploy/helm/rivora/crds/bgppeer-crd.yaml and restart", "err", perr)
+				} else {
+					peers := bgppeers.New(clients.Dynamic, clients.Clientset, bgpSpeaker, bgpStartupPeers, cfg.BGP.ASN, *nodeName, *namespace, logger)
+					go func() {
+						if err := peers.Run(ctx); err != nil {
+							logger.Error("BGPPeer controller exited", "err", err)
+						}
+					}()
+				}
+			}
+		}
+
 		var gwReconciler *gatewayapi.Reconciler
 		var gwFactory informers.SharedInformerFactory
 		var gwDynFactory dynamicinformer.DynamicSharedInformerFactory
@@ -426,6 +454,29 @@ func main() {
 			gwReconciler.OnChange = onChange
 		}
 
+		// VIPs recovered from the pinned maps stay programmed until the reconcilers have each
+		// made a full first pass; whatever none of them claimed is then removed.
+		firstPass := []*initsync.Tracker{initsync.New()}
+		reconciler.SetInitTracker(firstPass[0])
+		if gwReconciler != nil {
+			firstPass = append(firstPass, initsync.New())
+			gwReconciler.SetInitTracker(firstPass[1])
+		}
+		if plane.Unclaimed() > 0 {
+			go func() {
+				if err := initsync.WaitAll(ctx, firstReconcileTimeout, firstPass...); err != nil {
+					if ctx.Err() == nil {
+						logger.Error("not removing the VIPs recovered at start-up that nothing has claimed: the first reconcile did not finish; they stay programmed", "unclaimed", plane.Unclaimed(), "err", err)
+					}
+					return
+				}
+				if pruned := plane.PruneUnclaimed(); len(pruned) > 0 {
+					logger.Warn("removed VIPs left programmed by an earlier run that no Service or Gateway wants any more", "vips", pruned)
+					onChange()
+				}
+			}()
+		}
+
 		go func() {
 			if err := reconciler.Run(ctx, factory, *workers); err != nil {
 				logger.Error("k8s reconciler exited", "err", err)
@@ -455,6 +506,38 @@ func main() {
 	apiServer := api.New(plane, apiKey)
 	apiServer.SetReadOnlyKeys(readOnlyKey)
 	apiServer.SetLogger(logger)
+
+	// Client certificates (mutual TLS) as an alternative to bearer keys: a certificate signed by
+	// RIVORA_TLS_CLIENT_CA authenticates its holder, by common name. Listed common names are admins; any
+	// other verified certificate is read-only.
+	var clientTLS *tls.Config
+	if clientCAPath := os.Getenv("RIVORA_TLS_CLIENT_CA"); clientCAPath != "" {
+		if tlsCert == "" && !selfSigned {
+			logger.Error("RIVORA_TLS_CLIENT_CA needs TLS: set RIVORA_TLS_CERT and RIVORA_TLS_KEY (or RIVORA_TLS_SELF_SIGNED)")
+			os.Exit(1)
+		}
+		pemBytes, rerr := os.ReadFile(clientCAPath)
+		if rerr != nil {
+			logger.Error("read RIVORA_TLS_CLIENT_CA", "err", rerr)
+			os.Exit(1)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pemBytes) {
+			logger.Error("RIVORA_TLS_CLIENT_CA holds no PEM certificate", "path", clientCAPath)
+			os.Exit(1)
+		}
+		clientAuth := tls.VerifyClientCertIfGiven
+		if os.Getenv("RIVORA_TLS_CLIENT_REQUIRED") != "" {
+			clientAuth = tls.RequireAndVerifyClientCert
+		}
+		clientTLS = &tls.Config{ClientCAs: pool, ClientAuth: clientAuth, MinVersion: tls.VersionTLS12}
+		var admins []string
+		if v := os.Getenv("RIVORA_API_CERT_ADMIN_CNS"); v != "" {
+			admins = strings.Split(v, ",")
+		}
+		apiServer.SetClientCerts(admins)
+		logger.Info("client certificates accepted", "required", clientAuth == tls.RequireAndVerifyClientCert, "admin_cns", len(admins))
+	}
 	if bgpSpeaker != nil {
 		apiServer.RegisterBGP(bgpSpeaker)
 	}
@@ -481,7 +564,7 @@ func main() {
 		tlsMode = "self-signed"
 	}
 	authMode := "off"
-	if apiKey != "" {
+	if apiKey != "" || clientTLS != nil {
 		authMode = "on"
 	}
 	logger.Info("api listening", "addr", cfg.APIListen, "tls", tlsMode, "auth", authMode,
@@ -492,6 +575,7 @@ func main() {
 		var err error
 		switch tlsMode {
 		case "file":
+			srv.TLSConfig = clientTLS // nil unless client certificates are on; the key pair is loaded from the files
 			err = srv.ListenAndServeTLS(tlsCert, tlsKey)
 		case "self-signed":
 			cert, cerr := tlsutil.GenerateSelfSigned()
@@ -500,6 +584,9 @@ func main() {
 				os.Exit(1)
 			}
 			srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+			if clientTLS != nil {
+				srv.TLSConfig.ClientCAs, srv.TLSConfig.ClientAuth, srv.TLSConfig.MinVersion = clientTLS.ClientCAs, clientTLS.ClientAuth, clientTLS.MinVersion
+			}
 			err = srv.ListenAndServeTLS("", "")
 		default:
 			err = srv.ListenAndServe()
@@ -549,9 +636,14 @@ func localPolicyFor(bgpOn, speakerOn bool, node string) controller.LocalPolicy {
 // logStartup reports what start-up found already programmed in the pinned maps.
 // Removing a VIP the config no longer lists is worth a warning of its own: it
 // was still forwarding traffic until this moment.
+// firstReconcileTimeout bounds how long start-up waits for the reconcilers' first full pass before
+// giving up on removing VIPs nothing has claimed. A Service that fails to reconcile would otherwise
+// hold that back forever; on timeout nothing is removed, since one of them might still want its VIP.
+const firstReconcileTimeout = 2 * time.Minute
+
 func logStartup(logger *slog.Logger, s dataplane.StartupSummary) {
 	if s.Adopted == 0 && s.Dropped == 0 {
-		return // fresh maps (or Kubernetes mode): nothing was there
+		return // fresh maps: nothing was there
 	}
 	logger.Info("recovered existing datapath state from the pinned maps",
 		"adopted", s.Adopted, "updated", s.Updated, "unchanged", s.Unchanged, "added", s.Added)

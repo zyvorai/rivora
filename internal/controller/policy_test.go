@@ -309,3 +309,30 @@ func TestPolicyBGPCommunitiesReachTheVIP(t *testing.T) {
 		t.Errorf("a bad community must reject the whole policy, got %v", err)
 	}
 }
+
+func TestPolicyBGPPeersReachTheVIP(t *testing.T) {
+	p := &v1alpha1.ServicePolicy{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "p"}}
+	p.Spec.TargetRef.Name = "svc"
+	p.Spec.BGP = &v1alpha1.BGPPolicy{Peers: []string{"2001:DB8::1", "192.0.2.1"}}
+	sp, err := compilePolicy(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := lbService(corev1.ServicePort{Name: "http", Port: 80})
+	sl := slice("http", 8080, onNode("10.1.0.1", "node-a", true, true))
+	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{sl}, buildOptions{Policy: sp})
+	if err != nil || len(got) != 1 {
+		t.Fatalf("got %v, %v", got, err)
+	}
+	if peers := got[0].VIP.BGPPeers; strings.Join(peers, ",") != "192.0.2.1,2001:db8::1" {
+		t.Errorf("VIP peers = %v, want the normalised list", peers)
+	}
+	// No policy, or one without peers, leaves the route unlimited.
+	if got, _ := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{sl}, buildOptions{}); len(got) != 1 || got[0].VIP.BGPPeers != nil {
+		t.Errorf("without a policy the VIP must not be limited: %v", got)
+	}
+	p.Spec.BGP.Peers = []string{"tor-1"}
+	if _, err := compilePolicy(p); err == nil || !strings.Contains(err.Error(), "bgp.peers") {
+		t.Errorf("a bad peer must reject the whole policy, got %v", err)
+	}
+}

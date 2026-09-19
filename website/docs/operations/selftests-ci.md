@@ -20,6 +20,8 @@ runs `rivorad` (or a focused Go test) as root.
 | `make selftest-edgecases` | VLAN/QinQ, IP options, IPv4 fragments (NAT + DSR), ICMP path-MTU steering (IPv4 + IPv6) |
 | `make selftest-l3dsr` | L3 DSR: IP-in-IP and GRE, IPv4 + IPv6, backend a routed hop away, tunnel source configured and auto-detected |
 | `make selftest-bgp` | Real rivorad and a BGP peer two hops away: multihop, TCP MD5 (match/mismatch/missing), route communities |
+| `make selftest-ipv6-ext` | IPv6 extension headers (Destination Options, Hop-by-Hop chained) and fragmented UDP through NAT and DSR, checked by real reassembly on both ends |
+| `make selftest-ipv6-policy` | IPv6 clientIP affinity, and IPv6 drop counters (rate_limited, no_backend, unserved) |
 | `make selftest-ipv6` | Same as first over all-IPv6 |
 | `make selftest-ndp` | NS → NA for NAT IPv6 VIP |
 | `make selftest-all` | All of the above |

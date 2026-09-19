@@ -23,6 +23,15 @@ rules:
     resources: ["servicepolicies"]
     verbs: ["get", "list", "watch"]
 {{- end }}
+{{- if and .Values.bgp.enabled .Values.bgp.peerResources }}
+  - apiGroups: ["rivora.zyvor.dev"]
+    resources: ["bgppeers"]
+    verbs: ["get", "list", "watch"]
+  # A BGPPeer's nodeSelector is matched against the labels of the node rivorad runs on.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+{{- end }}
 {{- if .Values.gatewayApi.enabled }}
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["gatewayclasses", "gateways"]
@@ -34,6 +43,37 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "list", "watch"]
+{{- end }}
+{{- if and .Values.bgp.enabled .Values.bgp.peerResources }}
+---
+# A BGPPeer's passwordSecretRef is read from this namespace only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "rivora.fullname" . }}-rivorad-bgp-secrets
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rivora.rivorad.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "rivora.fullname" . }}-rivorad-bgp-secrets
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rivora.rivorad.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "rivora.fullname" . }}-rivorad-bgp-secrets
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "rivora.rivorad.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
 {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1

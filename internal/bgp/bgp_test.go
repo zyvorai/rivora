@@ -69,6 +69,12 @@ func freePort(t *testing.T) int {
 // address gobgp binds to or dials from). Returns the server and the port
 // it's listening on.
 func startFakePeer(t *testing.T, peerASN, ourASN uint32) (*server.BgpServer, int) {
+	return startFakePeerAt(t, "127.0.0.1", peerASN, ourASN)
+}
+
+// startFakePeerAt is startFakePeer expecting our session to come from neighbor, which lets a test
+// run two fake routers at once: one reached over 127.0.0.1, the other over ::1.
+func startFakePeerAt(t *testing.T, neighbor string, peerASN, ourASN uint32) (*server.BgpServer, int) {
 	t.Helper()
 	port := freePort(t)
 
@@ -85,7 +91,7 @@ func startFakePeer(t *testing.T, peerASN, ourASN uint32) (*server.BgpServer, int
 
 	if err := s.AddPeer(ctx, &api.AddPeerRequest{
 		Peer: &api.Peer{
-			Conf:      &api.PeerConf{NeighborAddress: "127.0.0.1", PeerAsn: ourASN},
+			Conf:      &api.PeerConf{NeighborAddress: neighbor, PeerAsn: ourASN},
 			Transport: &api.Transport{PassiveMode: true},
 			AfiSafis:  dualStackAfiSafis(),
 		},
