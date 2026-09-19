@@ -244,7 +244,7 @@ section "5. bad config is refused at start-up"
 } > "$CONFIG"
 lb try
 X=$(cat "${WORK}/exit-${CMDN}" 2>/dev/null)
-[ -n "$X" ] && [ "$X" != 0 ] && pass "conflicting probes on a shared backend refused (exit ${X})" || fail "conflicting probes were accepted (exit '${X}')"
+[ "$X" = 1 ] && pass "conflicting probes on a shared backend refused (exit ${X})" || fail "conflicting probes were accepted (exit '${X}')"
 grep -q 'must agree' "$LOG" && pass "the error explains the conflict" || fail "unclear error: $(tail -2 "$LOG")"
 
 {
@@ -254,7 +254,7 @@ grep -q 'must agree' "$LOG" && pass "the error explains the conflict" || fail "u
 } > "$CONFIG"
 lb try
 X=$(cat "${WORK}/exit-${CMDN}" 2>/dev/null)
-[ -n "$X" ] && [ "$X" != 0 ] && pass "an http path without a leading slash refused (exit ${X})" || fail "a bad path was accepted (exit '${X}')"
+[ "$X" = 1 ] && pass "an http path without a leading slash refused (exit ${X})" || fail "a bad path was accepted (exit '${X}')"
 
 echo ""
 echo "summary: pass=${PASS} fail=${FAIL}"
