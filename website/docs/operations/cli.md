@@ -80,9 +80,9 @@ The file's settings become flags, and the VIPs come from Services (and Gateways)
 ## `rivoractl`
 
 ```sh
-rivoractl status                     # overview of the node's one VIP
+rivoractl status                     # one VIP: its detail; several: a line per VIP
 rivoractl vips                       # every VIP: mode, backends, packets
-rivoractl backends                   # per backend: ID, address, weight, state, counters (one-VIP nodes)
+rivoractl backends                   # every backend of every VIP: VIP, ID, address, weight, state, counters
 rivoractl drain 12                   # no new flows to backend 12
 rivoractl undrain 12
 rivoractl weight 12 5 [--vip 10.0.0.1:80:tcp]    # override a Maglev weight; 0 clears it
@@ -90,11 +90,10 @@ rivoractl validate /etc/rivora/config.yaml       # offline; needs no daemon
 rivoractl version
 ```
 
-`status`, `vips` and `backends` accept `--format json`. **`status` and `backends` answer only on a node with
-exactly one VIP**; with several they fail and point you at `vips`. To find a backend ID on a multi-VIP node
-(a Kubernetes node, say), read `rivoractl vips --format json`: each VIP lists its backends with their IDs, and
-so does the web console. Drain and weight changes are live and are **not
-persisted**: they survive reconciles and reloads but not a restart.
+`status`, `vips` and `backends` accept `--format json`. `status` describes the node's VIP in detail when there is
+one and prints a line per VIP when there are several. `backends` has one row per (VIP, backend), so a backend
+serving two VIPs appears twice, with each VIP's weight; its `VIP` column is the key `weight --vip` takes. Drain and
+weight changes are live and are **not persisted**: they survive reconciles and reloads but not a restart.
 
 | Option | Meaning |
 | --- | --- |

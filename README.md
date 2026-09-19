@@ -170,8 +170,7 @@ Examples in [`config/examples/`](config/examples), all validated by CI:
 | `bgp-ha.yaml`, `bgp-options.yaml` | BGP + BFD and its options |
 | `remote-api.yaml` | An API bound to a non-loopback address |
 
-With more than one VIP, `rivoractl status` and `backends` answer with an error; use `rivoractl vips` (or
-`/api/v1/vips`). Every setting: [Configuration reference](website/docs/operations/configuration.md).
+With more than one VIP, `rivoractl status` prints a line per VIP and `backends` lists every VIP's backends. Every setting: [Configuration reference](website/docs/operations/configuration.md).
 
 ## Kubernetes
 
@@ -389,8 +388,6 @@ Read [Limitations](website/docs/core-concepts/limitations.md) before production.
 - **Behaviours**: out-of-order fragments are lost; IPv6 Routing/AH/ESP headers are not balanced; L3 DSR needs
   path MTU headroom; health checks are TCP and HTTP only; drains and weight overrides are not persisted; flow
   tables are fixed-size LRUs.
-- **Known gap**: `rivoractl status`/`backends`, `/api/v1/status`/`backends` and the console's sign-in check answer
-  only when a node has exactly one VIP (use `rivoractl vips`).
 - **Unverified**: real-cluster Gateway API traffic, `ServicePolicy`, `BGPPeer` and Kubernetes restart adoption;
   BGP against FRR/BIRD; performance; kernels other than 6.8.
 

@@ -5,7 +5,8 @@
 # selftest-multivip.sh — v0.2 foundation verification: two independent VIPs
 # on one rivorad sharing the same physical backends (on different ports),
 # and graceful draining (a backend excluded from *new* flow selection
-# without disrupting its already-established connections).
+# without disrupting its already-established connections), and that the API and
+# rivoractl answer for a node that has several VIPs.
 #
 # Builds the same kind of isolated netns/veth/bridge topology as
 # selftest.sh, in full-NAT mode (simplest correct topology for two VIPs
@@ -262,6 +263,28 @@ if [ "$seenB1" -gt 0 ] && [ "$seenB2" -gt 0 ] && [ "$seenWrongVIPonB" -eq 0 ]; t
 else
     fail "VIP B: ${seenB1}/${seenB2} of 20, cross-VIP leakage=${seenWrongVIPonB} — results: $(echo "$resultsB" | tr '\n' ' ')"
 fi
+
+section "The API and CLI answer for a node with several VIPs"
+# These used to fail: /api/v1/backends and /api/v1/status were a 500 with more than one VIP, which broke
+# `rivoractl backends`/`status` and the console's sign-in check.
+code() { ip netns exec "$NS_LB" curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:9870$1"; }
+[ "$(code /api/v1/vips)" = 200 ] && pass "/api/v1/vips answers 200" || fail "/api/v1/vips answered $(code /api/v1/vips)"
+[ "$(code /api/v1/backends)" = 200 ] && pass "/api/v1/backends answers 200 with two VIPs" || fail "/api/v1/backends answered $(code /api/v1/backends), want 200"
+[ "$(code /api/v1/status)" = 409 ] && pass "/api/v1/status refuses with 409 (not a 500): it answers only for a single VIP" \
+    || fail "/api/v1/status answered $(code /api/v1/status), want 409"
+rows=$(ip netns exec "$NS_LB" curl -s "http://127.0.0.1:9870/api/v1/backends" | python3 -c "
+import json, sys
+rows = json.load(sys.stdin)
+vips = sorted({r.get('vip', '') for r in rows})
+print(len(rows), ' '.join(vips))")
+[ "$rows" = "4 ${VIP_A}:${PORT_A}:tcp ${VIP_B}:${PORT_B}:tcp" ] \
+    && pass "backends lists 4 rows, two per VIP, each labelled with its VIP" || fail "backends rows: '${rows}'"
+tbl=$(ip netns exec "$NS_LB" "$RIVORACTL" backends --api 127.0.0.1:9870 2>&1)
+{ grep -q "${VIP_A}:${PORT_A}:tcp" <<<"$tbl" && grep -q "${VIP_B}:${PORT_B}:tcp" <<<"$tbl"; } \
+    && pass "rivoractl backends lists both VIPs' backends" || fail "rivoractl backends: ${tbl}"
+st=$(ip netns exec "$NS_LB" "$RIVORACTL" status --api 127.0.0.1:9870 2>&1)
+{ grep -q "${VIP_A}" <<<"$st" && grep -q "${VIP_B}" <<<"$st" && grep -q "2/2" <<<"$st"; } \
+    && pass "rivoractl status summarises both VIPs (2/2 healthy each)" || fail "rivoractl status: ${st}"
 
 section "Graceful draining (backend_health_map, direct BPF verification)"
 id_a1=$(backend_id_for "$VIP_A" 10.78.0.11 "$PORT_A")

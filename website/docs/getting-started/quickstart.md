@@ -77,14 +77,13 @@ All in [`config/examples/`](https://github.com/zyvorai/rivora/tree/main/config/e
 | `bgp-ha.yaml`, `bgp-options.yaml` | BGP + BFD, and its options |
 | `remote-api.yaml` | An API bound to a non-loopback address |
 
-With more than one VIP, `rivoractl status` and `backends` answer with an error; use `rivoractl vips` (or
-`/api/v1/vips`).
+With more than one VIP, `rivoractl status` prints a line per VIP, and `rivoractl vips` / `backends` list them all.
 
 ## Operate it
 
 ```sh
 rivoractl vips                          # every VIP: mode, backends, packets
-rivoractl drain 12                      # take backend 12 out of new-flow rotation (IDs from `vips --format json`)
+rivoractl drain 12                      # take backend 12 out of new-flow rotation (IDs from `rivoractl backends`)
 rivoractl weight 12 5                   # canary: give it more or less traffic
 sudo systemctl reload rivorad           # apply an edited config's VIP set (SIGHUP)
 curl -s http://127.0.0.1:9871/metrics   # Prometheus

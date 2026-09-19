@@ -17,8 +17,8 @@ anywhere else: read [Securing it](#securing-it) before changing `apiListen`.
 | Route | Method | Meaning |
 | --- | --- | --- |
 | `/api/v1/vips` | GET | Every VIP the node serves, with its backends and live counters. |
-| `/api/v1/status` | GET | The node's VIP, when there is **exactly one**; otherwise an error pointing at `/api/v1/vips`. |
-| `/api/v1/backends` | GET | The backends of the node's VIP, again only when there is exactly one. |
+| `/api/v1/status` | GET | The node's VIP, when there is **exactly one**. On a node with none or several it answers `409` and points at `/api/v1/vips`: there is no single VIP to describe. |
+| `/api/v1/backends` | GET | Every backend of every VIP, one row per (VIP, backend), each labelled with its `vip` (`addr:port:proto`, the form the `weight` route's `vip` takes). Any number of VIPs, including none (`[]`). |
 | `/api/v1/backends/{id}/drain` | POST | Stop sending new flows to a backend. Established flows continue. |
 | `/api/v1/backends/{id}/undrain` | POST | Undo an operator drain. |
 | `/api/v1/backends/{id}/weight` | POST | Override a backend's Maglev weight. Body `{"weight": 5, "vip": "addr:port:proto"}`; `vip` optional, weight `0` clears the override, above 1000 is rejected. |
@@ -26,7 +26,7 @@ anywhere else: read [Securing it](#securing-it) before changing `apiListen`.
 | `/` | GET | The web console. |
 
 The POST routes need `Content-Type: application/json` and, when authentication is on, admin access.
-Backend IDs are the `id` fields of `/api/v1/vips`.
+Backend IDs are the `id` fields of `/api/v1/backends` and `/api/v1/vips`. A backend that serves several VIPs has one row per VIP, with that VIP's weight and its own (repeated) counters, so do not sum the counters across rows.
 
 ```sh
 curl -s -H "Authorization: Bearer $RIVORA_API_KEY" http://127.0.0.1:9870/api/v1/vips
@@ -59,7 +59,8 @@ VIP's own: see [Why is traffic being dropped](runbook.md#why-is-traffic-being-dr
 The console at `/` is a read-only view: an overview, every VIP (a port range as `first-last`) and every
 backend with its state (`healthy`, `draining`, `draining (operator)`, `down`), weight and counters. It has no
 controls; drain and weight changes go through `rivoractl` or the API. It signs in with the same key as the
-API, held in memory only, so reloading the page signs out. With authentication off, an empty token signs in.
+API (checked against `/api/v1/vips`, so it works for any number of VIPs), held in memory only, so reloading the
+page signs out. With authentication off, an empty token signs in.
 
 ## Securing it
 

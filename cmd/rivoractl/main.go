@@ -9,20 +9,24 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"text/tabwriter"
 
 	"github.com/zyvorai/rivora/internal/apiclient"
 	"github.com/zyvorai/rivora/internal/config"
+	"github.com/zyvorai/rivora/internal/dataplane"
 )
 
 var version = "dev"
 
 const usage = `rivoractl: status | vips | backends [--format json] [--api HOST:PORT|URL]
-  status              Overview: VIP, mode, healthy/total backends, packet counters
+  status              Overview: with one VIP its detail (mode, healthy/total backends, counters);
+                      with several, one line per VIP
   vips                VIP configuration and live counters
-  backends            Per-backend state (healthy/draining/down) and packet counters
+  backends            Per-backend state (healthy/draining/down) and packet counters, one row
+                      per VIP the backend serves
   drain ID            Stop sending NEW flows to backend ID; established flows keep flowing
   undrain ID          Undo an operator drain (does not affect Kubernetes-driven draining)
   weight ID N         Override backend ID's Maglev weight to N (0 clears the override)
@@ -172,26 +176,55 @@ func main() {
 	}
 }
 
+// cmdStatus is the overview of the node. With one VIP it is that VIP's detail, as it always was; with
+// several there is no single VIP to describe, so it is a one-line summary per VIP, and with none it says so.
 func cmdStatus(c *apiclient.Client, format string) error {
-	st, err := c.Status()
+	vips, err := c.VIPs()
 	if err != nil {
 		return err
 	}
-	if format == "json" {
-		return printJSON(st)
+	return renderStatus(os.Stdout, vips, format)
+}
+
+func renderStatus(out io.Writer, vips []dataplane.Status, format string) error {
+	switch len(vips) {
+	case 0:
+		return fmt.Errorf("no VIPs configured")
+	case 1:
+		return renderSingleStatus(out, vips[0], format)
 	}
-	healthy := 0
+	if format == "json" {
+		return writeJSON(out, vips)
+	}
+	w := tabwriter.NewWriter(out, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(w, "VIP\tPORT\tPROTO\tMODE\tHEALTHY\tPACKETS\tBYTES\tDROPPED")
+	for _, st := range vips {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d/%d\t%d\t%d\t%d\n", st.VIPAddress, st.PortLabel(), st.Protocol, st.Mode,
+			healthyCount(st), len(st.Backends), st.Packets, st.Bytes, st.DroppedRateLimited+st.DroppedNoBackend)
+	}
+	return w.Flush()
+}
+
+func healthyCount(st dataplane.Status) int {
+	n := 0
 	for _, b := range st.Backends {
 		if b.Healthy {
-			healthy++
+			n++
 		}
 	}
-	fmt.Printf("VIP        %s:%s/%s\n", st.VIPAddress, st.PortLabel(), st.Protocol)
-	fmt.Printf("mode       %s\n", st.Mode)
-	fmt.Printf("interface  %s\n", st.Interface)
-	fmt.Printf("backends   %d/%d healthy\n", healthy, len(st.Backends))
-	fmt.Printf("traffic    %d packets, %d bytes, %d dropped\n", st.Packets, st.Bytes, st.Dropped)
-	fmt.Printf("uptime     since %s\n", st.StartedAt.Format("2006-01-02T15:04:05Z07:00"))
+	return n
+}
+
+func renderSingleStatus(out io.Writer, st dataplane.Status, format string) error {
+	if format == "json" {
+		return writeJSON(out, st)
+	}
+	fmt.Fprintf(out, "VIP        %s:%s/%s\n", st.VIPAddress, st.PortLabel(), st.Protocol)
+	fmt.Fprintf(out, "mode       %s\n", st.Mode)
+	fmt.Fprintf(out, "interface  %s\n", st.Interface)
+	fmt.Fprintf(out, "backends   %d/%d healthy\n", healthyCount(st), len(st.Backends))
+	fmt.Fprintf(out, "traffic    %d packets, %d bytes, %d dropped\n", st.Packets, st.Bytes, st.Dropped)
+	fmt.Fprintf(out, "uptime     since %s\n", st.StartedAt.Format("2006-01-02T15:04:05Z07:00"))
 	return nil
 }
 
@@ -216,11 +249,27 @@ func cmdBackends(c *apiclient.Client, format string) error {
 	if err != nil {
 		return err
 	}
+	return renderBackends(os.Stdout, bs, format)
+}
+
+// renderBackends prints one row per (VIP, backend). The VIP column appears when rivorad labels the
+// rows (a current rivorad always does), so a backend serving several VIPs is not shown as one.
+func renderBackends(out io.Writer, bs []dataplane.BackendStatus, format string) error {
 	if format == "json" {
-		return printJSON(bs)
+		return writeJSON(out, bs)
 	}
-	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tADDRESS\tPORT\tWEIGHT\tSTATE\tPACKETS\tBYTES")
+	withVIP := false
+	for _, b := range bs {
+		if b.VIP != "" {
+			withVIP = true
+		}
+	}
+	w := tabwriter.NewWriter(out, 0, 2, 2, ' ', 0)
+	if withVIP {
+		fmt.Fprintln(w, "VIP\tID\tADDRESS\tPORT\tWEIGHT\tSTATE\tPACKETS\tBYTES")
+	} else {
+		fmt.Fprintln(w, "ID\tADDRESS\tPORT\tWEIGHT\tSTATE\tPACKETS\tBYTES")
+	}
 	for _, b := range bs {
 		state := b.State
 		if state == "" { // older rivorad without the state field
@@ -231,6 +280,9 @@ func cmdBackends(c *apiclient.Client, format string) error {
 		}
 		if b.AdminDraining {
 			state += " (operator)"
+		}
+		if withVIP {
+			fmt.Fprintf(w, "%s\t", b.VIP)
 		}
 		fmt.Fprintf(w, "%d\t%s\t%d\t%d\t%s\t%d\t%d\n", b.ID, b.Address, b.Port, b.Weight, state, b.Packets, b.Bytes)
 	}
@@ -322,8 +374,10 @@ func cmdValidate(args []string) error {
 	return nil
 }
 
-func printJSON(v any) error {
-	enc := json.NewEncoder(os.Stdout)
+func printJSON(v any) error { return writeJSON(os.Stdout, v) }
+
+func writeJSON(w io.Writer, v any) error {
+	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
 }

@@ -50,9 +50,6 @@ These are known and worth doing; none is scheduled.
   (IPv4 and IPv6) against a real router such as FRR or BIRD, including BFD timing.
 - **Performance measurement.** Throughput and latency numbers per mode, generic versus native XDP, and DSR
   under native XDP on real hardware.
-- **Console and CLI on multi-VIP nodes.** `rivoractl status` and `backends`, `/api/v1/status` and
-  `/api/v1/backends`, and the web console's sign-in check only work with exactly one VIP; on a node with
-  several they should list them all.
 - **Health checks.** HTTPS, gRPC and UDP probes; per-VIP (rather than global) timing; passive outlier
   detection.
 - **Flow tables.** Configurable sizes and TCP-state-aware expiry (today: fixed-size LRU).

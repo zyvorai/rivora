@@ -40,8 +40,16 @@ type Admin interface {
 	SetBackendWeight(backendID uint32, vipKey string, weight uint32) (int, error)
 }
 
+// reader is what the read-only routes need from the dataplane; narrowed so they can be tested without
+// loading BPF maps. *dataplane.Dataplane implements it.
+type reader interface {
+	Status() (dataplane.Status, error)
+	Statuses() ([]dataplane.Status, error)
+	Backends() ([]dataplane.BackendStatus, error)
+}
+
 type Server struct {
-	dp     *dataplane.Dataplane
+	dp     reader
 	admin  Admin
 	apiKey string // admin key(s): full access; a comma-separated list rotates keys
 	// readOnlyKey is the key(s) that may only read. Empty means no read-only role.
@@ -276,10 +284,16 @@ func (s *Server) validBearer(header string) bool {
 	return a || r
 }
 
+// handleStatus answers for "the" VIP, which only a node with exactly one has. On any other node it is
+// a 409, not a fault: use /api/v1/vips, which lists every VIP.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	st, err := s.dp.Status()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		code := http.StatusInternalServerError
+		if errors.Is(err, dataplane.ErrNotSingleVIP) {
+			code = http.StatusConflict
+		}
+		writeError(w, code, err)
 		return
 	}
 	writeJSON(w, st)
@@ -294,13 +308,14 @@ func (s *Server) handleVIPs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, sts)
 }
 
+// handleBackends lists the backends of every VIP, one row per (VIP, backend), each labelled with its VIP.
 func (s *Server) handleBackends(w http.ResponseWriter, r *http.Request) {
-	st, err := s.dp.Status()
+	bs, err := s.dp.Backends()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, st.Backends)
+	writeJSON(w, bs)
 }
 
 // maxAdminBody bounds a mutation request body; the payloads are a few dozen

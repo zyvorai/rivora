@@ -5,7 +5,8 @@ import { setToken } from './api';
 
 export type LoginResult = { ok: true } | { ok: false; error: string };
 
-// login verifies the token by calling /api/v1/status. An empty token is allowed
+// login verifies the token by calling /api/v1/vips, which answers for a node with any number of
+// VIPs (/api/v1/status answers only when there is exactly one). An empty token is allowed
 // so a rivorad started without RIVORA_API_KEY (auth off) is still reachable;
 // if auth is on, the server answers 401 and the sign-in is refused.
 export async function login(apiToken: string): Promise<LoginResult> {
@@ -13,7 +14,7 @@ export async function login(apiToken: string): Promise<LoginResult> {
   if (apiToken) headers.Authorization = `Bearer ${apiToken}`;
   let r: Response;
   try {
-    r = await fetch('/api/v1/status', { headers });
+    r = await fetch('/api/v1/vips', { headers });
   } catch {
     return { ok: false, error: 'Could not reach the Rivora API.' };
   }
