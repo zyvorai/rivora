@@ -68,8 +68,19 @@ that only sets `healthCheck` changes only that.
 ## Enabling it
 
 The Helm chart installs the CRD and turns it on (`servicePolicy.enabled`, default
-`true`), which adds the RBAC and passes `-service-policy=true` to `rivorad`. Without
-the CRD installed, `-service-policy` must be off or the watch never syncs.
+`true`), which adds the RBAC and passes `-service-policy=true` to `rivorad`.
+
+**Helm installs a chart's CRDs only on first install, never on upgrade.** If you are upgrading
+from a release that predates ServicePolicy, apply the CRD yourself first:
+
+```sh
+kubectl apply -f deploy/helm/rivora/crds/servicepolicy-crd.yaml
+```
+
+If you forget, `rivorad` checks at start-up, logs `ServicePolicy is disabled: the CRD is not
+installed`, and carries on serving Services without policies (an informer on a CRD the cluster
+does not serve would otherwise never sync and stall every Service). Restart it after applying the
+CRD.
 
 The same rate limit is available to static configs as a VIP's `rateLimit` block
 (`config/examples/vip-rate-limit.yaml`).
