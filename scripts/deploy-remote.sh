@@ -60,6 +60,10 @@ Options:
   -v, --verbose       Verbose rsync
 
 Environment:
+  RIVORA_API_KEY         API bearer token for the remote rivorad. Required on the
+                         first install (the API is bound to 0.0.0.0); not needed
+                         when /etc/rivora/rivorad.env on the host already has one.
+                         Generate: openssl rand -hex 24
   RIVORA_DEPLOY_LOG      Log file path
   RIVORA_SSH_RETRIES     SSH retry count (default: 3)
   DEPLOY_DIR             Override remote staging dir (default: ~/.deployments/rivora)
@@ -296,7 +300,15 @@ REMOTE
 }
 
 build_install_remote() {
-    _ssh env REMOTE_STAGING="${REMOTE_DIR}" bash <<'REMOTE'
+    {
+        # The remote install-systemd.sh refuses to expose the API on 0.0.0.0
+        # without RIVORA_API_KEY, so forward ours. It goes over stdin as an
+        # `export` line rather than as an argument/env on the ssh command line,
+        # so it never appears in a local or remote process list.
+        if [ -n "${RIVORA_API_KEY:-}" ]; then
+            printf 'export RIVORA_API_KEY=%q\n' "${RIVORA_API_KEY}"
+        fi
+        cat <<'REMOTE'
 set -e
 SUDO=""
 [ "$(id -u)" -ne 0 ] && SUDO="sudo"
@@ -314,6 +326,7 @@ $SUDO install -m644 config/examples/remote-api.yaml /etc/rivora/remote-api.yaml.
 bash scripts/install-systemd.sh
 echo "Installed: $(rivorad -version 2>/dev/null || echo ok)"
 REMOTE
+    } | _ssh env REMOTE_STAGING="${REMOTE_DIR}" bash
 }
 
 verify_remote() {
@@ -382,6 +395,7 @@ print_deployment_summary() {
     echo "  remote: ${REMOTE_DIR}"
     echo ""
     echo "  UX URL: https://${TARGET_HOST}:9870/  (self-signed console; curl -k for API)"
+    echo "  auth:   sign in with the RIVORA_API_KEY in /etc/rivora/rivorad.env on the host"
     echo "  ssh ${TARGET_USER}@${TARGET_HOST}"
     echo "  rivora-doctor"
     echo "  sudo bash ${REMOTE_DIR}/scripts/selftest.sh"

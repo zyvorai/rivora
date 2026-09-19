@@ -71,6 +71,52 @@ they were actually removed, a restart rebuilds them from the current
 config/K8s state (some in-flight NAT connection affinity is lost in that
 case, existing DSR flows are not since the backend owns the reply path).
 
+## Draining a backend or shifting weight (live)
+
+Use these for maintenance and canary shifts without editing config or
+restarting `rivorad`. Backend IDs come from `rivoractl backends`.
+
+```bash
+rivoractl backends                 # ID, address, weight, STATE, counters
+rivoractl drain 12                 # no NEW flows; established flows keep flowing
+rivoractl undrain 12
+rivoractl weight 12 5              # override Maglev weight to 5 on every VIP using backend 12
+rivoractl weight 12 5 --vip 10.0.0.1:80:tcp   # only that VIP
+rivoractl weight 12 0              # clear the override; configured weight applies again
+```
+
+- The same operations are `POST /api/v1/backends/{id}/drain`, `/undrain` and
+  `/weight` (body `{"weight": 5, "vip": "addr:port:proto"}`, `vip` optional).
+  They require `Content-Type: application/json` and, when `RIVORA_API_KEY` is
+  set, the bearer token.
+- An operator drain is tracked separately from a Kubernetes-driven one
+  (terminating endpoint), so neither silently undoes the other. `STATE` shows
+  `draining (operator)` for yours, and `rivora_backend_draining` is `1` for either.
+- A failed health probe still wins over a drain: a backend that is down stays
+  down.
+- Weight overrides survive Kubernetes reconciles and static-config re-syncs, and
+  are dropped if the backend leaves the VIP. Weights above 1000 are rejected.
+- **Not persisted.** Drains and overrides live in `rivorad`'s memory: a restart
+  (or pod recreation) reverts to the configured state. Put lasting changes in
+  the config or the Service.
+- Check a config file before deploying it with `rivoractl validate FILE`; it
+  runs the same loader `rivorad` starts with and needs no running daemon.
+
+## The flow tables are filling up
+
+`connection_affinity_map` (sticky per-flow backend choice) and `nat_reverse_map`
+(full-NAT return path) are fixed-size LRU tables, with separate IPv6 siblings.
+When one is full the kernel evicts the least-recently-used flow, so a live
+connection can be re-hashed onto a different backend (affinity) or lose its
+un-NAT mapping (nat_reverse) and reset.
+
+Watch `rivora_conntrack_entries / rivora_conntrack_capacity` per `table`. A
+sustained ratio above ~0.8 means you are close to evicting live flows; the
+usual causes are a SYN flood (see the rate-limit example config) or many
+long-lived idle connections. Entry counts are sampled at most every 10 seconds.
+The table sizes are compile-time today, so the remedies are rate limiting and
+spreading VIPs across nodes.
+
 ## Restarting rivorad
 
 Safe under normal conditions: `internal/loader` pins BPF maps under

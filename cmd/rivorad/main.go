@@ -11,7 +11,6 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -34,6 +33,7 @@ import (
 	"github.com/zyvorai/rivora/internal/healthcheck"
 	"github.com/zyvorai/rivora/internal/k8s"
 	"github.com/zyvorai/rivora/internal/loader"
+	"github.com/zyvorai/rivora/internal/logging"
 	"github.com/zyvorai/rivora/internal/speaker"
 	"github.com/zyvorai/rivora/internal/tlsutil"
 )
@@ -45,6 +45,8 @@ func main() {
 		configPath = flag.String("config", "/etc/rivora/config.yaml", "path to VIP/backend config (static-YAML mode; ignored with -kubernetes)")
 		bpfDir     = flag.String("bpf-dir", "/usr/local/share/rivora/bpf", "directory containing xdp_ingress.o and tc_nat.o")
 		showVer    = flag.Bool("version", false, "print version and exit")
+		logLevel   = flag.String("log-level", "info", "log level: debug, info, warn or error")
+		logFormat  = flag.String("log-format", "text", "log format: text or json")
 
 		kubeMode      = flag.Bool("kubernetes", false, "run the Kubernetes reconciler + ARP speaker instead of loading -config; VIPs come from Service/EndpointSlice")
 		kubeconfig    = flag.String("kubeconfig", "", "path to a kubeconfig file (default: in-cluster config, falling back to $KUBECONFIG / ~/.kube/config); only used with -kubernetes")
@@ -80,7 +82,11 @@ func main() {
 		return
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	logger, err := logging.New(os.Stdout, *logLevel, *logFormat)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "rivorad:", err)
+		os.Exit(2)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -318,7 +324,7 @@ func main() {
 	// 127.0.0.1 is unreachable to anything but the local kubelet, and an
 	// in-cluster Prometheus needs a routable, plain-HTTP address instead.
 	// /healthz, /readyz and /metrics carry no sensitive data, so no auth here.
-	metricsSrv := &http.Server{Addr: *metricsListen, Handler: apiServer.MetricsHandler()}
+	metricsSrv := &http.Server{Addr: *metricsListen, Handler: apiServer.MetricsHandler(), ReadHeaderTimeout: readHeaderTimeout}
 	go func() {
 		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("metrics server", "err", err)
@@ -326,7 +332,7 @@ func main() {
 	}()
 	defer metricsSrv.Close()
 
-	srv := &http.Server{Addr: cfg.APIListen, Handler: apiServer.Handler()}
+	srv := &http.Server{Addr: cfg.APIListen, Handler: apiServer.Handler(), ReadHeaderTimeout: readHeaderTimeout}
 	tlsMode := "off"
 	switch {
 	case tlsCert != "" && tlsKey != "":
@@ -364,8 +370,23 @@ func main() {
 
 	<-ctx.Done()
 	logger.Info("shutting down")
-	_ = srv.Close()
+	// Let in-flight API requests finish, but never hold up exit (and the BPF
+	// detach in the deferred dp.Close) for longer than shutdownTimeout.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("api graceful shutdown incomplete, closing", "err", err)
+		_ = srv.Close()
+	}
 }
+
+const (
+	// readHeaderTimeout bounds how long a client may take to send request
+	// headers, closing the slowloris hole on the API and metrics listeners.
+	readHeaderTimeout = 10 * time.Second
+	// shutdownTimeout bounds the graceful drain of the API server on SIGTERM.
+	shutdownTimeout = 5 * time.Second
+)
 
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {

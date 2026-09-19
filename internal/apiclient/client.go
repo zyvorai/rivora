@@ -7,11 +7,14 @@
 package apiclient
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,10 +76,55 @@ func (c *Client) VIPs() ([]dataplane.Status, error) {
 	return vips, err
 }
 
+// Drain stops backend id from receiving new flows (established ones keep
+// flowing). Undrain reverses it. Both act on the operator's own drain flag,
+// independent of any Kubernetes-driven drain.
+func (c *Client) Drain(id uint32) error   { return c.backendAction(id, "drain", nil) }
+func (c *Client) Undrain(id uint32) error { return c.backendAction(id, "undrain", nil) }
+
+// SetWeight overrides backend id's Maglev weight, returning how many VIPs were
+// changed. vip ("addr:port:proto") scopes it to one VIP; empty applies to all
+// VIPs using the backend. weight 0 clears the override.
+func (c *Client) SetWeight(id uint32, weight uint32, vip string) (int, error) {
+	body := map[string]any{"weight": weight}
+	if vip != "" {
+		body["vip"] = vip
+	}
+	var resp struct {
+		VIPs int `json:"vips"`
+	}
+	err := c.do(http.MethodPost, "/api/v1/backends/"+strconv.FormatUint(uint64(id), 10)+"/weight", body, &resp)
+	return resp.VIPs, err
+}
+
+func (c *Client) backendAction(id uint32, action string, body any) error {
+	return c.do(http.MethodPost, "/api/v1/backends/"+strconv.FormatUint(uint64(id), 10)+"/"+action, body, nil)
+}
+
 func (c *Client) get(path string, out any) error {
-	req, err := http.NewRequest(http.MethodGet, c.base+path, nil)
+	return c.do(http.MethodGet, path, nil, out)
+}
+
+// do sends one request. A JSON body (when non-nil) always goes with
+// Content-Type: application/json, which rivorad requires on mutations as a
+// CSRF guard; mutations without a payload still send the header.
+func (c *Client) do(method, path string, body, out any) error {
+	var rdr *bytes.Reader
+	if body != nil {
+		buf, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		rdr = bytes.NewReader(buf)
+	} else {
+		rdr = bytes.NewReader(nil)
+	}
+	req, err := http.NewRequest(method, c.base+path, rdr)
 	if err != nil {
 		return err
+	}
+	if method != http.MethodGet {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	if c.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
@@ -84,7 +132,10 @@ func (c *Client) get(path string, out any) error {
 
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		if _, ok := err.(*net.OpError); ok {
+		// http.Client wraps transport errors in *url.Error, so a direct type
+		// assertion never matched; errors.As unwraps to the *net.OpError.
+		var opErr *net.OpError
+		if errors.As(err, &opErr) {
 			return fmt.Errorf("cannot reach rivorad at %s (is it running?): %w", c.base, err)
 		}
 		return err
@@ -103,6 +154,9 @@ func (c *Client) get(path string, out any) error {
 			return fmt.Errorf("rivorad: %s", e.Error)
 		}
 		return fmt.Errorf("rivorad: unexpected status %s", resp.Status)
+	}
+	if out == nil {
+		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }

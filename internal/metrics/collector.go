@@ -10,6 +10,8 @@ package metrics
 
 import (
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -23,9 +25,32 @@ type StatusSource interface {
 	Statuses() ([]dataplane.Status, error)
 }
 
+// ConntrackSource is optionally implemented by a StatusSource (the real
+// *dataplane.Dataplane does) to report flow-table occupancy. Kept separate so
+// a source that can't — or a test fake that doesn't care — needn't provide it.
+type ConntrackSource interface {
+	ConntrackUsage() []dataplane.MapUsage
+}
+
+// conntrackCacheTTL bounds how often the flow tables are walked. Counting
+// entries is O(table size) syscalls, so scraping it every few seconds from
+// several Prometheus replicas would be wasteful; occupancy moves slowly enough
+// that a 10s-old value is as good for alerting.
+const conntrackCacheTTL = 10 * time.Second
+
 // DataplaneCollector implements prometheus.Collector over a StatusSource.
 type DataplaneCollector struct {
 	src StatusSource
+
+	ct       ConntrackSource // nil when src doesn't provide flow-table usage
+	now      func() time.Time
+	ctMu     sync.Mutex
+	ctAt     time.Time
+	ctCached []dataplane.MapUsage
+
+	backendDraining *prometheus.Desc
+	ctEntries       *prometheus.Desc
+	ctCapacity      *prometheus.Desc
 
 	vipInfo        *prometheus.Desc
 	vipBackends    *prometheus.Desc
@@ -44,8 +69,9 @@ func NewDataplaneCollector(src StatusSource) *DataplaneCollector {
 	const ns = "rivora"
 	vipLabels := []string{"vip", "protocol", "mode"}
 	backendLabels := []string{"vip", "backend"}
-	return &DataplaneCollector{
+	c := &DataplaneCollector{
 		src: src,
+		now: time.Now,
 		vipInfo: prometheus.NewDesc(
 			prometheus.BuildFQName(ns, "vip", "info"),
 			"Static info for a configured VIP; always 1.",
@@ -96,7 +122,43 @@ func NewDataplaneCollector(src StatusSource) *DataplaneCollector {
 			"Whether the last scrape of the dataplane's BPF maps failed (1) or succeeded (0).",
 			nil, nil,
 		),
+		backendDraining: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "backend", "draining"),
+			"Whether a backend is draining (1): it takes no new flows but established ones continue. Set by an operator drain or a terminating Kubernetes endpoint.",
+			backendLabels, nil,
+		),
+		ctEntries: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "conntrack", "entries"),
+			"Live entries in a flow table (affinity, nat_reverse, and their IPv6 siblings). Sampled at most every 10s.",
+			[]string{"table"}, nil,
+		),
+		ctCapacity: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "conntrack", "capacity"),
+			"Maximum entries in a flow table. These are LRU maps: once entries reaches capacity, live flows are evicted and may be re-hashed onto a different backend.",
+			[]string{"table"}, nil,
+		),
 	}
+	if cs, ok := src.(ConntrackSource); ok {
+		c.ct = cs
+	}
+	return c
+}
+
+// conntrackUsage returns the flow-table usage, walking the tables at most once
+// per conntrackCacheTTL. The lock is held across the walk on purpose: two
+// concurrent scrapes should share one walk, not each start their own.
+func (c *DataplaneCollector) conntrackUsage() []dataplane.MapUsage {
+	c.ctMu.Lock()
+	defer c.ctMu.Unlock()
+	if c.ctCached != nil && c.now().Sub(c.ctAt) < conntrackCacheTTL {
+		return c.ctCached
+	}
+	c.ctCached = c.ct.ConntrackUsage()
+	if c.ctCached == nil {
+		c.ctCached = []dataplane.MapUsage{} // cache "no tables" too
+	}
+	c.ctAt = c.now()
+	return c.ctCached
 }
 
 func (c *DataplaneCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -110,6 +172,9 @@ func (c *DataplaneCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.backendHealthy
 	ch <- c.backendWeight
 	ch <- c.scrapeErrors
+	ch <- c.backendDraining
+	ch <- c.ctEntries
+	ch <- c.ctCapacity
 }
 
 func (c *DataplaneCollector) Collect(ch chan<- prometheus.Metric) {
@@ -144,6 +209,18 @@ func (c *DataplaneCollector) Collect(ch chan<- prometheus.Metric) {
 			ch <- prometheus.MustNewConstMetric(c.backendBytes, prometheus.CounterValue, float64(b.Bytes), vip, backend)
 			ch <- prometheus.MustNewConstMetric(c.backendHealthy, prometheus.GaugeValue, healthy, vip, backend)
 			ch <- prometheus.MustNewConstMetric(c.backendWeight, prometheus.GaugeValue, float64(b.Weight), vip, backend)
+			draining := 0.0
+			if b.State == "draining" {
+				draining = 1.0
+			}
+			ch <- prometheus.MustNewConstMetric(c.backendDraining, prometheus.GaugeValue, draining, vip, backend)
+		}
+	}
+
+	if c.ct != nil {
+		for _, u := range c.conntrackUsage() {
+			ch <- prometheus.MustNewConstMetric(c.ctEntries, prometheus.GaugeValue, float64(u.Entries), u.Table)
+			ch <- prometheus.MustNewConstMetric(c.ctCapacity, prometheus.GaugeValue, float64(u.Capacity), u.Table)
 		}
 	}
 }

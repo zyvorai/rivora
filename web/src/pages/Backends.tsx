@@ -5,6 +5,14 @@ import { fmtBytes } from '../types';
 
 type Row = BackendStatus & { vip: string };
 
+// A draining backend still serves established flows but takes no new ones, so
+// showing it as "down" would mislead an operator who just ran `rivoractl drain`.
+function backendLabel(b: { healthy: boolean; state?: string; adminDraining?: boolean }): string {
+  if (b.state === 'draining') return b.adminDraining ? 'draining (operator)' : 'draining';
+  if (b.state) return b.state === 'healthy' ? 'up' : 'down';
+  return b.healthy ? 'up' : 'down';
+}
+
 export default function Backends() {
   const [rows, setRows] = useState<Row[]>([]);
   const [err, setErr] = useState('');
@@ -60,7 +68,7 @@ export default function Backends() {
               <tbody>
                 {rows.map((b) => (
                   <tr key={`${b.vip}-${b.id}-${b.address}:${b.port}`}>
-                    <td>{b.healthy ? 'up' : 'down'}</td>
+                    <td>{backendLabel(b)}</td>
                     <td>
                       <code>
                         {b.address}:{b.port}

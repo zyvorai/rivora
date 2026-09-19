@@ -4,6 +4,9 @@ export type BackendStatus = {
   port: number;
   weight: number;
   healthy: boolean;
+  // Absent when talking to an older rivorad; fall back to `healthy`.
+  state?: 'healthy' | 'draining' | 'down';
+  adminDraining?: boolean;
   packets: number;
   bytes: number;
 };

@@ -10,9 +10,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"text/tabwriter"
 
 	"github.com/zyvorai/rivora/internal/apiclient"
+	"github.com/zyvorai/rivora/internal/config"
 )
 
 var version = "dev"
@@ -20,12 +22,22 @@ var version = "dev"
 const usage = `rivoractl: status | vips | backends [--format json] [--api HOST:PORT|URL]
   status              Overview: VIP, mode, healthy/total backends, packet counters
   vips                VIP configuration and live counters
-  backends            Per-backend health and packet counters
+  backends            Per-backend state (healthy/draining/down) and packet counters
+  drain ID            Stop sending NEW flows to backend ID; established flows keep flowing
+  undrain ID          Undo an operator drain (does not affect Kubernetes-driven draining)
+  weight ID N         Override backend ID's Maglev weight to N (0 clears the override)
+  validate [FILE]     Check a static-YAML config offline (default /etc/rivora/config.yaml)
   version             Print rivoractl version
 
 Options:
+  --vip KEY           weight: only change this VIP (addr:port:proto, e.g. 10.0.0.1:80:tcp);
+                      default is every VIP that uses the backend
   --api-key KEY       Bearer token (default: $RIVORA_API_KEY)
   --tls-insecure      Accept rivorad's self-signed cert (default: $RIVORA_TLS_INSECURE)
+
+Backend IDs come from 'rivoractl backends'. Drain and weight changes are live
+and are not persisted: they survive Kubernetes reconciles but not a rivorad
+restart.
 `
 
 func main() {
@@ -39,6 +51,7 @@ func main() {
 
 	apiAddr := ""
 	format := ""
+	vipKey := ""
 	apiKey := os.Getenv("RIVORA_API_KEY")
 	tlsInsecure := os.Getenv("RIVORA_TLS_INSECURE") != ""
 	rest := make([]string, 0, len(args))
@@ -59,6 +72,11 @@ func main() {
 			if i < len(args) {
 				apiKey = args[i]
 			}
+		case "--vip":
+			i++
+			if i < len(args) {
+				vipKey = args[i]
+			}
 		case "--tls-insecure":
 			tlsInsecure = true
 		default:
@@ -78,6 +96,14 @@ func main() {
 		err = cmdVIPs(client, format)
 	case "backends":
 		err = cmdBackends(client, format)
+	case "drain":
+		err = cmdDrain(client, rest, true)
+	case "undrain":
+		err = cmdDrain(client, rest, false)
+	case "weight":
+		err = cmdWeight(client, rest, vipKey)
+	case "validate":
+		err = cmdValidate(rest)
 	case "version":
 		fmt.Println("rivoractl", version)
 		return
@@ -140,11 +166,106 @@ func cmdBackends(c *apiclient.Client, format string) error {
 		return printJSON(bs)
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tADDRESS\tPORT\tWEIGHT\tHEALTHY\tPACKETS\tBYTES")
+	fmt.Fprintln(w, "ID\tADDRESS\tPORT\tWEIGHT\tSTATE\tPACKETS\tBYTES")
 	for _, b := range bs {
-		fmt.Fprintf(w, "%d\t%s\t%d\t%d\t%t\t%d\t%d\n", b.ID, b.Address, b.Port, b.Weight, b.Healthy, b.Packets, b.Bytes)
+		state := b.State
+		if state == "" { // older rivorad without the state field
+			state = "down"
+			if b.Healthy {
+				state = "healthy"
+			}
+		}
+		if b.AdminDraining {
+			state += " (operator)"
+		}
+		fmt.Fprintf(w, "%d\t%s\t%d\t%d\t%s\t%d\t%d\n", b.ID, b.Address, b.Port, b.Weight, state, b.Packets, b.Bytes)
 	}
 	return w.Flush()
+}
+
+// parseBackendID parses the positional backend ID argument.
+func parseBackendID(arg string) (uint32, error) {
+	id, err := strconv.ParseUint(arg, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("backend ID must be a non-negative integer (see 'rivoractl backends'), got %q", arg)
+	}
+	return uint32(id), nil
+}
+
+func cmdDrain(c *apiclient.Client, args []string, drain bool) error {
+	verb := "undrain"
+	if drain {
+		verb = "drain"
+	}
+	if len(args) != 1 {
+		return fmt.Errorf("usage: rivoractl %s ID", verb)
+	}
+	id, err := parseBackendID(args[0])
+	if err != nil {
+		return err
+	}
+	if drain {
+		err = c.Drain(id)
+	} else {
+		err = c.Undrain(id)
+	}
+	if err != nil {
+		return err
+	}
+	if drain {
+		fmt.Printf("backend %d draining: no new flows, established flows unaffected\n", id)
+	} else {
+		fmt.Printf("backend %d undrained\n", id)
+	}
+	return nil
+}
+
+func cmdWeight(c *apiclient.Client, args []string, vip string) error {
+	if len(args) != 2 {
+		return fmt.Errorf("usage: rivoractl weight ID N [--vip addr:port:proto]  (N=0 clears the override)")
+	}
+	id, err := parseBackendID(args[0])
+	if err != nil {
+		return err
+	}
+	w, err := strconv.ParseUint(args[1], 10, 32)
+	if err != nil {
+		return fmt.Errorf("weight must be a non-negative integer, got %q", args[1])
+	}
+	n, err := c.SetWeight(id, uint32(w), vip)
+	if err != nil {
+		return err
+	}
+	if w == 0 {
+		fmt.Printf("backend %d weight override cleared on %d VIP(s)\n", id, n)
+	} else {
+		fmt.Printf("backend %d weight set to %d on %d VIP(s)\n", id, w, n)
+	}
+	return nil
+}
+
+// cmdValidate checks a static-YAML config without contacting rivorad, using the
+// same loader rivorad itself starts with — so "validate passes" means rivorad
+// will accept the file (modulo host state like the interface existing).
+func cmdValidate(args []string) error {
+	path := "/etc/rivora/config.yaml"
+	switch len(args) {
+	case 0:
+	case 1:
+		path = args[0]
+	default:
+		return fmt.Errorf("usage: rivoractl validate [FILE]")
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	backends := 0
+	for _, v := range cfg.VIPs {
+		backends += len(v.Backends)
+	}
+	fmt.Printf("%s: ok (%d VIP(s), %d backend(s))\n", path, len(cfg.VIPs), backends)
+	return nil
 }
 
 func printJSON(v any) error {

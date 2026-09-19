@@ -14,7 +14,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -30,6 +29,7 @@ import (
 
 	"github.com/zyvorai/rivora/internal/ipamctrl"
 	"github.com/zyvorai/rivora/internal/k8s"
+	"github.com/zyvorai/rivora/internal/logging"
 )
 
 var version = "dev"
@@ -43,6 +43,8 @@ func main() {
 		gatewayAPI    = flag.Bool("gateway-api", false, "also watch GatewayClass/Gateway and assign addresses to managed Gateways; requires the Gateway API CRDs to be installed")
 		metricsListen = flag.String("metrics-listen", ":9871", "address the /metrics, /healthz, /readyz endpoints listen on")
 		showVer       = flag.Bool("version", false, "print version and exit")
+		logLevel      = flag.String("log-level", "info", "log level: debug, info, warn or error")
+		logFormat     = flag.String("log-format", "text", "log format: text or json")
 	)
 	flag.Parse()
 
@@ -51,7 +53,11 @@ func main() {
 		return
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	logger, err := logging.New(os.Stdout, *logLevel, *logFormat)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "rivora-controller:", err)
+		os.Exit(2)
+	}
 
 	cfg, err := k8s.BuildConfig(*kubeconfig)
 	if err != nil {
