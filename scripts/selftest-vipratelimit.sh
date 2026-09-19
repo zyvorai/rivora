@@ -77,8 +77,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Deleting a namespace tears its veths down asynchronously, so a run started right after
+# another can find the previous run's halves still there ("File exists"). Clear any and
+# wait until they are gone.
 for role in lb client be; do
+    ip link del "vveth-${role}-br" 2>/dev/null || true
     ip link del "vveth-${role}" 2>/dev/null || true
+done
+for _ in $(seq 1 50); do
+    ip -o link 2>/dev/null | grep -qE ' vveth-(lb|client|be)(-br)?[:@]' || break
+    sleep 0.1
 done
 
 ip link add "$BR" type bridge
@@ -115,8 +123,12 @@ s.bind((sys.argv[1], int(sys.argv[2])))
 s.listen(64)
 while True:
     conn, _ = s.accept()
-    conn.sendall(b"OK\n")
-    conn.close()
+    try:
+        conn.sendall(b"OK\n")
+    except OSError:
+        pass  # a probe or a gate check that hung up early must not kill the backend
+    finally:
+        conn.close()
 PYEOF
 }
 
