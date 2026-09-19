@@ -331,6 +331,6 @@ jobs:
     - name: BGP selftest (multihop + TCP MD5 across a router, communities)
       if: ${{ !cancelled() }}
       run: sudo env "PATH=$PATH" "GOCACHE=$(go env GOCACHE)" "GOMODCACHE=$(go env GOMODCACHE)" bash scripts/selftest-bgp.sh
-    - name: NAT checksum selftest (offload off: TCP/UDP, IPv4/IPv6 checksums verified end to end)
+    - name: NAT checksum selftest (TCP/UDP over IPv4 and IPv6, checksum offload off)
       if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-checksum.sh
