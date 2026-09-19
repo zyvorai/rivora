@@ -10,6 +10,8 @@ import (
 	"net"
 	"os"
 	"reflect"
+	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -46,6 +48,151 @@ type VIP struct {
 	Protocol Protocol  `yaml:"protocol"`
 	Mode     Mode      `yaml:"mode"`
 	Backends []Backend `yaml:"backends"`
+	// SessionAffinity says whether one client sticks to one backend. Unset (or
+	// "none") spreads a client's connections across backends; "clientIP" sends
+	// every connection from a source address to the same backend, for as long as
+	// the backend set is unchanged. It maps Kubernetes' Service.spec.sessionAffinity.
+	SessionAffinity SessionAffinity `yaml:"sessionAffinity,omitempty"`
+	// HealthCheck says how this VIP's backends are probed. Unset means the
+	// default: a TCP connect to the backend's service port, exactly as before.
+	HealthCheck ProbeSpec `yaml:"healthCheck,omitempty"`
+}
+
+// SessionAffinity is how a VIP chooses a backend for a new connection.
+type SessionAffinity string
+
+const (
+	// AffinityNone hashes the whole 5-tuple: a client's connections spread out.
+	AffinityNone SessionAffinity = "none"
+	// AffinityClientIP hashes the source address only, so a client's connections all
+	// go to the same backend. Unlike Kubernetes' ClientIP affinity there is no
+	// timeout: it holds while the backend set is stable, and when that changes
+	// Maglev moves only a small share of clients.
+	AffinityClientIP SessionAffinity = "clientIP"
+)
+
+// Effective treats the empty value as the default, none.
+func (a SessionAffinity) Effective() SessionAffinity {
+	if a == "" {
+		return AffinityNone
+	}
+	return a
+}
+
+// Validate accepts none, clientIP, or empty (the default).
+func (a SessionAffinity) Validate() error {
+	switch a.Effective() {
+	case AffinityNone, AffinityClientIP:
+		return nil
+	}
+	return fmt.Errorf("sessionAffinity %q: must be none or clientIP", string(a))
+}
+
+// ProbeType is what an active health probe does.
+type ProbeType string
+
+const (
+	// ProbeTCP opens a TCP connection and closes it. It proves a port accepts
+	// connections, not that the application behind it works.
+	ProbeTCP ProbeType = "tcp"
+	// ProbeHTTP sends a GET and checks the status code, so a backend whose app is
+	// wedged, erroring or still warming up is taken out of rotation even though
+	// its port is open.
+	ProbeHTTP ProbeType = "http"
+)
+
+// DefaultExpectStatus is what an HTTP probe accepts unless told otherwise: any
+// success or redirect. Redirects are not followed, only counted, so a backend
+// that answers 302 to a login page is not marked down by it.
+const DefaultExpectStatus = "200-399"
+
+// ProbeSpec configures one VIP's active health probe. The zero value is the
+// legacy TCP connect.
+//
+// A backend address is probed once however many VIPs list it, so VIPs that share
+// a backend must agree on its probe; Config.Validate rejects a conflict rather
+// than letting one silently win.
+type ProbeSpec struct {
+	Type ProbeType `yaml:"type,omitempty"` // tcp (default) | http
+	// Port probes this port instead of the backend's service port. Health
+	// endpoints are often on their own port, and a UDP service has no TCP port to
+	// connect to at all. 0 means the service port.
+	Port uint16 `yaml:"port,omitempty"`
+	// The remaining fields apply to type http only.
+	Path         string `yaml:"path,omitempty"`         // default "/"; must start with "/"
+	Host         string `yaml:"host,omitempty"`         // Host header; default is the backend address
+	ExpectStatus string `yaml:"expectStatus,omitempty"` // "200" or "200-299"; default 200-399
+}
+
+// Effective returns the spec with defaults filled in, so callers and the
+// conflict check compare like with like (unset and explicit-default are equal).
+func (p ProbeSpec) Effective() ProbeSpec {
+	if p.Type == "" {
+		p.Type = ProbeTCP
+	}
+	if p.Type == ProbeHTTP {
+		if p.Path == "" {
+			p.Path = "/"
+		}
+		if p.ExpectStatus == "" {
+			p.ExpectStatus = DefaultExpectStatus
+		}
+	}
+	return p
+}
+
+// StatusRange parses ExpectStatus ("200" or "200-299") into inclusive bounds.
+func (p ProbeSpec) StatusRange() (lo, hi int, err error) {
+	e := p.Effective().ExpectStatus
+	parse := func(s string) (int, error) {
+		n, err := strconv.Atoi(strings.TrimSpace(s))
+		if err != nil || n < 100 || n > 599 {
+			return 0, fmt.Errorf("expectStatus %q: %q is not an HTTP status code (100-599)", e, s)
+		}
+		return n, nil
+	}
+	if a, b, isRange := strings.Cut(e, "-"); isRange {
+		if lo, err = parse(a); err != nil {
+			return 0, 0, err
+		}
+		if hi, err = parse(b); err != nil {
+			return 0, 0, err
+		}
+		if lo > hi {
+			return 0, 0, fmt.Errorf("expectStatus %q: range start is after its end", e)
+		}
+		return lo, hi, nil
+	}
+	if lo, err = parse(e); err != nil {
+		return 0, 0, err
+	}
+	return lo, lo, nil
+}
+
+// Validate checks one probe spec in isolation.
+func (p ProbeSpec) Validate() error {
+	switch e := p.Effective(); e.Type {
+	case ProbeTCP:
+		if p.Path != "" || p.Host != "" || p.ExpectStatus != "" {
+			return fmt.Errorf("healthCheck: path, host and expectStatus only apply to type http")
+		}
+	case ProbeHTTP:
+		if !strings.HasPrefix(e.Path, "/") {
+			return fmt.Errorf("healthCheck: path %q must start with /", p.Path)
+		}
+		if strings.ContainsAny(e.Path, " \t\r\n") {
+			return fmt.Errorf("healthCheck: path %q must not contain whitespace", p.Path)
+		}
+		if strings.ContainsAny(e.Host, " /\t\r\n") {
+			return fmt.Errorf("healthCheck: host %q is not a valid Host header value", p.Host)
+		}
+		if _, _, err := p.StatusRange(); err != nil {
+			return fmt.Errorf("healthCheck: %w", err)
+		}
+	default:
+		return fmt.Errorf("healthCheck: type %q must be tcp or http", string(p.Type))
+	}
+	return nil
 }
 
 type HealthCheck struct {
@@ -291,6 +438,12 @@ func (c Config) Validate() error {
 		if len(v.Backends) == 0 {
 			return fmt.Errorf("vip %s:%d: at least one backend is required", v.Address, v.Port)
 		}
+		if err := v.SessionAffinity.Validate(); err != nil {
+			return fmt.Errorf("vip %s:%d: %w", v.Address, v.Port, err)
+		}
+		if err := v.HealthCheck.Validate(); err != nil {
+			return fmt.Errorf("vip %s:%d: %w", v.Address, v.Port, err)
+		}
 		vipIsV4 := vipIP.To4() != nil
 		for _, b := range v.Backends {
 			beIP := net.ParseIP(b.Address)
@@ -312,6 +465,34 @@ func (c Config) Validate() error {
 				if _, err := net.ParseMAC(b.MAC); err != nil {
 					return fmt.Errorf("backend %s: invalid mac %q: %w", b.Address, b.MAC, err)
 				}
+			}
+		}
+	}
+	return c.checkSharedBackendProbes()
+}
+
+// checkSharedBackendProbes rejects two VIPs that list the same backend address
+// and port but ask for different probes. The health checker probes each backend
+// once and its result is shared by every VIP that uses it, so conflicting
+// settings can't both be honoured; failing here beats one silently winning.
+func (c Config) checkSharedBackendProbes() error {
+	type use struct {
+		vip   string
+		probe ProbeSpec
+	}
+	first := map[string]use{}
+	for _, v := range c.VIPs {
+		vipName := fmt.Sprintf("%s:%d/%s", v.Address, v.Port, v.Protocol)
+		probe := v.HealthCheck.Effective()
+		for _, b := range v.Backends {
+			key := fmt.Sprintf("%s:%d", b.Address, b.Port)
+			prev, seen := first[key]
+			if !seen {
+				first[key] = use{vip: vipName, probe: probe}
+				continue
+			}
+			if prev.probe != probe {
+				return fmt.Errorf("backend %s is used by vip %s and vip %s with different healthCheck settings; a backend is probed once, so they must agree", key, prev.vip, vipName)
 			}
 		}
 	}

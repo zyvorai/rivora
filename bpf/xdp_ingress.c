@@ -366,7 +366,9 @@ static __always_inline int handle_ipv4(struct xdp_md *ctx, void *data, void *dat
     }
 
     if (!use_affinity) {
-        __u32 hash = rivora_hash5(iph->saddr, iph->daddr, sport, dport, iph->protocol);
+        __u32 hash = cfg->affinity == RIVORA_AFFINITY_CLIENT_IP
+                         ? rivora_hash_src(iph->saddr)
+                         : rivora_hash5(iph->saddr, iph->daddr, sport, dport, iph->protocol);
         __u32 local_slot = hash % cfg->maglev_size;
         if (pick_backend(cfg->maglev_offset, cfg->maglev_size, local_slot, &backend_id) < 0) {
             bump_stats(RIVORA_STATS_GLOBAL, 0, 1);
@@ -518,7 +520,9 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
     }
 
     if (!use_affinity) {
-        __u32 hash = rivora_hash5_v6((__u8 *)&iph->saddr, (__u8 *)&iph->daddr, sport, dport, iph->nexthdr);
+        __u32 hash = cfg->affinity == RIVORA_AFFINITY_CLIENT_IP
+                         ? rivora_hash_src_v6((__u8 *)&iph->saddr)
+                         : rivora_hash5_v6((__u8 *)&iph->saddr, (__u8 *)&iph->daddr, sport, dport, iph->nexthdr);
         __u32 local_slot = hash % cfg->maglev_size;
         if (pick_backend(cfg->maglev_offset, cfg->maglev_size, local_slot, &backend_id) < 0) {
             bump_stats(RIVORA_STATS_GLOBAL, 0, 1);

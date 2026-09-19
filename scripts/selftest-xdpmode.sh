@@ -209,7 +209,7 @@ section "3. native where the driver can't: must refuse, not run slow"
 write_config xdpdummy native
 lb "try:"
 EXITN=$(cat "${WORK}/exit-${CMDN}" 2>/dev/null)
-[ -n "$EXITN" ] && [ "$EXITN" != 0 ] && pass "rivorad refused to start (exit ${EXITN})" || fail "rivorad started, or exit status unknown ('${EXITN}')"
+[ "$EXITN" = 1 ] && pass "rivorad refused to start (exit ${EXITN})" || fail "rivorad started, or exit status unknown ('${EXITN}')"
 grep -qi 'native XDP' "$LOG" && pass "the error says native XDP is the problem" || fail "error doesn't mention native XDP: $(tail -3 "$LOG")"
 check_eq "nothing was left attached to the device" "$(kmode xdpdummy)" none
 

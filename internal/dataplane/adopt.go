@@ -282,7 +282,7 @@ func (d *Dataplane) adoptOneLocked(r rawVIP) error {
 		extent:     ext,
 		vip: config.VIP{
 			Address: r.addr, Port: r.port, Protocol: r.proto,
-			Mode: modeFromByte(sc.Mode),
+			Mode: modeFromByte(sc.Mode), SessionAffinity: affinityFromByte(sc.Affinity),
 		},
 	}
 	for name, b := range backends {
@@ -345,4 +345,11 @@ func modeFromByte(m uint8) config.Mode {
 		return config.ModeNAT
 	}
 	return config.ModeDSR
+}
+
+func affinityFromByte(b uint8) config.SessionAffinity {
+	if b == bpfmaps.AffinityClientIP {
+		return config.AffinityClientIP
+	}
+	return config.AffinityNone
 }

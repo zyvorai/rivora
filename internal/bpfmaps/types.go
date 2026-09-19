@@ -72,8 +72,17 @@ type ServiceConfig struct {
 	MaglevOffset uint32
 	MaglevSize   uint32 // must be nonzero and match the extent actually written into maglev_table
 	Mode         uint8
-	Pad          [3]uint8
+	Affinity     uint8 // AffinityNone / AffinityClientIP
+	Pad          [2]uint8
 }
+
+// Session affinity: what the Maglev slot is chosen from. Mirrors
+// RIVORA_AFFINITY_* in bpf/rivora_common.h. The zero value is none, so a
+// service_config pinned by an older version keeps its behaviour.
+const (
+	AffinityNone     = 0 // hash the whole 5-tuple: one client's connections spread out
+	AffinityClientIP = 1 // hash the source address only: one client sticks to one backend
+)
 
 // BackendInfo — struct backend_info. 12 bytes.
 type BackendInfo struct {
