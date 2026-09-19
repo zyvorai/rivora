@@ -191,8 +191,9 @@ this is opt-in, same env-var-driven shape as netra's `netrad`:
 
 | Env var                    | Effect                                              |
 | --------------------------- | ---------------------------------------------------- |
-| `RIVORA_API_KEY`            | Admin key: require this bearer token on every request; full access (including `drain`/`weight`). Setting it is what turns authentication on. |
+| `RIVORA_API_KEY`            | Admin key (write `id:NAME=KEY` to name it in the audit log of changes): require this bearer token on every request; full access (including `drain`/`weight`). Setting it is what turns authentication on. |
 | `RIVORA_API_READONLY_KEY`   | Read-only key: may read the API and console, gets `403` on anything that changes state. Needs `RIVORA_API_KEY` too. |
+| `RIVORA_TLS_CLIENT_CA`      | Accept client certificates signed by this CA (mutual TLS); needs TLS on. Names in `RIVORA_API_CERT_ADMIN_CNS` are admins, any other verified certificate is read-only. `RIVORA_TLS_CLIENT_REQUIRED=1` demands one. |
 | `RIVORA_TLS_CERT` / `_KEY`  | Serve HTTPS with this certificate                     |
 | `RIVORA_TLS_SELF_SIGNED`    | Serve HTTPS with an auto-generated self-signed cert (no cert files needed) |
 

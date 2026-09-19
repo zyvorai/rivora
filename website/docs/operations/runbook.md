@@ -105,6 +105,26 @@ skipped with `--tls-insecure`.
 unsafe: a read-only key with no admin key, a key in both roles, or a setting with
 no usable key in it.
 
+**Who did it: named keys and an audit trail.** Write a key as `id:NAME=KEY`
+(`RIVORA_API_KEY=id:alice=...,id:bob=...`; NAME is letters, digits, `.`, `_` or `-`, up to 64) and
+every state-changing request (drain, undrain, weight) is logged as
+`api change user=alice role=admin method=POST path=... status=200 remote=...` and counted in
+`rivora_api_changes_total{user,code}`, whether it succeeded or not. A change refused because the caller's
+key or certificate is read-only is always logged, naming them (`reason=forbidden user=viewer`), and is
+never throttled. A key without `id:` is named by its position (`key-1`), and the audit line never contains
+a key. Reusing a name is refused at start-up.
+
+**Client certificates (mutual TLS).** Set `RIVORA_TLS_CLIENT_CA` to a PEM CA bundle (TLS must be on,
+via `RIVORA_TLS_CERT`/`RIVORA_TLS_KEY` or `RIVORA_TLS_SELF_SIGNED`) and a client certificate signed by
+it authenticates its holder with no key: the common name is the identity (`cert:ops` in the audit trail),
+common names listed in `RIVORA_API_CERT_ADMIN_CNS` (comma-separated) get the admin role, and any other
+verified certificate is read-only. By default a certificate is optional, so bearer keys keep working
+beside it; add `RIVORA_TLS_CLIENT_REQUIRED=1` to turn away every caller without one at the TLS
+handshake. With certificates on, authentication is on even if no key is set. Give `rivoractl` its own:
+`rivoractl --cert ops.pem --key ops.key --ca-file server.pem drain 3` (or `RIVORA_CLIENT_CERT`/
+`RIVORA_CLIENT_KEY`). A certificate is verified against the CA only; **revocation is not checked**, so keep
+them short-lived or rotate the CA. Per-user roles finer than admin/read-only are not implemented.
+
 ## Draining a backend or shifting weight (live)
 
 Use these for maintenance and canary shifts without editing config or

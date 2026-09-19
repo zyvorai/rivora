@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -47,8 +48,15 @@ type Server struct {
 	readOnlyKey  string
 	registry     *prometheus.Registry
 	authFailures *prometheus.CounterVec // nil when the Server was built without a registry
+	changes      *prometheus.CounterVec // audited changes by user and status code
 	logger       *slog.Logger
 	failLog      *throttle
+
+	// mtls is set when client certificates are accepted: a request over TLS whose certificate chains to the
+	// configured CA is authenticated by it, with no key. certAdmins names the certificate common names that
+	// get the admin role; any other verified certificate is read-only.
+	mtls       bool
+	certAdmins map[string]bool
 }
 
 // New creates a Server. apiKey may be empty, in which case the API is
@@ -62,13 +70,18 @@ func New(dp *dataplane.Dataplane, apiKey string) *Server {
 	// Create both series up front so they read 0 rather than being absent.
 	failures.WithLabelValues(failUnauthenticated)
 	failures.WithLabelValues(failForbidden)
+	changes := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "rivora_api_changes_total",
+		Help: "API requests that change state (drain, undrain, weight), by the key name or certificate that made them and the HTTP status returned. Each is also logged as an audit line.",
+	}, []string{"user", "code"})
 	reg.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		metrics.NewDataplaneCollector(dp),
 		failures,
+		changes,
 	)
-	return &Server{dp: dp, admin: dp, apiKey: apiKey, registry: reg, authFailures: failures}
+	return &Server{dp: dp, admin: dp, apiKey: apiKey, registry: reg, authFailures: failures, changes: changes}
 }
 
 // RegisterBGP adds the rivora_bgp_* series to /metrics. Call it once, before the
@@ -143,35 +156,110 @@ func (s *Server) Handler() http.Handler {
 	return s.auth(mux)
 }
 
+// Roles a caller can hold.
+const (
+	roleAdmin    = "admin"
+	roleReadOnly = "readonly"
+)
+
+// identity is who a request was authenticated as: a key's name, or "cert:" and a certificate's common name.
+type identity struct {
+	user, role string
+}
+
+// SetClientCerts turns on client-certificate authentication (the listener must be configured with a client
+// CA to verify against; see cmd/rivorad). adminCNs are the certificate common names that get the admin role;
+// every other verified certificate may read but not change anything. Call before serving.
+func (s *Server) SetClientCerts(adminCNs []string) {
+	s.mtls = true
+	s.certAdmins = make(map[string]bool, len(adminCNs))
+	for _, cn := range adminCNs {
+		if cn = strings.TrimSpace(cn); cn != "" {
+			s.certAdmins[cn] = true
+		}
+	}
+}
+
+// identify authenticates r: a verified client certificate first, else a bearer key.
+func (s *Server) identify(r *http.Request, admin, readOnly []credential) (identity, bool) {
+	if s.mtls && r.TLS != nil && len(r.TLS.VerifiedChains) > 0 && len(r.TLS.PeerCertificates) > 0 {
+		cn := r.TLS.PeerCertificates[0].Subject.CommonName
+		role := roleReadOnly
+		if s.certAdmins[cn] {
+			role = roleAdmin
+		}
+		return identity{user: "cert:" + cn, role: role}, true
+	}
+	token, ok := bearerToken(r.Header.Get("Authorization"))
+	if !ok {
+		return identity{}, false
+	}
+	if name, hit := matchCred(token, admin); hit {
+		return identity{user: name, role: roleAdmin}, true
+	}
+	if name, hit := matchCred(token, readOnly); hit {
+		return identity{user: name, role: roleReadOnly}, true
+	}
+	return identity{}, false
+}
+
+// statusRecorder remembers the status code a handler wrote, for the audit line.
+type statusRecorder struct {
+	http.ResponseWriter
+	code int
+}
+
+func (w *statusRecorder) WriteHeader(code int) {
+	w.code = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
 func (s *Server) auth(next http.Handler) http.Handler {
-	admin := parseKeys(s.apiKey)
-	if len(admin) == 0 {
+	admin, _ := parseCredentials(s.apiKey)
+	readOnly, _ := parseCredentials(s.readOnlyKey)
+	if len(admin) == 0 && !s.mtls {
 		return next
 	}
-	readOnly := parseKeys(s.readOnlyKey)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/api/") {
 			next.ServeHTTP(w, r)
 			return
 		}
-		token, ok := bearerToken(r.Header.Get("Authorization"))
-		switch {
-		case ok && matchAny(token, admin):
-			next.ServeHTTP(w, r)
-		case ok && matchAny(token, readOnly):
-			// A valid read-only key: fine for anything that can't change state.
-			if safeMethod(r.Method) {
-				next.ServeHTTP(w, r)
-				return
-			}
-			s.recordAuthFailure(r, failForbidden)
-			writeError(w, http.StatusForbidden, errReadOnly)
-		default:
-			s.recordAuthFailure(r, failUnauthenticated)
+		id, ok := s.identify(r, admin, readOnly)
+		if !ok {
+			s.recordAuthFailure(r, failUnauthenticated, "")
 			w.Header().Set("WWW-Authenticate", `Bearer realm="rivorad"`)
 			writeError(w, http.StatusUnauthorized, errUnauthorized)
+			return
 		}
+		if safeMethod(r.Method) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if id.role != roleAdmin {
+			s.recordAuthFailure(r, failForbidden, id.user)
+			writeError(w, http.StatusForbidden, errReadOnly)
+			return
+		}
+		// A change: run it, then record who made it and how it went.
+		rec := &statusRecorder{ResponseWriter: w, code: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		s.audit(r, id, rec.code)
 	})
+}
+
+// audit logs and counts one state-changing request by an authenticated caller.
+func (s *Server) audit(r *http.Request, id identity, code int) {
+	if s.changes != nil {
+		s.changes.WithLabelValues(id.user, strconv.Itoa(code)).Inc()
+	}
+	if s.logger != nil {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		s.logger.Info("api change", "user", id.user, "role", id.role, "method", r.Method, "path", r.URL.Path, "status", code, "remote", host)
+	}
 }
 
 // validBearer reports whether header carries any valid credential, admin or
@@ -181,7 +269,11 @@ func (s *Server) validBearer(header string) bool {
 	if !ok {
 		return false
 	}
-	return matchAny(token, parseKeys(s.apiKey)) || matchAny(token, parseKeys(s.readOnlyKey))
+	admin, _ := parseCredentials(s.apiKey)
+	readOnly, _ := parseCredentials(s.readOnlyKey)
+	_, a := matchCred(token, admin)
+	_, r := matchCred(token, readOnly)
+	return a || r
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {

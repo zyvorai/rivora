@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -455,6 +456,38 @@ func main() {
 	apiServer := api.New(plane, apiKey)
 	apiServer.SetReadOnlyKeys(readOnlyKey)
 	apiServer.SetLogger(logger)
+
+	// Client certificates (mutual TLS) as an alternative to bearer keys: a certificate signed by
+	// RIVORA_TLS_CLIENT_CA authenticates its holder, by common name. Listed common names are admins; any
+	// other verified certificate is read-only.
+	var clientTLS *tls.Config
+	if clientCAPath := os.Getenv("RIVORA_TLS_CLIENT_CA"); clientCAPath != "" {
+		if tlsCert == "" && !selfSigned {
+			logger.Error("RIVORA_TLS_CLIENT_CA needs TLS: set RIVORA_TLS_CERT and RIVORA_TLS_KEY (or RIVORA_TLS_SELF_SIGNED)")
+			os.Exit(1)
+		}
+		pemBytes, rerr := os.ReadFile(clientCAPath)
+		if rerr != nil {
+			logger.Error("read RIVORA_TLS_CLIENT_CA", "err", rerr)
+			os.Exit(1)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pemBytes) {
+			logger.Error("RIVORA_TLS_CLIENT_CA holds no PEM certificate", "path", clientCAPath)
+			os.Exit(1)
+		}
+		clientAuth := tls.VerifyClientCertIfGiven
+		if os.Getenv("RIVORA_TLS_CLIENT_REQUIRED") != "" {
+			clientAuth = tls.RequireAndVerifyClientCert
+		}
+		clientTLS = &tls.Config{ClientCAs: pool, ClientAuth: clientAuth, MinVersion: tls.VersionTLS12}
+		var admins []string
+		if v := os.Getenv("RIVORA_API_CERT_ADMIN_CNS"); v != "" {
+			admins = strings.Split(v, ",")
+		}
+		apiServer.SetClientCerts(admins)
+		logger.Info("client certificates accepted", "required", clientAuth == tls.RequireAndVerifyClientCert, "admin_cns", len(admins))
+	}
 	if bgpSpeaker != nil {
 		apiServer.RegisterBGP(bgpSpeaker)
 	}
@@ -481,7 +514,7 @@ func main() {
 		tlsMode = "self-signed"
 	}
 	authMode := "off"
-	if apiKey != "" {
+	if apiKey != "" || clientTLS != nil {
 		authMode = "on"
 	}
 	logger.Info("api listening", "addr", cfg.APIListen, "tls", tlsMode, "auth", authMode,
@@ -492,6 +525,7 @@ func main() {
 		var err error
 		switch tlsMode {
 		case "file":
+			srv.TLSConfig = clientTLS // nil unless client certificates are on; the key pair is loaded from the files
 			err = srv.ListenAndServeTLS(tlsCert, tlsKey)
 		case "self-signed":
 			cert, cerr := tlsutil.GenerateSelfSigned()
@@ -500,6 +534,9 @@ func main() {
 				os.Exit(1)
 			}
 			srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+			if clientTLS != nil {
+				srv.TLSConfig.ClientCAs, srv.TLSConfig.ClientAuth, srv.TLSConfig.MinVersion = clientTLS.ClientCAs, clientTLS.ClientAuth, clientTLS.MinVersion
+			}
 			err = srv.ListenAndServeTLS("", "")
 		default:
 			err = srv.ListenAndServe()
