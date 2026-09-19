@@ -317,3 +317,6 @@ jobs:
     - name: Port range selftest (TCP/UDP, NAT/DSR, IPv4 + IPv6, reload, adoption)
       if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-portrange.sh
+    - name: NAT checksum selftest (offload off: TCP/UDP, IPv4/IPv6 checksums verified end to end)
+      if: ${{ !cancelled() }}
+      run: sudo bash scripts/selftest-checksum.sh
