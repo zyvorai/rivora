@@ -184,6 +184,12 @@ bgp:
   #     asn: 65000
   #     bfd: true
   peers: []
+  # configSecret names an existing Secret whose bgp.yaml key holds a `bgp:` section in the static
+  # config's schema. Use it for what the fields above cannot say: per-peer password (TCP MD5),
+  # multihop, gracefulRestart and nodes, plus communities, localPref and aggregates. When set it
+  # REPLACES asn, routerId, ipv6NextHop and peers above. Keeping passwords in a Secret keeps them
+  # off the command line and out of `helm get values`. See website/docs/operations/bgp.md.
+  configSecret: ""
 
 # addressPools seeds AddressPool custom resources on install, e.g.:
 #   --set addressPools[0].name=default \

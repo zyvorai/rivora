@@ -26,6 +26,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"os"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,7 +70,7 @@ type Speaker struct {
 	logger *slog.Logger
 
 	mu         sync.Mutex
-	advertised map[netip.Addr]uuid.UUID // VIP address -> the gobgp path UUID currently advertised for it
+	advertised map[netip.Prefix]advertisedRoute // prefix -> the route currently advertised for it
 
 	// Counters for Snapshot, under their own lock so a scrape never waits on a
 	// resync pass (which holds mu across gobgp calls).
@@ -115,18 +118,10 @@ func newSpeaker(cfg config.BGP, source vipSource, logger *slog.Logger, listenPor
 	}
 
 	for _, p := range cfg.Peers {
-		peer := &api.Peer{
-			Conf: &api.PeerConf{
-				NeighborAddress: p.Address,
-				PeerAsn:         p.ASN,
-				LocalAsn:        cfg.ASN,
-			},
-			// Negotiate both unicast families so IPv4 /32 and IPv6 /128
-			// VIP host routes can be advertised on the same session.
-			AfiSafis: dualStackAfiSafis(),
-		}
-		if p.BFD {
-			peer.Bfd = &api.BfdPeerConfig{Enabled: true}
+		peer, err := peerConfig(cfg, p)
+		if err != nil {
+			s.Stop()
+			return nil, fmt.Errorf("bgp peer %s: %w", p.Address, err)
 		}
 		if port, ok := peerRemotePort[p.Address]; ok {
 			peer.Transport = &api.Transport{RemotePort: port}
@@ -142,10 +137,77 @@ func newSpeaker(cfg config.BGP, source vipSource, logger *slog.Logger, listenPor
 		server:       s,
 		source:       source,
 		logger:       logger,
-		advertised:   map[netip.Addr]uuid.UUID{},
+		advertised:   map[netip.Prefix]advertisedRoute{},
 		stateChanges: map[string]uint64{},
 		resyncNow:    make(chan struct{}, 1),
 	}, nil
+}
+
+// advertisedRoute is what is currently in gobgp for one prefix: its path UUID and a signature of
+// the attributes it was advertised with, so a change of communities re-advertises it.
+type advertisedRoute struct {
+	id  uuid.UUID
+	sig string
+}
+
+// route is one desired advertisement.
+type route struct {
+	communities []uint32
+}
+
+func (r route) sig() string {
+	parts := make([]string, len(r.communities))
+	for i, c := range r.communities {
+		parts[i] = fmt.Sprintf("%d", c)
+	}
+	return strings.Join(parts, ",")
+}
+
+// peerConfig builds the gobgp peer for p. It is separate from newSpeaker so the mapping from
+// rivora's peer options to gobgp's can be tested without a session.
+func peerConfig(local config.BGP, p config.BGPPeer) (*api.Peer, error) {
+	password := p.Password
+	if p.PasswordFile != "" {
+		raw, err := os.ReadFile(p.PasswordFile)
+		if err != nil {
+			return nil, fmt.Errorf("read passwordFile: %w", err)
+		}
+		password = strings.TrimRight(string(raw), "\r\n")
+		if password == "" {
+			return nil, fmt.Errorf("passwordFile %s is empty", p.PasswordFile)
+		}
+		if len(password) > 80 {
+			return nil, fmt.Errorf("the password in %s is longer than the 80 bytes TCP MD5 allows", p.PasswordFile)
+		}
+	}
+	peer := &api.Peer{
+		Conf: &api.PeerConf{
+			NeighborAddress: p.Address,
+			PeerAsn:         p.ASN,
+			LocalAsn:        local.ASN,
+			AuthPassword:    password,
+		},
+		// Negotiate both unicast families so IPv4 /32 and IPv6 /128
+		// VIP host routes can be advertised on the same session.
+		AfiSafis: dualStackAfiSafis(),
+	}
+	if p.BFD {
+		peer.Bfd = &api.BfdPeerConfig{Enabled: true}
+	}
+	if p.Multihop != 0 {
+		peer.EbgpMultihop = &api.EbgpMultihop{Enabled: true, MultihopTtl: p.Multihop}
+	}
+	if g := p.GracefulRestart; g != nil && g.Enabled {
+		rt := g.RestartTime
+		if rt == 0 {
+			rt = 120
+		}
+		peer.GracefulRestart = &api.GracefulRestart{Enabled: true, RestartTime: rt, NotificationEnabled: true}
+		for _, af := range peer.AfiSafis {
+			af.MpGracefulRestart = &api.MpGracefulRestart{Config: &api.MpGracefulRestartConfig{Enabled: true}}
+		}
+	}
+	return peer, nil
 }
 
 func dualStackAfiSafis() []*api.AfiSafi {
@@ -197,62 +259,144 @@ func (sp *Speaker) Run(ctx context.Context) error {
 	}
 }
 
-// resync diffs the currently-healthy VIP set against what's advertised
-// and advertises/withdraws the difference.
+// resync diffs the routes that should be advertised against what is, and advertises, re-advertises
+// (when a route's attributes changed) or withdraws the difference.
 func (sp *Speaker) resync() {
 	statuses, err := sp.source.Statuses()
 	if err != nil {
 		sp.logger.Error("list vip statuses for bgp resync", "err", err)
 		return
 	}
-	desired := map[netip.Addr]bool{}
-	for _, addr := range healthyVIPAddresses(statuses) {
-		desired[addr] = true
+	desired, err := sp.desiredRoutes(statuses)
+	if err != nil {
+		sp.logger.Error("compute bgp routes", "err", err)
+		return
 	}
 
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
 
-	for addr := range desired {
-		if _, ok := sp.advertised[addr]; ok {
+	// Withdraw first: a route whose attributes changed is withdrawn and re-added below, and one
+	// whose covering aggregate just appeared is withdrawn before the aggregate goes out.
+	for prefix, cur := range sp.advertised {
+		want, keep := desired[prefix]
+		if keep && want.sig() == cur.sig {
 			continue
 		}
-		id, err := sp.advertise(addr)
-		if err != nil {
-			sp.logger.Error("advertise bgp route", "vip", addr, "err", err)
-			sp.countAdvertiseError()
-			continue
-		}
-		sp.advertised[addr] = id
-		sp.logger.Info("advertised bgp route", "vip", addr)
-	}
-
-	for addr, id := range sp.advertised {
-		if desired[addr] {
-			continue
-		}
-		if err := sp.withdraw(id); err != nil {
-			sp.logger.Error("withdraw bgp route", "vip", addr, "err", err)
+		if err := sp.withdraw(cur.id); err != nil {
+			sp.logger.Error("withdraw bgp route", "prefix", prefix, "err", err)
 			sp.countWithdrawError()
 			continue
 		}
-		delete(sp.advertised, addr)
-		sp.logger.Info("withdrew bgp route", "vip", addr)
+		delete(sp.advertised, prefix)
+		if !keep {
+			sp.logger.Info("withdrew bgp route", "prefix", prefix)
+		}
+	}
+
+	prefixes := make([]netip.Prefix, 0, len(desired))
+	for p := range desired {
+		prefixes = append(prefixes, p)
+	}
+	sort.Slice(prefixes, func(i, j int) bool { return prefixes[i].String() < prefixes[j].String() })
+	for _, prefix := range prefixes {
+		if _, ok := sp.advertised[prefix]; ok {
+			continue
+		}
+		r := desired[prefix]
+		id, err := sp.advertise(prefix, r)
+		if err != nil {
+			sp.logger.Error("advertise bgp route", "prefix", prefix, "err", err)
+			sp.countAdvertiseError()
+			continue
+		}
+		sp.advertised[prefix] = advertisedRoute{id: id, sig: r.sig()}
+		sp.logger.Info("advertised bgp route", "prefix", prefix, "communities", len(r.communities))
 	}
 }
 
-func (sp *Speaker) advertise(addr netip.Addr) (uuid.UUID, error) {
-	bits := 32
+// desiredRoutes is every route that should be advertised right now: a host route per VIP with a
+// healthy backend (unless a covering aggregate suppresses it), and each aggregate that has at
+// least one healthy VIP under it. Communities are the global ones plus the VIP's (or aggregate's).
+func (sp *Speaker) desiredRoutes(statuses []dataplane.Status) (map[netip.Prefix]route, error) {
+	global, err := config.ParseCommunities(sp.cfg.Communities)
+	if err != nil {
+		return nil, err
+	}
+	vipComms := map[netip.Addr][]string{}
+	for _, st := range statuses {
+		if !anyHealthy(st.Backends) {
+			continue
+		}
+		if addr, err := netip.ParseAddr(st.VIPAddress); err == nil {
+			vipComms[addr] = append(vipComms[addr], st.BGPCommunities...)
+		}
+	}
+
+	desired := map[netip.Prefix]route{}
+	suppressed := map[netip.Addr]bool{}
+	for _, a := range sp.cfg.Aggregates {
+		prefix, err := netip.ParsePrefix(a.Prefix)
+		if err != nil {
+			return nil, err
+		}
+		prefix = prefix.Masked()
+		covered := false
+		for addr := range vipComms {
+			if prefix.Contains(addr) {
+				covered = true
+				if a.SuppressSpecifics {
+					suppressed[addr] = true
+				}
+			}
+		}
+		if !covered {
+			continue
+		}
+		specific, err := config.ParseCommunities(a.Communities)
+		if err != nil {
+			return nil, err
+		}
+		desired[prefix] = route{communities: mergeCommunities(global, specific)}
+	}
+	for addr, names := range vipComms {
+		if suppressed[addr] {
+			continue
+		}
+		specific, err := config.ParseCommunities(names)
+		if err != nil {
+			return nil, err
+		}
+		desired[netip.PrefixFrom(addr, addr.BitLen())] = route{communities: mergeCommunities(global, specific)}
+	}
+	return desired, nil
+}
+
+// mergeCommunities concatenates lists, dropping repeats, keeping first-seen order.
+func mergeCommunities(lists ...[]uint32) []uint32 {
+	var out []uint32
+	seen := map[uint32]bool{}
+	for _, l := range lists {
+		for _, c := range l {
+			if !seen[c] {
+				seen[c] = true
+				out = append(out, c)
+			}
+		}
+	}
+	return out
+}
+
+func (sp *Speaker) advertise(prefix netip.Prefix, r route) (uuid.UUID, error) {
 	family := bgp.RF_IPv4_UC
-	if addr.Is6() {
-		bits = 128
+	if prefix.Addr().Is6() {
 		family = bgp.RF_IPv6_UC
 	}
-	nlri, err := bgp.NewIPAddrPrefix(netip.PrefixFrom(addr, bits))
+	nlri, err := bgp.NewIPAddrPrefix(prefix)
 	if err != nil {
 		return uuid.UUID{}, err
 	}
-	nextHop, err := sp.nextHop(addr)
+	nextHop, err := sp.nextHop(prefix.Addr())
 	if err != nil {
 		return uuid.UUID{}, err
 	}
@@ -264,6 +408,12 @@ func (sp *Speaker) advertise(addr netip.Addr) (uuid.UUID, error) {
 		bgp.NewPathAttributeOrigin(0), // IGP — locally-originated route
 		nh,
 		bgp.NewPathAttributeAsPath(nil),
+	}
+	if len(r.communities) > 0 {
+		attrs = append(attrs, bgp.NewPathAttributeCommunities(r.communities))
+	}
+	if sp.cfg.LocalPref != nil {
+		attrs = append(attrs, bgp.NewPathAttributeLocalPref(*sp.cfg.LocalPref))
 	}
 	resp, err := sp.server.AddPath(apiutil.AddPathRequest{
 		Paths: []*apiutil.Path{{Family: family, Nlri: nlri, Attrs: attrs}},

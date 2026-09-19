@@ -286,3 +286,26 @@ func TestPolicyEventRequeuesTargetService(t *testing.T) {
 		t.Fatalf("policy creation queued %q (shutdown=%v), want ns/svc", key, shutdown)
 	}
 }
+
+func TestPolicyBGPCommunitiesReachTheVIP(t *testing.T) {
+	p := &v1alpha1.ServicePolicy{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "p"}}
+	p.Spec.TargetRef.Name = "svc"
+	p.Spec.BGP = &v1alpha1.BGPPolicy{Communities: []string{"65000:42", "no-export"}}
+	sp, err := compilePolicy(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := lbService(corev1.ServicePort{Name: "http", Port: 80})
+	sl := slice("http", 8080, onNode("10.1.0.1", "node-a", true, true))
+	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{sl}, buildOptions{Policy: sp})
+	if err != nil || len(got) != 1 {
+		t.Fatalf("got %v, %v", got, err)
+	}
+	if c := got[0].VIP.BGPCommunities; len(c) != 2 || c[0] != "65000:42" || c[1] != "no-export" {
+		t.Errorf("VIP communities = %v, want [65000:42 no-export]", c)
+	}
+	p.Spec.BGP.Communities = []string{"65000:notanumber"}
+	if _, err := compilePolicy(p); err == nil || !strings.Contains(err.Error(), "bgp.communities") {
+		t.Errorf("a bad community must reject the whole policy, got %v", err)
+	}
+}

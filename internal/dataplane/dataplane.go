@@ -82,8 +82,10 @@ type Status struct {
 	Interface  string          `json:"interface"`
 	StartedAt  time.Time       `json:"startedAt"`
 	Backends   []BackendStatus `json:"backends"`
-	Packets    uint64          `json:"packets"`
-	Bytes      uint64          `json:"bytes"`
+	// BGPCommunities are the VIP's own bgpCommunities, read by the BGP speaker.
+	BGPCommunities []string `json:"bgpCommunities,omitempty"`
+	Packets        uint64   `json:"packets"`
+	Bytes          uint64   `json:"bytes"`
 	// Dropped is node-wide (stats_map's global slot), the sum of every VIP's
 	// drops, not this VIP's own count — the fields below are this VIP's own.
 	Dropped uint64 `json:"dropped"`
@@ -1013,14 +1015,15 @@ func (d *Dataplane) Statuses() ([]Status, error) {
 	for _, entry := range d.services {
 		vip := entry.vip
 		st := Status{
-			VIPAddress: vip.Address,
-			VIPPort:    vip.Port,
-			VIPPortEnd: vip.PortEnd,
-			Protocol:   string(vip.Protocol),
-			Mode:       string(vip.Mode),
-			Interface:  d.cfg.Interface,
-			StartedAt:  d.startedAt,
-			Dropped:    globalDropped,
+			VIPAddress:     vip.Address,
+			VIPPort:        vip.Port,
+			VIPPortEnd:     vip.PortEnd,
+			BGPCommunities: vip.BGPCommunities,
+			Protocol:       string(vip.Protocol),
+			Mode:           string(vip.Mode),
+			Interface:      d.cfg.Interface,
+			StartedAt:      d.startedAt,
+			Dropped:        globalDropped,
 		}
 		if dropMap != nil {
 			if ds, err := sumDropStats(dropMap, entry.serviceID); err == nil {

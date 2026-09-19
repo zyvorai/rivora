@@ -80,6 +80,7 @@ func main() {
 		bgpASN         = flag.Uint("bgp-asn", 0, "this node's BGP AS number when -bgp is set; only used with -kubernetes")
 		bgpRouterID    = flag.String("bgp-router-id", "", "this node's BGP router-id (an IPv4 address, need not be routable) when -bgp is set; only used with -kubernetes")
 		bgpIPv6NextHop = flag.String("bgp-ipv6-next-hop", "", "IPv6 next-hop for advertised IPv6 VIP /128 routes when -bgp is set; required to advertise IPv6 VIPs; only used with -kubernetes")
+		bgpConfigFile  = flag.String("bgp-config", "", "path to a YAML file with a bgp: section (the same schema as the static config's), for BGP options -bgp-peers cannot express: peer passwords, multihop, graceful restart, communities, local-pref, aggregates, per-node peers; replaces -bgp, -bgp-asn, -bgp-router-id, -bgp-ipv6-next-hop and -bgp-peers; only used with -kubernetes")
 		bgpPeers       = flag.String("bgp-peers", "", "comma-separated BGP peers when -bgp is set, each addr:asn or addr:asn:bfd (e.g. \"10.0.0.1:65000:bfd,10.0.0.2:65001\"); only used with -kubernetes")
 	)
 	flag.Parse()
@@ -167,7 +168,19 @@ func main() {
 			logger.Error("-rate-limit-pps and -rate-limit-burst must both be > 0 with -rate-limit")
 			os.Exit(1)
 		}
-		if *bgpOn {
+		if *bgpConfigFile != "" {
+			if *bgpOn || *bgpASN != 0 || *bgpRouterID != "" || *bgpPeers != "" || *bgpIPv6NextHop != "" {
+				logger.Error("-bgp-config replaces -bgp, -bgp-asn, -bgp-router-id, -bgp-ipv6-next-hop and -bgp-peers; set one or the other")
+				os.Exit(1)
+			}
+			b, berr := config.LoadBGP(*bgpConfigFile)
+			if berr != nil {
+				logger.Error("load -bgp-config", "err", berr)
+				os.Exit(1)
+			}
+			cfg.BGP = b
+			*bgpOn = true // the rest of start-up (speaker, externalTrafficPolicy: Local) keys off this
+		} else if *bgpOn {
 			peers, perr := parseBGPPeers(*bgpPeers)
 			if perr != nil {
 				logger.Error("parse -bgp-peers", "err", perr)
@@ -263,7 +276,17 @@ func main() {
 	var bgpSpeaker *bgp.Speaker
 	if cfg.BGP.Enabled {
 		var err error
-		bgpSpeaker, err = bgp.New(cfg.BGP, plane, logger)
+		node := *nodeName
+		if node == "" {
+			node, _ = os.Hostname()
+		}
+		bgpCfg := cfg.BGP.ForNode(node)
+		if len(bgpCfg.Peers) == 0 {
+			logger.Warn("no configured BGP peer applies to this node, so it will advertise nothing", "node", node)
+		} else if len(bgpCfg.Peers) != len(cfg.BGP.Peers) {
+			logger.Info("some BGP peers are limited to other nodes and are not used here", "node", node, "used", len(bgpCfg.Peers), "configured", len(cfg.BGP.Peers))
+		}
+		bgpSpeaker, err = bgp.New(bgpCfg, plane, logger)
 		if err != nil {
 			logger.Error("start bgp speaker", "err", err)
 			os.Exit(1)

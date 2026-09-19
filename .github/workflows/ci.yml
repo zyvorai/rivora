@@ -30,6 +30,9 @@ jobs:
     # -race covers the product IPv6 follow-ons (IPAM sparse alloc, BGP,
     # speaker VIP selection) plus the rest of the tree in one pass.
     - run: go test -race ./...
+    # The BGP tests that need CAP_NET_ADMIN (TCP MD5) skip themselves unprivileged; run them for real.
+    - name: BGP TCP MD5 tests (privileged)
+      run: sudo env "PATH=$PATH" "GOCACHE=$(go env GOCACHE)" "GOMODCACHE=$(go env GOMODCACHE)" go test -count=1 -run 'TestMD5' -v ./internal/bgp
     - run: gofmt -l . | tee /tmp/fmt.out && [ ! -s /tmp/fmt.out ]
   security:
     runs-on: ubuntu-latest
@@ -264,7 +267,9 @@ jobs:
       # basis, since on a host where it does work the multivip step then runs.
       run: |
         sudo apt-get update -qq
-        sudo apt-get install -y -qq clang llvm libelf-dev
+        # ethtool and tcpdump: the edge-case, checksum and L3 DSR selftests switch offloads off
+        # and read packet captures.
+        sudo apt-get install -y -qq clang llvm libelf-dev ethtool tcpdump
         sudo apt-get install -y -qq bpftool || true
         command -v bpftool || sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" || true
         command -v bpftool || sudo apt-get install -y -qq linux-tools-common linux-tools-generic || true
@@ -323,6 +328,9 @@ jobs:
     - name: L3 DSR selftest (IP-in-IP and GRE, IPv4 + IPv6, routed backend)
       if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-l3dsr.sh
+    - name: BGP selftest (multihop + TCP MD5 across a router, communities)
+      if: ${{ !cancelled() }}
+      run: sudo env "PATH=$PATH" "GOCACHE=$(go env GOCACHE)" "GOMODCACHE=$(go env GOMODCACHE)" bash scripts/selftest-bgp.sh
     - name: NAT checksum selftest (offload off: TCP/UDP, IPv4/IPv6 checksums verified end to end)
       if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-checksum.sh

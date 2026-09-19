@@ -33,6 +33,17 @@ type ServicePolicySpec struct {
 
 	// Weights sets each endpoint's share of new connections.
 	Weights *WeightPolicy `json:"weights,omitempty"`
+
+	// BGP tunes how this Service's VIP is advertised when rivorad runs the BGP speaker.
+	BGP *BGPPolicy `json:"bgp,omitempty"`
+}
+
+// BGPPolicy is the per-Service part of BGP advertisement.
+type BGPPolicy struct {
+	// Communities are added to the route advertised for this Service's VIPs, on top of the
+	// speaker's own: "65000:100" (both halves 0-65535) or no-export, no-advertise,
+	// no-export-subconfed.
+	Communities []string `json:"communities,omitempty"`
 }
 
 // PolicyTargetRef points a policy at a Service.
