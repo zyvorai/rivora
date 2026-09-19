@@ -1,13 +1,25 @@
 name: CI
 on:
+  # Branch pushes run CI too, so work gets checked before a PR exists (stacked
+  # branches especially). Once a PR is open the same commit is checked by both
+  # events; the concurrency group below keeps each event's latest run only.
   push:
-    branches: [main]
+    branches: [main, 'feat/**', 'fix/**']
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
+# One live run per event type and ref: a newer push cancels the superseded run, but a
+# push run never cancels a pull_request run (or the reverse), so a PR's required
+# checks are never the ones that get cancelled. main is never cancelled: every merge
+# should have its own result.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 jobs:
   go:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
     - uses: actions/checkout@v4
     - uses: actions/setup-go@v5
@@ -21,6 +33,7 @@ jobs:
     - run: gofmt -l . | tee /tmp/fmt.out && [ ! -s /tmp/fmt.out ]
   security:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
     - uses: actions/checkout@v4
     - uses: actions/setup-go@v5
@@ -38,6 +51,7 @@ jobs:
         fi
   helm:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
     - uses: actions/checkout@v4
     - uses: azure/setup-helm@v4
@@ -83,6 +97,7 @@ jobs:
       run: make check-chart-sync
   crd:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
     - uses: actions/checkout@v4
     - name: Validate AddressPool CRD + IPv6 sample
@@ -120,6 +135,7 @@ jobs:
   cli:
     needs: [go]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
     - uses: actions/checkout@v4
     - uses: actions/setup-go@v5
@@ -142,7 +158,7 @@ jobs:
         # discoverable after Helm creates it — unlike the shared box this
         # was manually verified against, where the CRD already pre-existed
         # from earlier testing. Retry rather than race it.
-        for i in $(seq 1 10); do
+        for _ in $(seq 1 10); do
           ./bin/rivora status | tee /tmp/status.out
           grep -q 'AddressPool CRD  installed' /tmp/status.out && break
           sleep 2
@@ -159,7 +175,7 @@ jobs:
         # Pods take a few seconds to finish Terminating after `helm
         # uninstall` returns — confirmed manually against a live cluster
         # (an immediate check there also raced this the first time).
-        for i in $(seq 1 15); do
+        for _ in $(seq 1 15); do
           out="$(kubectl get all -n rivora-system 2>&1)" || true
           echo "$out" | grep -q 'No resources found' && break
           sleep 2
@@ -168,8 +184,56 @@ jobs:
         echo "$out" | grep -q 'No resources found'
     - if: always()
       run: kind delete cluster --name rivora-cli-ci
+  # The web console is committed as a built bundle (internal/api/ui), which rivorad
+  # embeds. Nothing else notices if it drifts from web/src, e.g. a source change
+  # whose bundle was never rebuilt, so rebuild it here and fail on any difference.
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with: {node-version: '22', cache: npm, cache-dependency-path: web/package-lock.json}
+    - name: Typecheck and build the console
+      run: cd web && npm ci && npm run build
+    - name: The committed bundle matches its source
+      run: |
+        if ! git diff --exit-code -- internal/api/ui || [ -n "$(git ls-files --others --exclude-standard internal/api/ui)" ]; then
+          echo "::error::internal/api/ui is out of date with web/src: run 'make web' and commit the result"
+          git status --short internal/api/ui
+          exit 1
+        fi
+  # Cheap checks that have each caught a real problem by hand: a script that doesn't
+  # parse, an example config that no longer validates, a broken workflow, and the
+  # hardcoded console login coming back.
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
+      with: {go-version: '1.27.1', cache: true}
+    - name: Every shell script parses
+      run: |
+        for f in $(git ls-files 'scripts/*.sh'); do
+          bash -n "$f" || { echo "::error file=$f::syntax error"; exit 1; }
+        done
+    - name: Every example config validates
+      run: |
+        go build -o /tmp/rivoractl ./cmd/rivoractl
+        for f in config/examples/*.yaml; do /tmp/rivoractl validate "$f"; done
+    - name: No hardcoded console credentials
+      run: |
+        # The [1] keeps this line from matching itself: a plain literal would match the
+        # command that searches for it, in this very file.
+        if grep -rIn 'Admin@32[1]' --exclude-dir=node_modules --exclude-dir=.git .; then
+          echo "::error::the hardcoded console login is back"; exit 1
+        fi
+    - name: Workflows are valid (actionlint)
+      run: docker run --rm -v "$PWD:/repo" --workdir /repo rhysd/actionlint:latest -color
   bpf:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
     - uses: actions/checkout@v4
     # Only clang/llvm/libelf-dev are actually needed to compile the BPF
@@ -184,20 +248,20 @@ jobs:
   integration:
     needs: [go, bpf]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
     - uses: actions/checkout@v4
     - uses: actions/setup-go@v5
       with: {go-version: '1.27.1', cache: true}
     - name: Install build deps
-      # bpftool itself — not just its postinst hook — prints "bpftool not
-      # found for kernel X" and exits nonzero on this runner's kernel even
-      # though it's fully present and functional (confirmed: `command -v
-      # bpftool` resolves it, and it works fine for the actual map
-      # show/dump/update calls the selftest scripts make) — it's warning
-      # about missing supplementary kernel-debug artifacts, not reporting
-      # itself broken. So: `|| true` every install attempt, and don't gate
-      # on `bpftool version`'s exit code either — the selftest scripts'
-      # actual bpftool usage is the real, meaningful check.
+      # bpftool does NOT reliably work on this runner. Its kernel has no matching
+      # linux-tools package, so the Ubuntu wrapper prints "WARNING: bpftool not found
+      # for kernel X ... install linux-tools-X" and does nothing (measured: a
+      # `map lookup`/`map delete` through it silently doesn't happen). Any selftest
+      # that needs to touch a map must therefore NOT depend on it: selftest-multivip
+      # skips its bpftool step here (and says so), and selftest-drops talks to the map
+      # through the bpf() syscall directly. It is still installed on a best-effort
+      # basis, since on a host where it does work the multivip step then runs.
       run: |
         sudo apt-get update -qq
         sudo apt-get install -y -qq clang llvm libelf-dev
@@ -207,27 +271,43 @@ jobs:
         command -v bpftool
         bpftool version || true
     - run: make bpf build
+    # Every selftest step below runs even if an earlier one failed (`!cancelled()`),
+    # so one red step can't hide the rest; the job still fails if any of them did.
     - name: Functional selftest (veth/netns, DSR + full-NAT)
       run: sudo bash scripts/selftest.sh
     - name: Multi-VIP + draining selftest (veth/netns)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-multivip.sh
     - name: Weighted Maglev selftest (veth/netns)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-weighted.sh
     - name: Rate limit selftest (veth/netns)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-ratelimit.sh
     - name: IPv6 dataplane selftest (veth/netns, DSR + full-NAT)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-ipv6.sh
     - name: NDP speaker selftest (veth)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-ndp.sh
     - name: Restart selftest (persisted datapath, veth/netns)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-restart.sh
     - name: Restart reconciliation selftest (stale VIPs, shifted IDs, veth/netns)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-adopt.sh
     - name: Drop-reason counters selftest (rate limit, no backend, unserved, veth/netns)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-drops.sh
     - name: XDP attach mode selftest (generic, native, auto, mode change, veth/netns)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-xdpmode.sh
     - name: HTTP health check selftest (open port + failing app, reload, bad config, veth/netns)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-httpcheck.sh
     - name: API auth selftest (roles, key rotation, failure metric, cert pinning, bad key config)
+      if: ${{ !cancelled() }}
       run: sudo bash scripts/selftest-apiauth.sh
+    - name: Session affinity selftest (clientIP stickiness, reload, restart, failover, veth/netns)
+      if: ${{ !cancelled() }}
+      run: sudo bash scripts/selftest-affinity.sh

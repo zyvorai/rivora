@@ -401,3 +401,44 @@ func TestSharedBackendMustAgreeOnItsProbe(t *testing.T) {
 		t.Errorf("different backends with different probes rejected: %v", err)
 	}
 }
+
+func TestSessionAffinityValidation(t *testing.T) {
+	for _, a := range []SessionAffinity{"", AffinityNone, AffinityClientIP} {
+		if err := a.Validate(); err != nil {
+			t.Errorf("%q rejected: %v", a, err)
+		}
+	}
+	for _, a := range []SessionAffinity{"ClientIP", "clientip", "source", "true", "sticky"} {
+		if err := a.Validate(); err == nil {
+			t.Errorf("%q accepted; the spellings are none and clientIP", a)
+		}
+	}
+	if SessionAffinity("").Effective() != AffinityNone {
+		t.Error("unset must mean none")
+	}
+}
+
+func TestLoadParsesSessionAffinity(t *testing.T) {
+	cfg, err := loadYAML(t, `
+interface: eth0
+vips:
+  - {address: 10.0.0.1, port: 80, protocol: tcp, mode: nat, sessionAffinity: clientIP, backends: [{address: 10.1.0.1, port: 80}]}
+  - {address: 10.0.0.2, port: 80, protocol: tcp, mode: nat, backends: [{address: 10.1.0.2, port: 80}]}
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.VIPs[0].SessionAffinity != AffinityClientIP {
+		t.Errorf("vip 0 sessionAffinity = %q", cfg.VIPs[0].SessionAffinity)
+	}
+	if cfg.VIPs[1].SessionAffinity.Effective() != AffinityNone {
+		t.Errorf("an unset sessionAffinity must be none, got %q", cfg.VIPs[1].SessionAffinity)
+	}
+	if _, err := loadYAML(t, `
+interface: eth0
+vips:
+  - {address: 10.0.0.1, port: 80, protocol: tcp, mode: nat, sessionAffinity: ClientIP, backends: [{address: 10.1.0.1, port: 80}]}
+`); err == nil {
+		t.Error("a mis-cased sessionAffinity loaded; a typo must fail, not silently mean none")
+	}
+}

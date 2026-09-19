@@ -171,3 +171,36 @@ func TestReloadWarnsAboutStartupOnlySettingsButStillAppliesVIPs(t *testing.T) {
 		t.Errorf("operator not warned that the interface change was ignored: %q", logs)
 	}
 }
+
+func TestLocalPolicyOnlyHonouredWhereItIsSafe(t *testing.T) {
+	cases := []struct {
+		name         string
+		bgp, l2      bool
+		node         string
+		wantHonoured bool
+		wantReason   string
+	}{
+		{"BGP with the L2 speaker off and a node name: safe", true, false, "node-a", true, ""},
+		{"whitespace around the node name is trimmed", true, false, "  node-a ", true, ""},
+		{"L2 speaker alone: unsafe, one node answers for every VIP", false, true, "node-a", false, "L2 speaker"},
+		{"BGP and the L2 speaker together: unsafe, and says how to fix it", true, true, "node-a", false, "-speaker=false"},
+		{"neither BGP nor L2: nothing stops a node without pods attracting traffic", false, false, "node-a", false, "needs BGP"},
+		{"BGP but no node name: cannot filter", true, false, "", false, "NODE_NAME"},
+		{"BGP but a blank node name", true, false, "   ", false, "NODE_NAME"},
+	}
+	for _, c := range cases {
+		got := localPolicyFor(c.bgp, c.l2, c.node)
+		if (got.Node != "") != c.wantHonoured {
+			t.Errorf("%s: honoured=%v, want %v (%+v)", c.name, got.Node != "", c.wantHonoured, got)
+		}
+		if c.wantHonoured && got.Node != "node-a" {
+			t.Errorf("%s: node = %q, want it trimmed to node-a", c.name, got.Node)
+		}
+		if !c.wantHonoured && !strings.Contains(got.NotHonouredReason, c.wantReason) {
+			t.Errorf("%s: reason %q should mention %q", c.name, got.NotHonouredReason, c.wantReason)
+		}
+		if c.wantHonoured && got.NotHonouredReason != "" {
+			t.Errorf("%s: honoured but carries a reason: %q", c.name, got.NotHonouredReason)
+		}
+	}
+}

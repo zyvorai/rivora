@@ -16,6 +16,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -64,7 +65,22 @@ type Reconciler struct {
 	// so a Reconcile that finds fewer (or zero, e.g. on delete) desired
 	// VIPs knows exactly which stale ones to RemoveVIP, without needing
 	// the now-gone Service object to reconstruct them.
+	//
+	// mu guards installed. The workqueue guarantees one Service key is never
+	// processed by two workers at once, but different Services run concurrently
+	// (-workers, default 2) and all write this map: unguarded, two reconciles at
+	// the same moment crash the process with "concurrent map read and map write".
+	// It is held only around the map access, never across a dataplane call.
+	mu        sync.Mutex
 	installed map[string][]string
+
+	// localPolicy says how externalTrafficPolicy: Local is treated; see LocalPolicy.
+	// Set before Run; read-only afterwards.
+	localPolicy LocalPolicy
+	// warnedLocal remembers which Services have already been warned that their Local
+	// policy isn't honoured, so the warning is once per Service, not per reconcile.
+	// Guarded by mu.
+	warnedLocal map[string]bool
 
 	// OnChange, if set, is called after every reconcile that touched the
 	// dataplane (create/update/remove) — rivorad uses it to refresh the
@@ -91,7 +107,8 @@ func New(clientset kubernetes.Interface, plane dataplaner, lbClass string, logge
 		queue: workqueue.NewTypedRateLimitingQueue[string](
 			workqueue.DefaultTypedControllerRateLimiter[string](),
 		),
-		installed: map[string][]string{},
+		installed:   map[string][]string{},
+		warnedLocal: map[string]bool{},
 	}
 
 	svcInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -107,6 +124,20 @@ func New(clientset kubernetes.Interface, plane dataplaner, lbClass string, logge
 
 	return r, factory
 }
+
+// LocalPolicy says how a Service's externalTrafficPolicy: Local is treated.
+type LocalPolicy struct {
+	// Node, when set, honours Local: the Service's VIP uses only endpoints on this
+	// node. Set it only where a node without local endpoints won't attract the
+	// traffic, which in practice means BGP with the L2 speaker off.
+	Node string
+	// NotHonouredReason is logged, once per Service, when a Service asks for Local
+	// but Node is empty, so the operator knows it was treated as Cluster.
+	NotHonouredReason string
+}
+
+// SetLocalPolicy configures externalTrafficPolicy: Local handling. Call before Run.
+func (r *Reconciler) SetLocalPolicy(p LocalPolicy) { r.localPolicy = p }
 
 func (r *Reconciler) enqueueService(obj interface{}) {
 	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
@@ -186,6 +217,7 @@ func (r *Reconciler) reconcile(key string) error {
 
 	svc, err := r.serviceLister.Services(ns).Get(name)
 	if errors.IsNotFound(err) {
+		r.forgetLocalWarning(key)
 		return r.removeAllFor(key, nil)
 	}
 	if err != nil {
@@ -202,11 +234,41 @@ func (r *Reconciler) reconcile(key string) error {
 		return fmt.Errorf("list endpointslices: %w", err)
 	}
 
-	desired, err := buildDesiredVIPs(svc, slices)
+	r.noteLocalPolicy(key, svc)
+	desired, err := buildDesiredVIPs(svc, slices, buildOptions{LocalNode: r.localPolicy.Node})
 	if err != nil {
 		return err
 	}
 	return r.removeAllFor(key, desired)
+}
+
+// forgetLocalWarning lets a re-created Service of the same name be warned again.
+func (r *Reconciler) forgetLocalWarning(key string) {
+	r.mu.Lock()
+	delete(r.warnedLocal, key)
+	r.mu.Unlock()
+}
+
+// noteLocalPolicy warns, once per Service, that externalTrafficPolicy: Local is
+// being treated as Cluster (the node isn't set up to honour it safely). Traffic
+// still works, since the NAT preserves the client address either way; what is lost
+// is only the "deliver on the node that has the pod" locality.
+func (r *Reconciler) noteLocalPolicy(key string, svc *corev1.Service) {
+	if r.localPolicy.Node != "" || svc.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyLocal {
+		return
+	}
+	r.mu.Lock()
+	already := r.warnedLocal[key]
+	r.warnedLocal[key] = true
+	r.mu.Unlock()
+	if already {
+		return
+	}
+	reason := r.localPolicy.NotHonouredReason
+	if reason == "" {
+		reason = "this node is not configured to honour it"
+	}
+	r.logger.Warn("externalTrafficPolicy: Local is being treated as Cluster for this Service", "service", key, "why", reason)
 }
 
 // removeAllFor applies desired's VIP set for key, upserting each one and
@@ -233,7 +295,10 @@ func (r *Reconciler) removeAllFor(key string, desired []desiredVIP) error {
 		}
 	}
 
-	for _, oldKey := range r.installed[key] {
+	r.mu.Lock()
+	previous := append([]string(nil), r.installed[key]...)
+	r.mu.Unlock()
+	for _, oldKey := range previous {
 		if newKeys[oldKey] {
 			continue
 		}
@@ -243,6 +308,7 @@ func (r *Reconciler) removeAllFor(key string, desired []desiredVIP) error {
 		changed = true
 	}
 
+	r.mu.Lock()
 	if len(newKeys) == 0 {
 		delete(r.installed, key)
 	} else {
@@ -252,6 +318,7 @@ func (r *Reconciler) removeAllFor(key string, desired []desiredVIP) error {
 		}
 		r.installed[key] = keys
 	}
+	r.mu.Unlock()
 
 	if changed && r.OnChange != nil {
 		r.OnChange()

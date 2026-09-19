@@ -60,6 +60,7 @@ func main() {
 		metricsListen = flag.String("metrics-listen", ":9871", "listen address for /healthz, /readyz and /metrics — unlike -api-listen this is meant to be routable from outside the node (e.g. an in-cluster Prometheus), since rivorad's hostNetwork Pod makes 127.0.0.1 unreachable except from the local kubelet")
 		lbClass       = flag.String("loadbalancer-class", "", "only manage Services whose spec.loadBalancerClass matches this value (default: services with no class set); only used with -kubernetes")
 		namespace     = flag.String("namespace", envOr("POD_NAMESPACE", "rivora-system"), "namespace the ARP speaker's leader-election Lease lives in; only used with -kubernetes")
+		nodeName      = flag.String("node-name", os.Getenv("NODE_NAME"), "this node's Kubernetes name (default $NODE_NAME, which the Helm chart sets from spec.nodeName); needed to honour externalTrafficPolicy: Local, which is only honoured with -bgp and -speaker=false; only used with -kubernetes")
 		workers       = flag.Int("workers", 2, "number of concurrent Service reconcile workers; only used with -kubernetes")
 		speakerOn     = flag.Bool("speaker", true, "run the L2 ARP+NDP speaker (requires CAP_NET_RAW); only used with -kubernetes")
 
@@ -337,6 +338,13 @@ func main() {
 		}
 
 		reconciler, factory := controller.New(clients.Clientset, plane, *lbClass, logger)
+		localPolicy := localPolicyFor(*bgpOn, *speakerOn, *nodeName)
+		reconciler.SetLocalPolicy(localPolicy)
+		if localPolicy.Node != "" {
+			logger.Info("externalTrafficPolicy: Local is honoured: Services that ask for it use only this node's endpoints", "node", localPolicy.Node)
+		} else {
+			logger.Info("externalTrafficPolicy: Local is not honoured on this node; such Services are treated as Cluster (each is warned about once)", "why", localPolicy.NotHonouredReason)
+		}
 
 		var gwReconciler *gatewayapi.Reconciler
 		var gwFactory informers.SharedInformerFactory
@@ -470,6 +478,31 @@ func main() {
 		logger.Warn("api graceful shutdown incomplete, closing", "err", err)
 		_ = srv.Close()
 	}
+}
+
+// localPolicyFor decides whether externalTrafficPolicy: Local is honoured on this
+// node. It is only safe where a node that has none of a Service's pods won't attract
+// its traffic. With BGP that holds: a node advertises a VIP only while it has a
+// healthy local backend, so one with none withdraws the route. With the L2 speaker it
+// does not: a single elected node answers ARP for every VIP whether or not it runs the
+// pods, so a Local Service would blackhole whenever the leader has none. Anywhere it
+// isn't safe, Local is treated as Cluster (as it always was), which still works because
+// the NAT preserves the client address either way; the reason is what an operator
+// reads in the once-per-Service warning.
+func localPolicyFor(bgpOn, speakerOn bool, node string) controller.LocalPolicy {
+	switch {
+	case speakerOn:
+		why := "the L2 speaker answers ARP/NDP from one elected node, which may not run this Service's pods, so honouring Local could blackhole it"
+		if bgpOn {
+			why += "; BGP is on too, so run with -speaker=false to honour Local"
+		}
+		return controller.LocalPolicy{NotHonouredReason: why}
+	case !bgpOn:
+		return controller.LocalPolicy{NotHonouredReason: "Local needs BGP: without it nothing stops a node with no local endpoints from receiving the traffic"}
+	case strings.TrimSpace(node) == "":
+		return controller.LocalPolicy{NotHonouredReason: "this node's name is unknown: set -node-name or the NODE_NAME environment variable (the Helm chart sets it from spec.nodeName)"}
+	}
+	return controller.LocalPolicy{Node: strings.TrimSpace(node)}
 }
 
 // logStartup reports what start-up found already programmed in the pinned maps.

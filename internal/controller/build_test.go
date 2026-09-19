@@ -45,7 +45,7 @@ func slice(portName string, port int32, endpoints ...discoveryv1.Endpoint) *disc
 func TestBuildDesiredVIPsNoIngressYieldsNothing(t *testing.T) {
 	svc := lbService(corev1.ServicePort{Name: "http", Port: 80})
 	svc.Status.LoadBalancer.Ingress = nil
-	got, err := buildDesiredVIPs(svc, nil)
+	got, err := buildDesiredVIPs(svc, nil, buildOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestBuildDesiredVIPsBasic(t *testing.T) {
 		Conditions: discoveryv1.EndpointConditions{Ready: ptr(true), Serving: ptr(true)},
 	})
 
-	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{sl})
+	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{sl}, buildOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestBuildDesiredVIPsBasic(t *testing.T) {
 
 func TestBuildDesiredVIPsSkipsUnsupportedProtocol(t *testing.T) {
 	svc := lbService(corev1.ServicePort{Name: "sctp", Port: 80, Protocol: corev1.ProtocolSCTP})
-	got, err := buildDesiredVIPs(svc, nil)
+	got, err := buildDesiredVIPs(svc, nil, buildOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestBuildDesiredVIPsSkipsUnsupportedProtocol(t *testing.T) {
 
 func TestBuildDesiredVIPsSkipsPortWithNoReadyBackends(t *testing.T) {
 	svc := lbService(corev1.ServicePort{Name: "http", Port: 80})
-	got, err := buildDesiredVIPs(svc, nil)
+	got, err := buildDesiredVIPs(svc, nil, buildOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestBuildDesiredVIPsNotReadyIsIncludedAsDraining(t *testing.T) {
 		Conditions: discoveryv1.EndpointConditions{Ready: ptr(false), Serving: ptr(true), Terminating: ptr(true)},
 	})
 
-	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{sl})
+	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{sl}, buildOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestBuildDesiredVIPsNotServingIsExcludedEntirely(t *testing.T) {
 		Conditions: discoveryv1.EndpointConditions{Ready: ptr(false), Serving: ptr(false)},
 	})
 
-	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{sl})
+	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{sl}, buildOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestBuildDesiredVIPsDedupesAcrossSlices(t *testing.T) {
 	slB := slice("http", 8080, ep)
 	slB.Name = "svc-fghij"
 
-	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{slA, slB})
+	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{slA, slB}, buildOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func TestBuildDesiredVIPsMultiplePorts(t *testing.T) {
 	})
 	slHTTPS.Name = "svc-https"
 
-	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{slHTTP, slHTTPS})
+	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{slHTTP, slHTTPS}, buildOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +195,7 @@ func TestBuildDesiredVIPsAcceptsIPv6Endpoints(t *testing.T) {
 		Conditions: discoveryv1.EndpointConditions{Ready: ptr(true), Serving: ptr(true)},
 	})
 	sl.AddressType = discoveryv1.AddressTypeIPv6
-	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{sl})
+	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{sl}, buildOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +221,7 @@ func TestBuildDesiredVIPsFiltersCrossFamilyBackends(t *testing.T) {
 		Conditions: discoveryv1.EndpointConditions{Ready: ptr(true), Serving: ptr(true)},
 	})
 	v6.AddressType = discoveryv1.AddressTypeIPv6
-	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{v4, v6})
+	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{v4, v6}, buildOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +253,7 @@ func TestBuildDesiredVIPsKubeVirtVM(t *testing.T) {
 		},
 	})
 
-	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{sl})
+	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{sl}, buildOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +279,7 @@ func TestBuildDesiredVIPsManualEndpointSliceExternalBackend(t *testing.T) {
 		},
 	})
 
-	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{sl})
+	got, err := buildDesiredVIPs(svc, []*discoveryv1.EndpointSlice{sl}, buildOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
