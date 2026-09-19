@@ -375,8 +375,13 @@ func (d *Dataplane) dropRawVIP(r rawVIP) {
 }
 
 func modeFromByte(m uint8) config.Mode {
-	if m == bpfmaps.ModeNAT {
+	switch m {
+	case bpfmaps.ModeNAT:
 		return config.ModeNAT
+	case bpfmaps.ModeTunnelIPIP:
+		return config.ModeDSRIPIP
+	case bpfmaps.ModeTunnelGRE:
+		return config.ModeDSRGRE
 	}
 	return config.ModeDSR
 }

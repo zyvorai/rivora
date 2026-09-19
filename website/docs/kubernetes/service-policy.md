@@ -29,6 +29,9 @@ spec:
     nodes:
       big-node-1: 4
       big-node-2: 4
+  bgp:                         # only with rivorad's BGP speaker
+    communities: ["65001:7"]   # added to this Service's route
+    peers: [10.0.1.1]          # send it only to this peer (default: every peer)
 ```
 
 Every field is optional; a setting you leave out keeps its default, so a policy
@@ -51,6 +54,11 @@ that only sets `healthCheck` changes only that.
   the new connections of 1) and range 1 to 1000. Pod IPs are ephemeral, so weights
   key on the stable thing an endpoint carries, its node. To take a node out of
   rotation, drain it rather than weighting it to 0.
+- **`bgp`** tunes the route advertised for this Service's VIPs when BGP is on:
+  `communities` are added to the speaker's own, and `peers` (by address) limits which of
+  the BGP peers the route is sent to, so a Service can be carried by one rack's router or
+  one upstream only. See [BGP](../operations/bgp.md#sending-a-route-to-only-some-peers)
+  for how, and what a name that is not a running peer does.
 
 ## Rules worth knowing
 

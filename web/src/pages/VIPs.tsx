@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api';
 import type { VIPStatus } from '../types';
-import { fmtBytes } from '../types';
+import { fmtBytes, vipPortLabel } from '../types';
 
 export default function VIPs() {
   const [vips, setVips] = useState<VIPStatus[]>([]);
@@ -45,12 +45,12 @@ export default function VIPs() {
         const backends = v.backends || [];
         const up = backends.filter((b) => b.healthy).length;
         return (
-          <section className="card span2" key={`${v.vipAddress}:${v.vipPort}:${v.protocol}`}>
+          <section className="card span2" key={`${v.vipAddress}:${vipPortLabel(v)}:${v.protocol}`}>
             <p className="eyebrow">
               {(v.protocol || '').toUpperCase()} · {(v.mode || '').toUpperCase()}
             </p>
             <h3>
-              {v.vipAddress}:{v.vipPort}
+              {v.vipAddress}:{vipPortLabel(v)}
             </h3>
             <p>
               {up}/{backends.length} backends healthy · {v.packets.toLocaleString()} packets · {fmtBytes(v.bytes)} ·

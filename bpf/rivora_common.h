@@ -28,6 +28,15 @@ static long (*bpf_map_update_elem)(void *map, const void *key, const void *value
 static long (*bpf_map_delete_elem)(void *map, const void *key) = (void *)BPF_FUNC_map_delete_elem;
 static __u64 (*bpf_ktime_get_ns)(void) = (void *)BPF_FUNC_ktime_get_ns;
 static __s64 (*bpf_csum_diff)(__be32 *from, __u32 from_size, __be32 *to, __u32 to_size, __u32 seed) = (void *)BPF_FUNC_csum_diff;
+static long (*bpf_xdp_adjust_head)(struct xdp_md *ctx, int delta) = (void *)BPF_FUNC_xdp_adjust_head;
+static long (*bpf_fib_lookup)(void *ctx, struct bpf_fib_lookup *params, int plen, __u32 flags) = (void *)BPF_FUNC_fib_lookup;
+static long (*bpf_redirect)(__u32 ifindex, __u64 flags) = (void *)BPF_FUNC_redirect;
+static long (*bpf_xdp_adjust_tail)(struct xdp_md *ctx, int delta) = (void *)BPF_FUNC_xdp_adjust_tail;
+/* Copy between a packet and memory (kernel 5.18+); they work on any offset without the byte-wise copy
+ * loops, and register spills, that memcpy on an unaligned packet pointer costs the BPF stack. */
+static long (*bpf_xdp_load_bytes)(struct xdp_md *ctx, __u32 offset, void *buf, __u32 len) = (void *)BPF_FUNC_xdp_load_bytes;
+static long (*bpf_xdp_store_bytes)(struct xdp_md *ctx, __u32 offset, void *buf, __u32 len) = (void *)BPF_FUNC_xdp_store_bytes;
+static __u32 (*bpf_get_prandom_u32)(void) = (void *)BPF_FUNC_get_prandom_u32;
 
 #define IPPROTO_ICMP_ 1
 #define IPPROTO_TCP_ 6
@@ -279,6 +288,106 @@ struct frag_rev_val {
 };
 _Static_assert(sizeof(struct frag_rev_val) == 8, "frag_rev_val ABI");
 
+/* IPv6 fragments. Same idea as the IPv4 tracking above, keyed by the Fragment header's 32-bit
+ * identification. The key is written with the ORIGINAL addresses (before any NAT rewrite). */
+struct frag_key6 {
+    __u8  saddr[16];
+    __u8  daddr[16];
+    __u32 id;
+    __u8  proto; /* the fragmented payload's protocol (the Fragment header's next header) */
+    __u8  pad[3];
+};
+_Static_assert(sizeof(struct frag_key6) == 40, "frag_key6 ABI");
+
+struct frag_rev_val6 {
+    __u8 vip_addr[16];
+};
+_Static_assert(sizeof(struct frag_rev_val6) == 16, "frag_rev_val6 ABI");
+
+/* IPv6 extension headers the programs step over to find the L4 header: Hop-by-Hop (0),
+ * Destination Options (60) and Fragment (44). Anything else in the chain (Routing, AH, ESP,
+ * or a chain longer than RIVORA_V6_MAX_EXT headers or RIVORA_V6_MAX_EXT_BYTES bytes) is not
+ * walked and the packet is left alone: a Routing header changes what the pseudo-header's
+ * destination is, and ESP hides the ports. */
+#define RIVORA_V6_HOPOPTS   0
+#define RIVORA_V6_ROUTING   43
+#define RIVORA_V6_FRAGMENT  44
+#define RIVORA_V6_DSTOPTS   60
+#define RIVORA_V6_MAX_EXT   4
+#define RIVORA_V6_MAX_EXT_BYTES 248 /* keeps the offset provably below 256 for the verifier */
+#define RIVORA_V6_FRAG_OFFSET 0xfff8
+#define RIVORA_V6_FRAG_MF     0x0001
+
+struct rivora_v6_opt_hdr {
+    __u8 nexthdr;
+    __u8 hdrlen; /* in 8-byte units, not counting the first 8 bytes */
+};
+
+struct rivora_v6_frag_hdr {
+    __u8   nexthdr;
+    __u8   reserved;
+    __be16 frag_off; /* offset in the high 13 bits (8-byte units), MF in the low bit */
+    __be32 id;
+};
+
+struct rivora_v6_l4 {
+    __u32 off;      /* bytes between the fixed IPv6 header and the L4 header (or the fragment's payload) */
+    __u8  proto;    /* the protocol after every walked header */
+    __u8  is_frag;  /* a Fragment header was present */
+    __u8  more;     /* ...with MF set */
+    __u8  pad;
+    __u16 frag_off; /* the fragment's byte offset in the datagram, host order (0 for a first fragment) */
+    __u16 pad2;
+    __u32 id;       /* the Fragment header's identification, network order */
+};
+
+/* Walk iph's extension-header chain. Returns 0 with the result in out, or -1 when the chain is
+ * truncated or not walkable, in which case the caller passes the packet on untouched. */
+static __always_inline int rivora_v6_walk(struct ipv6hdr *iph, void *data_end, struct rivora_v6_l4 *out)
+{
+    __u8 nh = iph->nexthdr;
+    __u32 off = 0;
+    out->off = 0;
+    out->is_frag = 0;
+    out->more = 0;
+    out->frag_off = 0;
+    out->id = 0;
+
+#pragma unroll
+    for (int i = 0; i < RIVORA_V6_MAX_EXT; i++) {
+        if (nh == RIVORA_V6_HOPOPTS || nh == RIVORA_V6_DSTOPTS) {
+            struct rivora_v6_opt_hdr *oh = (void *)(iph + 1) + (off & 0xff);
+            if ((void *)(oh + 1) > data_end)
+                return -1;
+            nh = oh->nexthdr;
+            off += ((__u32)oh->hdrlen + 1) * 8;
+        } else if (nh == RIVORA_V6_FRAGMENT) {
+            if (out->is_frag)
+                return -1; /* a second Fragment header is malformed */
+            struct rivora_v6_frag_hdr *fh = (void *)(iph + 1) + (off & 0xff);
+            if ((void *)(fh + 1) > data_end)
+                return -1;
+            __u16 fo = __builtin_bswap16(fh->frag_off);
+            out->is_frag = 1;
+            out->more = fo & RIVORA_V6_FRAG_MF;
+            out->frag_off = fo & RIVORA_V6_FRAG_OFFSET;
+            out->id = fh->id;
+            nh = fh->nexthdr;
+            off += 8;
+        } else {
+            break;
+        }
+        if (off > RIVORA_V6_MAX_EXT_BYTES)
+            return -1;
+    }
+    /* Still on an extension header we don't walk after the last permitted step. */
+    if (nh == RIVORA_V6_HOPOPTS || nh == RIVORA_V6_DSTOPTS || nh == RIVORA_V6_FRAGMENT)
+        return -1;
+    out->off = off;
+    out->proto = nh;
+    return 0;
+}
+
 struct lb_stats {
     __u64 packets;
     __u64 bytes;
@@ -387,6 +496,21 @@ static __always_inline int rl_take(const struct rl_config *cfg, const struct rl_
 
 #define RIVORA_MODE_DSR 0
 #define RIVORA_MODE_NAT 1
+/* L3 DSR: the packet is wrapped in an IP-in-IP (2) or GRE (3) tunnel to the backend, which
+ * unwraps it and answers the client directly from the VIP. Unlike DSR (0) the backend need not
+ * be on the load balancer's L2 segment, only routable from it. IPv4 VIPs use an IPv4 outer
+ * header and IPv6 VIPs an IPv6 one. */
+#define RIVORA_MODE_TUNNEL_IPIP 2
+#define RIVORA_MODE_TUNNEL_GRE  3
+
+/* tunnel_config_map: the source address of the outer header, per family, written by rivorad at
+ * start-up (configured, or the attached interface's own address). A zero source means "none":
+ * a tunnel VIP then drops rather than send a packet nobody can attribute. */
+struct tunnel_config {
+    __u32 src4;     /* network byte order */
+    __u8  src6[16];
+};
+_Static_assert(sizeof(struct tunnel_config) == 20, "tunnel_config ABI");
 
 /* backend_health_map values — mirrors bpfmaps.Health{Down,Healthy,Draining}
  * on the Go side. Draining excludes a backend from pick_backend()'s *new*

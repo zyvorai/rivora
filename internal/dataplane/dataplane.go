@@ -82,8 +82,12 @@ type Status struct {
 	Interface  string          `json:"interface"`
 	StartedAt  time.Time       `json:"startedAt"`
 	Backends   []BackendStatus `json:"backends"`
-	Packets    uint64          `json:"packets"`
-	Bytes      uint64          `json:"bytes"`
+	// BGPCommunities are the VIP's own bgpCommunities, read by the BGP speaker.
+	BGPCommunities []string `json:"bgpCommunities,omitempty"`
+	// BGPPeers are the peers the VIP's route is limited to; empty means every peer.
+	BGPPeers []string `json:"bgpPeers,omitempty"`
+	Packets  uint64   `json:"packets"`
+	Bytes    uint64   `json:"bytes"`
 	// Dropped is node-wide (stats_map's global slot), the sum of every VIP's
 	// drops, not this VIP's own count — the fields below are this VIP's own.
 	Dropped uint64 `json:"dropped"`
@@ -148,6 +152,16 @@ type Dataplane struct {
 	backendAlloc  *idAllocator
 	maglevAlloc   *extentAllocator
 
+	// tunnelSrc4/6 are the outer-header sources of the dsr-ipip / dsr-gre modes, resolved at Apply
+	// (configured, else the attached interface's own address). nil means none was found.
+	tunnelSrc4 net.IP
+	tunnelSrc6 net.IP
+
+	// unclaimed holds the VIPs adopted from a previous run's pinned maps that no reconciler has
+	// programmed since (Kubernetes mode; see PruneUnclaimed). An adopted entry has no spec yet, so
+	// it must not be re-upserted from one (SetBackendWeight skips it).
+	unclaimed map[string]bool
+
 	startup StartupSummary
 }
 
@@ -157,6 +171,7 @@ func New(cfg config.Config, dp *loader.Datapath) *Dataplane {
 		dp:            dp,
 		startedAt:     time.Now(),
 		services:      map[string]*serviceEntry{},
+		unclaimed:     map[string]bool{},
 		backendStates: map[uint32]*backendState{},
 		serviceAlloc:  newIDAllocator(bpfmaps.MaxVIPs),
 		backendAlloc:  newIDAllocator(bpfmaps.MaxBackends),
@@ -182,14 +197,31 @@ func (d *Dataplane) Apply(iface *net.Interface) error {
 	if err := d.applyRateLimit(); err != nil {
 		return err
 	}
+	if err := d.applyTunnelConfig(iface); err != nil {
+		return err
+	}
 
 	// Static-YAML mode: the file is the whole desired VIP set, so recover what
 	// a previous run left in the pinned maps and reconcile it against the file
-	// (see adopt.go) instead of programming on top of leftovers. Kubernetes mode
-	// also calls Apply, but with no VIPs — its reconcilers supply them later, so
-	// there is nothing to reconcile against, and adopting-then-reloading to an
-	// empty set would tear down every persisted VIP. It keeps the old path.
+	// (see adopt.go) instead of programming on top of leftovers.
+	//
+	// Kubernetes mode calls Apply with no VIPs: its reconcilers supply them later, so there is
+	// nothing to reconcile against yet. It still adopts, so the leftovers' service IDs, Maglev
+	// extents and backend IDs are not handed out again, but it must not remove them: they are
+	// most likely still wanted, and tearing them down would drop every connection until the
+	// reconcilers caught up. They are left forwarding, marked unclaimed; an UpsertVIP claims one,
+	// and PruneUnclaimed removes what nothing claimed once the first reconcile pass is done.
 	if len(d.cfg.VIPs) == 0 {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		sum, err := d.adoptLocked()
+		if err != nil {
+			return fmt.Errorf("adopt existing datapath state: %w", err)
+		}
+		for key := range d.services {
+			d.unclaimed[key] = true
+		}
+		d.startup = StartupSummary{AdoptSummary: sum}
 		return nil
 	}
 	d.mu.Lock()
@@ -260,6 +292,82 @@ func (d *Dataplane) applyRateLimit() error {
 	return nil
 }
 
+// applyTunnelConfig resolves the outer-header source of the tunnel modes for each family
+// (configured, else the attached interface's own address) and writes tunnel_config_map. Finding
+// none is not an error here: only a tunnel VIP needs one, and upsertVIPLocked says so then.
+func (d *Dataplane) applyTunnelConfig(iface *net.Interface) error {
+	var src4, src6 net.IP
+	if d.cfg.TunnelSource != "" {
+		src4 = net.ParseIP(d.cfg.TunnelSource).To4()
+	}
+	if d.cfg.TunnelSource6 != "" {
+		src6 = net.ParseIP(d.cfg.TunnelSource6)
+	}
+	if iface != nil && (src4 == nil || src6 == nil) {
+		addrs, _ := iface.Addrs()
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			if v4 := ipn.IP.To4(); v4 != nil {
+				if src4 == nil {
+					src4 = v4
+				}
+			} else if src6 == nil && ipn.IP.IsGlobalUnicast() {
+				src6 = ipn.IP
+			}
+		}
+	}
+	d.mu.Lock()
+	d.tunnelSrc4, d.tunnelSrc6 = src4, src6
+	d.mu.Unlock()
+
+	m := d.dp.Maps[bpfmaps.MapTunnelConfig]
+	if m == nil {
+		return nil // an object built before tunnel modes existed; a tunnel VIP fails in upsertVIPLocked
+	}
+	var tc bpfmaps.TunnelConfig
+	if src4 != nil {
+		tc.Src4 = ip4ToBE32(src4)
+	}
+	if src6 != nil {
+		tc.Src6 = ip6To16(src6)
+	}
+	var zero uint32
+	if err := m.Update(&zero, &tc, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("update tunnel_config_map: %w", err)
+	}
+	return nil
+}
+
+// TunnelSources returns the outer-header source addresses in use for the tunnel modes
+// (IPv4, IPv6); nil means none was configured or found.
+func (d *Dataplane) TunnelSources() (v4, v6 net.IP) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.tunnelSrc4, d.tunnelSrc6
+}
+
+// checkTunnelReady says why a tunnel-mode VIP cannot be programmed, or nil.
+func (d *Dataplane) checkTunnelReady(vip config.VIP) error {
+	if !vip.Mode.IsTunnel() {
+		return nil
+	}
+	if d.dp.Maps[bpfmaps.MapTunnelConfig] == nil {
+		return fmt.Errorf("mode %s: this datapath object has no tunnel support; rebuild the BPF objects", vip.Mode)
+	}
+	ip := net.ParseIP(vip.Address)
+	if ip != nil && ip.To4() != nil {
+		if d.tunnelSrc4 == nil {
+			return fmt.Errorf("mode %s: no IPv4 tunnel source: set tunnelSource, or give %s an IPv4 address", vip.Mode, d.cfg.Interface)
+		}
+	} else if d.tunnelSrc6 == nil {
+		return fmt.Errorf("mode %s: no IPv6 tunnel source: set tunnelSource6, or give %s a global IPv6 address", vip.Mode, d.cfg.Interface)
+	}
+	return nil
+}
+
 // scaleRateLimit turns a configured per-source rate and burst into what the BPF
 // program enforces. Each CPU keeps its own bucket, so both are divided by the CPU
 // count (see applyRateLimit), with a floor of 1 so a small limit still admits
@@ -315,6 +423,9 @@ func (d *Dataplane) UpsertVIP(vip config.VIP) error {
 
 func (d *Dataplane) upsertVIPLocked(spec config.VIP) error {
 	key := vipKeyString(spec)
+	if err := d.checkTunnelReady(spec); err != nil {
+		return fmt.Errorf("vip %s: %w", key, err)
+	}
 	entry, existed := d.services[key]
 	if !existed {
 		id, err := d.serviceAlloc.Alloc(key)
@@ -379,8 +490,13 @@ func (d *Dataplane) upsertVIPLocked(spec config.VIP) error {
 	}
 
 	mode := uint8(bpfmaps.ModeDSR)
-	if vip.Mode == config.ModeNAT {
+	switch vip.Mode {
+	case config.ModeNAT:
 		mode = bpfmaps.ModeNAT
+	case config.ModeDSRIPIP:
+		mode = bpfmaps.ModeTunnelIPIP
+	case config.ModeDSRGRE:
+		mode = bpfmaps.ModeTunnelGRE
 	}
 	sc := bpfmaps.ServiceConfig{
 		BackendCount: uint32(len(entry.backendIDs)),
@@ -405,7 +521,34 @@ func (d *Dataplane) upsertVIPLocked(spec config.VIP) error {
 
 	entry.vipSpec = spec
 	entry.vip = vip
+	delete(d.unclaimed, key)
 	return nil
+}
+
+// PruneUnclaimed removes every VIP adopted at start-up that no UpsertVIP has claimed since, and
+// returns their keys. Call it once every reconciler has finished its first full pass: at that
+// point a leftover nothing claimed belongs to a Service or Gateway that no longer exists (or no
+// longer wants it), and it would otherwise stay programmed for good, since the reconcilers never
+// heard of it and so never remove it. Calling it earlier would tear down VIPs still wanted.
+func (d *Dataplane) PruneUnclaimed() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	keys := make([]string, 0, len(d.unclaimed))
+	for k := range d.unclaimed {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		_ = d.removeVIPLocked(k) // never fails: it deletes best-effort
+	}
+	return keys
+}
+
+// Unclaimed returns how many adopted VIPs are still waiting to be claimed or pruned.
+func (d *Dataplane) Unclaimed() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.unclaimed)
 }
 
 // applyProbeLocked records probe as the health-check spec of every backend entry
@@ -733,6 +876,7 @@ func (d *Dataplane) removeVIPLocked(key string) error {
 		d.releaseBackendLocked(name, id)
 	}
 
+	delete(d.unclaimed, key)
 	_ = d.vipMapDelete(entry.vip)
 	var zero bpfmaps.ServiceConfig
 	_ = d.dp.Maps[bpfmaps.MapServiceConfig].Update(&entry.serviceID, &zero, ebpf.UpdateAny)
@@ -844,8 +988,14 @@ func (d *Dataplane) SetBackendWeight(backendID uint32, vipKey string, weight uin
 		name  string
 	}
 	var targets []target
+	waiting := ""
 	for key, entry := range d.services {
 		if vipKey != "" && key != vipKey {
+			continue
+		}
+		if d.unclaimed[key] {
+			// Adopted at start-up and not yet reconciled: there is no spec to rebuild from.
+			waiting = key
 			continue
 		}
 		for name, id := range entry.backendIDs {
@@ -853,6 +1003,9 @@ func (d *Dataplane) SetBackendWeight(backendID uint32, vipKey string, weight uin
 				targets = append(targets, target{entry, name})
 			}
 		}
+	}
+	if len(targets) == 0 && waiting != "" {
+		return 0, fmt.Errorf("vip %q was recovered at start-up and is not reconciled yet, try again shortly: %w", waiting, ErrVIPNotFound)
 	}
 	if len(targets) == 0 {
 		return 0, fmt.Errorf("backend %d: %w", backendID, ErrBackendNotFound)
@@ -921,14 +1074,16 @@ func (d *Dataplane) Statuses() ([]Status, error) {
 	for _, entry := range d.services {
 		vip := entry.vip
 		st := Status{
-			VIPAddress: vip.Address,
-			VIPPort:    vip.Port,
-			VIPPortEnd: vip.PortEnd,
-			Protocol:   string(vip.Protocol),
-			Mode:       string(vip.Mode),
-			Interface:  d.cfg.Interface,
-			StartedAt:  d.startedAt,
-			Dropped:    globalDropped,
+			VIPAddress:     vip.Address,
+			VIPPort:        vip.Port,
+			VIPPortEnd:     vip.PortEnd,
+			BGPCommunities: vip.BGPCommunities,
+			BGPPeers:       vip.BGPPeers,
+			Protocol:       string(vip.Protocol),
+			Mode:           string(vip.Mode),
+			Interface:      d.cfg.Interface,
+			StartedAt:      d.startedAt,
+			Dropped:        globalDropped,
 		}
 		if dropMap != nil {
 			if ds, err := sumDropStats(dropMap, entry.serviceID); err == nil {

@@ -43,6 +43,14 @@ struct {
     __type(value, struct frag_rev_val);
 } frag_rev_map SEC(".maps");
 
+/* IPv6 sibling of frag_rev_map. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct frag_key6);
+    __type(value, struct frag_rev_val6);
+} frag_rev_map6 SEC(".maps");
+
 /* A later fragment of a backend's reply has no L4 header, so it cannot be looked up by port.
  * It gets the source rewrite its datagram's first fragment got. Only the IP header changes:
  * the L4 checksum lives in the first fragment, which already accounted for the new source. */
@@ -145,13 +153,32 @@ static __always_inline int handle_ipv6(void *data_end, struct ipv6hdr *iph)
 {
     if ((void *)(iph + 1) > data_end)
         return TC_ACT_OK;
-    if (iph->nexthdr != IPPROTO_TCP_ && iph->nexthdr != IPPROTO_UDP_)
+
+    /* Same extension-header walk as xdp_ingress: a reply can carry a Fragment header (a large UDP
+     * reply) or, rarely, Hop-by-Hop / Destination Options. */
+    struct rivora_v6_l4 w;
+    if (rivora_v6_walk(iph, data_end, &w) < 0)
+        return TC_ACT_OK;
+    const __u8 proto = w.proto;
+    if (proto != IPPROTO_TCP_ && proto != IPPROTO_UDP_)
         return TC_ACT_OK;
 
-    void *l4 = (void *)(iph + 1);
+    /* A later fragment of a reply has no L4 header: it gets the source rewrite its first fragment
+     * got. Only the IP header changes; the L4 checksum, in the first fragment, already covers it. */
+    if (w.is_frag && w.frag_off != 0) {
+        struct frag_key6 fk = {.id = w.id, .proto = proto};
+        __builtin_memcpy(fk.saddr, &iph->saddr, 16);
+        __builtin_memcpy(fk.daddr, &iph->daddr, 16);
+        struct frag_rev_val6 *fv = bpf_map_lookup_elem(&frag_rev_map6, &fk);
+        if (fv)
+            __builtin_memcpy(&iph->saddr, fv->vip_addr, 16);
+        return TC_ACT_OK;
+    }
+
+    void *l4 = (void *)(iph + 1) + (w.off & 0xff);
     __u16 sport, dport;
 
-    if (iph->nexthdr == IPPROTO_TCP_) {
+    if (proto == IPPROTO_TCP_) {
         struct tcphdr *tcph = l4;
         if ((void *)(tcph + 1) > data_end)
             return TC_ACT_OK;
@@ -166,7 +193,7 @@ static __always_inline int handle_ipv6(void *data_end, struct ipv6hdr *iph)
     }
 
     /* This is the backend->client leg: src = backend, dst = client. */
-    struct nat_reverse_key6 rk = {.backend_port = sport, .client_port = dport, .proto = iph->nexthdr};
+    struct nat_reverse_key6 rk = {.backend_port = sport, .client_port = dport, .proto = proto};
     __builtin_memcpy(rk.backend_addr, &iph->saddr, 16);
     __builtin_memcpy(rk.client_addr, &iph->daddr, 16);
     struct nat_reverse_val6 *rv = bpf_map_lookup_elem(&nat_reverse_map6, &rk);
@@ -181,8 +208,8 @@ static __always_inline int handle_ipv6(void *data_end, struct ipv6hdr *iph)
 
     /* Re-derive the L4 pointer fresh here too — same reasoning as
      * handle_ipv4's NAT block. */
-    void *l4b = (void *)(iph + 1);
-    if (iph->nexthdr == IPPROTO_TCP_) {
+    void *l4b = (void *)(iph + 1) + (w.off & 0xff);
+    if (proto == IPPROTO_TCP_) {
         struct tcphdr *t = l4b;
         if ((void *)(t + 1) > data_end)
             return TC_ACT_OK;
@@ -196,6 +223,16 @@ static __always_inline int handle_ipv6(void *data_end, struct ipv6hdr *iph)
         csum_replace(&u->check, old_saddr, new_saddr, 16);
         csum_replace(&u->check, &old_sport, &new_sport, 2);
         u->source = new_sport;
+    }
+    /* First fragment of a fragmented reply: remember the rewrite for the rest of it. Keyed by the
+     * addresses as they are before the rewrite, which is what the later fragments carry. */
+    if (w.is_frag && w.more) {
+        struct frag_key6 fk = {.id = w.id, .proto = proto};
+        __builtin_memcpy(fk.saddr, old_saddr, 16);
+        __builtin_memcpy(fk.daddr, &iph->daddr, 16);
+        struct frag_rev_val6 fv;
+        __builtin_memcpy(fv.vip_addr, new_saddr, 16);
+        bpf_map_update_elem(&frag_rev_map6, &fk, &fv, BPF_ANY);
     }
     __builtin_memcpy(&iph->saddr, new_saddr, 16);
 

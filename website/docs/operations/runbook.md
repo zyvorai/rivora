@@ -105,6 +105,26 @@ skipped with `--tls-insecure`.
 unsafe: a read-only key with no admin key, a key in both roles, or a setting with
 no usable key in it.
 
+**Who did it: named keys and an audit trail.** Write a key as `id:NAME=KEY`
+(`RIVORA_API_KEY=id:alice=...,id:bob=...`; NAME is letters, digits, `.`, `_` or `-`, up to 64) and
+every state-changing request (drain, undrain, weight) is logged as
+`api change user=alice role=admin method=POST path=... status=200 remote=...` and counted in
+`rivora_api_changes_total{user,code}`, whether it succeeded or not. A change refused because the caller's
+key or certificate is read-only is always logged, naming them (`reason=forbidden user=viewer`), and is
+never throttled. A key without `id:` is named by its position (`key-1`), and the audit line never contains
+a key. Reusing a name is refused at start-up.
+
+**Client certificates (mutual TLS).** Set `RIVORA_TLS_CLIENT_CA` to a PEM CA bundle (TLS must be on,
+via `RIVORA_TLS_CERT`/`RIVORA_TLS_KEY` or `RIVORA_TLS_SELF_SIGNED`) and a client certificate signed by
+it authenticates its holder with no key: the common name is the identity (`cert:ops` in the audit trail),
+common names listed in `RIVORA_API_CERT_ADMIN_CNS` (comma-separated) get the admin role, and any other
+verified certificate is read-only. By default a certificate is optional, so bearer keys keep working
+beside it; add `RIVORA_TLS_CLIENT_REQUIRED=1` to turn away every caller without one at the TLS
+handshake. With certificates on, authentication is on even if no key is set. Give `rivoractl` its own:
+`rivoractl --cert ops.pem --key ops.key --ca-file server.pem drain 3` (or `RIVORA_CLIENT_CERT`/
+`RIVORA_CLIENT_KEY`). A certificate is verified against the CA only; **revocation is not checked**, so keep
+them short-lived or rotate the CA. Per-user roles finer than admin/read-only are not implemented.
+
 ## Draining a backend or shifting weight (live)
 
 Use these for maintenance and canary shifts without editing config or
@@ -194,8 +214,8 @@ FTP, RTP media, game servers), and can list several ports at once
   can be carved out to go somewhere else. Two *ranges* on the same address and protocol
   must not overlap; that is rejected when the config loads.
 - The API reports a range as `vipPort` (first) and `vipPortEnd` (last), and metrics label
-  it `vip="192.0.2.20:30000-30100"`, and `rivoractl vips` shows `30000-30100`. The web
-  console still shows a range VIP by its first port only.
+  it `vip="192.0.2.20:30000-30100"`, and both `rivoractl vips` and the web console
+  show `30000-30100`.
 - **How it works:** the range is stored in a BPF LPM trie as a few aligned blocks
   (30000-30100 is five), checked only when no exact-port VIP matched. With
   `-persist-datapath` a restart adopts ranges from the pinned maps like any other VIP.
@@ -233,9 +253,67 @@ below stated plainly. `scripts/selftest-edgecases.sh` exercises all of it.
   ICMP quoting a connection that does not exist is **not** steered. IPv6 "packet too big" and
   the other ICMPv6 errors are handled the same way. Echo (ping) to a VIP is untouched. Only
   TCP and UDP flows are matched, and only where the quoted header has no IP options.
-- **Not handled:** IPv6 extension headers (hop-by-hop, routing, destination options) and IPv6
-  fragments. A packet whose IPv6 next header is not TCP or UDP is passed through untouched,
-  as before.
+- **IPv6 extension headers.** Hop-by-Hop and Destination Options headers (up to four headers,
+  248 bytes in all) are stepped over to reach the TCP/UDP header, in full-NAT and DSR, and stay
+  in the packet. **Not handled, and passed through untouched:** a Routing header (it changes what
+  the checksum's destination is), AH and ESP (ESP hides the ports), and any longer chain. ICMPv6
+  errors are steered only when the ICMPv6 header directly follows the IPv6 header, and only for a
+  flow whose quoted packet has none, so path-MTU discovery for a flow that carries extension
+  headers is not steered.
+- **IPv6 fragments.** Handled like IPv4's: the first fragment carries the ports, is balanced
+  normally, and its backend is remembered (keyed by source, destination, the Fragment header's
+  identification and protocol; LRU); later fragments follow it. In full-NAT the backend's
+  fragmented replies are un-NATed on the way out the same way. The same limit applies: a later
+  fragment that arrives *before* its first fragment is not steered, so that datagram is lost.
+  `scripts/selftest-ipv6-ext.sh` runs 4000-byte datagrams (three fragments each way) and
+  extension-header TCP through NAT and DSR; the L3 DSR modes handle these packets by the same code
+  but are **not** covered by that selftest, and an IPv6 fragment that grows past the path MTU under
+  a tunnel is answered with a "packet too big" like any other packet.
+
+## L3 DSR (IP-in-IP and GRE)
+
+Plain `mode: dsr` rewrites the frame's MAC, so a backend must sit on the load balancer's own L2
+segment. **L3 DSR** lifts that: `mode: dsr-ipip` or `mode: dsr-gre` wraps each packet in a tunnel
+to the backend, which can be any number of routed hops away. The backend unwraps it and answers the
+client directly from the VIP, so replies still bypass the load balancer
+(`config/examples/l3-dsr.yaml`).
+
+```yaml
+tunnelSource: 198.51.100.1     # outer source; unset = the attached interface's own address
+vips:
+  - {address: 192.0.2.30, port: 443, protocol: tcp, mode: dsr-ipip,
+     backends: [{address: 10.20.0.11, port: 443}]}     # no mac: reached by address
+```
+
+- **IPv4 VIPs** get an IPv4 outer header (IP-in-IP, or GRE over IPv4); **IPv6 VIPs** get an IPv6
+  one (IPv6-in-IPv6, or GRE over IPv6). `tunnelSource` is the IPv4 source and `tunnelSource6` the
+  IPv6 one; each defaults to the attached interface's own address of that family. Start-up logs the
+  addresses in use. A tunnel VIP with no source to use is refused rather than sent unattributable.
+- **On each backend** you need a tunnel endpoint that accepts packets to its own address from any
+  remote (`ip tunnel add tun0 mode ipip local <backend-ip>`; `mode gre`; `ip -6 tunnel add ... mode
+  ip6ip6` or `ip6gre`), the VIP on `lo`, and reverse-path filtering off on the tunnel device.
+- **MTU.** The tunnelled packet is 20 bytes larger (24 with GRE, 40/44 for IPv6) and XDP cannot
+  fragment it. When a packet fits the client's path but not the load balancer's path to the backend,
+  the load balancer answers the client as a router would: "fragmentation needed" for an IPv4 packet
+  with DF set (which TCP's is), "packet too big" for IPv6, advertising the link's MTU less the tunnel
+  overhead, from the VIP. The client's path-MTU discovery then shrinks its segments and the connection
+  works (`selftest-l3dsr.sh` checks a 20000-byte transfer over a 1400-byte link, and the MTU the client
+  learns). Two cases are not covered: an IPv4 packet **without** DF (nothing can carry it, and it takes
+  the kernel-fallback path below), and a path where the smaller link is beyond the first hop (the
+  router there sends its own ICMP to the tunnel source, not to the client). Where you can, give the
+  path to the backends a larger MTU.
+- **How it is forwarded.** After encapsulation the outer header is routed with `bpf_fib_lookup`, and
+  the frame goes straight out of the egress interface, so the load balancer needs a route to the
+  backend and IP forwarding enabled. If the lookup cannot answer (next-hop neighbour not resolved
+  yet, a VLAN sub-interface, or too big for the egress MTU) the packet is handed to the kernel to
+  resolve and forward. The load balancer's own health probes to the backend keep the neighbour entry
+  warm, so this is the exception. That fallback path re-enters the load balancer's stack with one of
+  its own addresses as the source, which the kernel drops as a martian unless
+  `net.ipv4.conf.<if>.accept_local=1`; if you see the first packets to a backend vanish, that is why.
+- **Fragments, ICMP errors, VLANs and IP options** are handled as for the other modes (see above):
+  each fragment is tunnelled individually and the backend reassembles.
+- **Not supported:** GRE keys, checksums or sequence numbers, and VXLAN/Geneve. K8s-managed VIPs are
+  NAT-only, so these modes are for static configs. Changing `tunnelSource` needs a restart.
 
 ## Kubernetes Service semantics: session affinity and `externalTrafficPolicy`
 
@@ -493,10 +571,20 @@ What you take on when you enable it:
   it sounds: without it, the removed VIP's service ID is reused by the first VIP
   in the new config, and traffic still addressed to the removed VIP is answered
   by another VIP's backends. `scripts/selftest-adopt.sh` reproduces that on an
-  older build and passes on this one. **Not done with `-kubernetes`**: there the
-  reconcilers supply the VIPs after start-up, so there is nothing to reconcile
-  against yet, and a VIP whose Service was deleted while `rivorad` was down stays
-  programmed until its map entry is cleared.
+  older build and passes on this one.
+- **With `-kubernetes` the same recovery happens, but removal waits for the
+  reconcilers.** At start-up `rivorad` reads the pinned VIPs back (so nothing new
+  is given an ID a leftover still holds) and leaves them forwarding: most are still
+  wanted, and removing them at once would drop connections until the Service and
+  Gateway reconcilers caught up. Each is claimed as its Service or Gateway is
+  reconciled. Once both reconcilers have finished their first full pass, whatever
+  nothing claimed (a Service deleted while `rivorad` was down) is removed, and the log
+  says `removed VIPs left programmed by an earlier run that no Service or Gateway wants any more`.
+  If a Service keeps failing to reconcile, that pass never finishes; after two minutes
+  `rivorad` logs `not removing the VIPs recovered at start-up that nothing has claimed`
+  and removes nothing (one of them might belong to the failing Service), so fix the
+  Service and restart, or remove the entry by hand. Until a leftover is claimed,
+  `rivoractl` weight changes on it are refused with "not reconciled yet".
 - **Changing `interface` or dropping every `mode: nat` VIP leaves the old link
   attached.** The start-up log warns about persisted links this config no
   longer manages; run `rivorad -detach` to clear them.
