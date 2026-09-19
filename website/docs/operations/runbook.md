@@ -135,6 +135,68 @@ What a reload does **not** do:
 - It is **not available with `-kubernetes`**, where the Service/EndpointSlice
   reconcilers own the VIP set and there is no file to re-read.
 
+## Why is traffic being dropped, or not load-balanced?
+
+Each VIP counts, on the XDP path, why a packet it matched did not reach a
+backend. `rivora_vip_dropped_packets_total{vip,reason}` counts real drops:
+
+| `reason` | What it means | First thing to check |
+| --- | --- | --- |
+| `rate_limited` | A SYN exceeded the per-source `rateLimit`. | Is it an attack, or is the limit set too low for legitimate clients? Compare with the source addresses in your flow logs. |
+| `no_healthy_backend` | The VIP matched but every backend in its Maglev probe window is down or draining, so there was nowhere to send it. | `rivora_backend_healthy` for that VIP; the backends themselves, not `rivorad`. |
+
+`rivora_vip_unserved_packets_total{vip}` is deliberately **not** a drop. It counts
+packets that matched a VIP but could not be served (no service configuration or
+backend entry), so they were passed to the kernel stack instead of being
+load-balanced. A VIP that answers with a reset, or is reachable but skipping the
+load balancer, will show here. It should always be zero; a nonzero, rising value
+means the maps and the config disagree, so check `rivoractl vips` and restart or
+reload `rivorad`.
+
+The two drop reasons across all VIPs sum to the node-wide
+`rivora_dropped_packets_total`, so a gap between them would itself be a bug.
+Counters run from when the BPF maps were pinned, and a VIP that is removed and
+added back starts from zero.
+
+Suggested alerts:
+
+```yaml
+# A VIP is dropping because it has nothing to send to.
+- alert: RivoraVIPNoHealthyBackend
+  expr: sum by (vip) (rate(rivora_vip_dropped_packets_total{reason="no_healthy_backend"}[5m])) > 0
+  for: 2m
+# Traffic is matching a VIP but skipping the load balancer.
+- alert: RivoraVIPUnserved
+  expr: sum by (vip) (rate(rivora_vip_unserved_packets_total[5m])) > 0
+  for: 2m
+```
+
+## BGP session and route health
+
+With `bgp.enabled`, `rivorad` exports the speaker's state as `rivora_bgp_*`
+(the series are absent, not zero, when BGP is off):
+
+| Metric | Meaning |
+| --- | --- |
+| `rivora_bgp_peer_up{peer,asn}` | `1` when the session is ESTABLISHED. `0` means that peer is not receiving this node's VIP routes. A configured peer gobgp fails to report shows as `0`, not as missing. |
+| `rivora_bgp_peer_state_changes_total{peer}` | Session-state transitions since start. A rising value on a peer that is mostly up is a flapping session (or a BFD-detected drop). |
+| `rivora_bgp_advertised_routes{family}` | VIP host routes advertised right now (`ipv4` `/32`, `ipv6` `/128`). A VIP is advertised only while it has a healthy backend, so this dropping is the health-gating working. |
+| `rivora_bgp_route_update_errors_total{op}` | Failed `advertise`/`withdraw` attempts. A resync retries, so a value that stops rising was transient; one that keeps rising means routes are not reaching the peers. The usual cause is an IPv6 VIP with no `ipv6NextHop` configured. |
+
+```yaml
+- alert: RivoraBGPPeerDown
+  expr: rivora_bgp_peer_up == 0
+  for: 2m
+- alert: RivoraBGPPeerFlapping
+  expr: increase(rivora_bgp_peer_state_changes_total[10m]) > 4
+- alert: RivoraBGPRouteUpdatesFailing
+  expr: increase(rivora_bgp_route_update_errors_total[10m]) > 0
+```
+
+`peer_up == 0` for every peer while `rivora_backend_healthy` is `1` is a network
+or peer-side problem; `peer_up == 1` with `advertised_routes == 0` means the VIPs
+have no healthy backend.
+
 ## The flow tables are filling up
 
 `connection_affinity_map` (sticky per-flow backend choice) and `nat_reverse_map`

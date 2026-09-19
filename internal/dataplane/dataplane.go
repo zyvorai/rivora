@@ -74,10 +74,16 @@ type Status struct {
 	Backends   []BackendStatus `json:"backends"`
 	Packets    uint64          `json:"packets"`
 	Bytes      uint64          `json:"bytes"`
-	// Dropped is node-wide (stats_map's global slot isn't attributable to a
-	// specific VIP — some drops, like "no healthy backend", happen before
-	// backend/VIP-specific accounting), not this VIP's own drop count.
+	// Dropped is node-wide (stats_map's global slot), the sum of every VIP's
+	// drops, not this VIP's own count — the fields below are this VIP's own.
 	Dropped uint64 `json:"dropped"`
+
+	// This VIP's own drops by reason, plus packets that matched the VIP but
+	// bypassed the load balancer (drop_stats_map, summed across CPUs). Like the
+	// other counters they run from when the BPF maps were pinned.
+	DroppedRateLimited uint64 `json:"droppedRateLimited"` // SYNs over the per-source rate limit
+	DroppedNoBackend   uint64 `json:"droppedNoBackend"`   // no healthy backend in the probe window
+	Unserved           uint64 `json:"unserved"`           // XDP_PASS: VIP matched but couldn't be served
 }
 
 // serviceEntry is a node's live state for one VIP.
@@ -269,6 +275,9 @@ func (d *Dataplane) upsertVIPLocked(spec config.VIP) error {
 		}
 		entry = &serviceEntry{serviceID: id, backendIDs: map[string]uint32{}}
 		d.services[key] = entry
+		// drop_stats_map is pinned and outlives VIPs, so a freed ID may still
+		// carry the previous VIP's counts; a new VIP starts from zero.
+		d.resetDropStatsLocked(id)
 	}
 
 	vip := entry.applyWeightOverrides(spec)
@@ -653,6 +662,7 @@ func (d *Dataplane) removeVIPLocked(key string) error {
 	_ = d.vipMapDelete(entry.vip)
 	var zero bpfmaps.ServiceConfig
 	_ = d.dp.Maps[bpfmaps.MapServiceConfig].Update(&entry.serviceID, &zero, ebpf.UpdateAny)
+	d.resetDropStatsLocked(entry.serviceID)
 
 	if entry.extent.size > 0 {
 		d.maglevAlloc.Free(entry.extent)
@@ -822,6 +832,7 @@ func (d *Dataplane) Statuses() ([]Status, error) {
 
 	healthMap := d.dp.Maps[bpfmaps.MapBackendHealth]
 	statsMap := d.dp.Maps[bpfmaps.MapStats]
+	dropMap := d.dp.Maps[bpfmaps.MapDropStats] // nil for an object built before per-reason drops existed
 
 	var globalDropped uint64
 	if s, err := sumStats(statsMap, bpfmaps.StatsGlobalIdx); err == nil {
@@ -839,6 +850,13 @@ func (d *Dataplane) Statuses() ([]Status, error) {
 			Interface:  d.cfg.Interface,
 			StartedAt:  d.startedAt,
 			Dropped:    globalDropped,
+		}
+		if dropMap != nil {
+			if ds, err := sumDropStats(dropMap, entry.serviceID); err == nil {
+				st.DroppedRateLimited = ds.ByReason[bpfmaps.DropRateLimited]
+				st.DroppedNoBackend = ds.ByReason[bpfmaps.DropNoBackend]
+				st.Unserved = ds.ByReason[bpfmaps.Unserved]
+			}
 		}
 		weightByName := make(map[string]uint32, len(vip.Backends))
 		for _, b := range vip.Backends {
@@ -906,6 +924,36 @@ func healthStateName(v uint8) string {
 	default:
 		return "down"
 	}
+}
+
+// sumDropStats reads service id's per-CPU drop counters and sums them.
+func sumDropStats(m *ebpf.Map, id uint32) (bpfmaps.DropStats, error) {
+	var perCPU []bpfmaps.DropStats
+	if err := m.Lookup(&id, &perCPU); err != nil {
+		return bpfmaps.DropStats{}, err
+	}
+	var total bpfmaps.DropStats
+	for _, s := range perCPU {
+		for i := range total.ByReason {
+			total.ByReason[i] += s.ByReason[i]
+		}
+	}
+	return total, nil
+}
+
+// resetDropStatsLocked zeroes service id's drop counters on every CPU. A
+// PERCPU map takes one value per possible CPU on update. Best-effort, like the
+// other teardown writes: a failure leaves stale counts, not a broken dataplane.
+func (d *Dataplane) resetDropStatsLocked(id uint32) {
+	m := d.dp.Maps[bpfmaps.MapDropStats]
+	if m == nil {
+		return
+	}
+	n, err := ebpf.PossibleCPU()
+	if err != nil {
+		n = runtime.NumCPU()
+	}
+	_ = m.Update(&id, make([]bpfmaps.DropStats, n), ebpf.UpdateAny)
 }
 
 func sumStats(m *ebpf.Map, idx uint32) (bpfmaps.LBStats, error) {

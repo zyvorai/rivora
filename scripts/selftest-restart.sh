@@ -36,10 +36,13 @@ section() { echo ""; echo "=== $1 ==="; }
 
 # Both overridable so the test can run a freshly built binary without
 # installing it over a running rivorad service.
-RIVORAD="${RIVORAD:-$(command -v rivorad || echo "${ROOT}/bin/rivorad")}"
+# Prefer this checkout's build over anything installed system-wide, which may predate
+# the feature under test (see selftest-ratelimit.sh).
+RIVORAD="${RIVORAD:-${ROOT}/bin/rivorad}"
+[ -x "$RIVORAD" ] || RIVORAD="$(command -v rivorad || echo "$RIVORAD")"
 if [ -z "${BPF_DIR:-}" ]; then
-    BPF_DIR="/usr/local/share/rivora/bpf"
-    [ -f "${BPF_DIR}/xdp_ingress.o" ] || BPF_DIR="${ROOT}/bpf"
+    BPF_DIR="${ROOT}/bpf"
+    [ -f "${BPF_DIR}/xdp_ingress.o" ] || BPF_DIR="/usr/local/share/rivora/bpf"
 fi
 for f in "$RIVORAD" "${BPF_DIR}/xdp_ingress.o" "${BPF_DIR}/tc_nat.o"; do
     [ -e "$f" ] || { echo "missing: $f" >&2; exit 1; }

@@ -55,6 +55,13 @@ func New(dp *dataplane.Dataplane, apiKey string) *Server {
 	return &Server{dp: dp, admin: dp, apiKey: apiKey, registry: reg}
 }
 
+// RegisterBGP adds the rivora_bgp_* series to /metrics. Call it once, before the
+// server starts serving, and only when BGP is enabled: a node without BGP then
+// exposes no BGP series instead of a misleading set of zeros.
+func (s *Server) RegisterBGP(src metrics.BGPSource) {
+	s.registry.MustRegister(metrics.NewBGPCollector(src))
+}
+
 // MetricsHandler serves only /healthz, /readyz and /metrics — no console,
 // no /api/*. Meant for a second listener bound wider than the main API's
 // loopback-only address (see cmd/rivorad), since a hostNetwork Pod's

@@ -90,6 +90,16 @@ struct {
     __type(value, struct lb_stats);
 } stats_map SEC(".maps");
 
+/* Per-service drop/bypass counters, indexed by service_id. PERCPU so bumping
+ * needs no atomics; userspace sums across CPUs. A new map (not a change to
+ * stats_map), so an already-pinned deployment simply gains it on upgrade. */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 4096); /* bpfmaps.MaxVIPs */
+    __type(key, __u32); /* service_id */
+    __type(value, struct drop_stats);
+} drop_stats_map SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
@@ -144,6 +154,14 @@ struct {
     __type(key, struct addr6_key); /* source IPv6 address, network byte order */
     __type(value, struct rl_bucket);
 } rl_buckets_map6 SEC(".maps");
+
+static __always_inline void bump_drop(__u32 service_id, __u32 reason)
+{
+    struct drop_stats *d = bpf_map_lookup_elem(&drop_stats_map, &service_id);
+    if (!d || reason >= RIVORA_DROP_REASONS)
+        return;
+    d->by_reason[reason] += 1;
+}
 
 static __always_inline void bump_stats(__u32 idx, __u32 bytes, __u8 dropped)
 {
@@ -312,6 +330,7 @@ static __always_inline int handle_ipv4(struct xdp_md *ctx, void *data, void *dat
     __u32 *service_id = bpf_map_lookup_elem(&vip_map, &vk);
     if (!service_id)
         return XDP_PASS; /* not a VIP we own */
+    __u32 sid = *service_id;
 
     /* SYN-flood mitigation: only new-connection attempts (SYN packets)
      * consume a token — established connections' data packets and all UDP
@@ -320,12 +339,15 @@ static __always_inline int handle_ipv4(struct xdp_md *ctx, void *data, void *dat
      * (the default). */
     if (is_syn && rate_limit_exceeded(iph->saddr)) {
         bump_stats(RIVORA_STATS_GLOBAL, 0, 1);
+        bump_drop(sid, RIVORA_DROP_RATE_LIMITED);
         return XDP_DROP;
     }
 
     struct service_config *cfg = bpf_map_lookup_elem(&service_config_map, service_id);
-    if (!cfg || cfg->backend_count == 0 || cfg->maglev_size == 0)
+    if (!cfg || cfg->backend_count == 0 || cfg->maglev_size == 0) {
+        bump_drop(sid, RIVORA_UNSERVED);
         return XDP_PASS;
+    }
 
     struct conn_key ck = {
         .saddr = iph->saddr, .daddr = iph->daddr,
@@ -348,14 +370,17 @@ static __always_inline int handle_ipv4(struct xdp_md *ctx, void *data, void *dat
         __u32 local_slot = hash % cfg->maglev_size;
         if (pick_backend(cfg->maglev_offset, cfg->maglev_size, local_slot, &backend_id) < 0) {
             bump_stats(RIVORA_STATS_GLOBAL, 0, 1);
+            bump_drop(sid, RIVORA_DROP_NO_BACKEND);
             return XDP_DROP; /* no healthy backend within probe window */
         }
         bpf_map_update_elem(&connection_affinity_map, &ck, &backend_id, BPF_ANY);
     }
 
     struct backend_info *be = bpf_map_lookup_elem(&backend_map, &backend_id);
-    if (!be)
+    if (!be) {
+        bump_drop(sid, RIVORA_UNSERVED);
         return XDP_PASS;
+    }
 
     __u32 pkt_len = (__u32)(data_end - data);
     bump_stats(RIVORA_STATS_GLOBAL, pkt_len, 0);
@@ -463,15 +488,19 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
     __u32 *service_id = bpf_map_lookup_elem(&vip_map6, &vk);
     if (!service_id)
         return XDP_PASS; /* not a VIP we own */
+    __u32 sid = *service_id;
 
     if (is_syn && rate_limit_exceeded_v6((__u8 *)&iph->saddr)) {
         bump_stats(RIVORA_STATS_GLOBAL, 0, 1);
+        bump_drop(sid, RIVORA_DROP_RATE_LIMITED);
         return XDP_DROP;
     }
 
     struct service_config *cfg = bpf_map_lookup_elem(&service_config_map, service_id);
-    if (!cfg || cfg->backend_count == 0 || cfg->maglev_size == 0)
+    if (!cfg || cfg->backend_count == 0 || cfg->maglev_size == 0) {
+        bump_drop(sid, RIVORA_UNSERVED);
         return XDP_PASS;
+    }
 
     struct conn_key6 ck = {.sport = sport, .dport = dport, .proto = iph->nexthdr};
     __builtin_memcpy(ck.saddr, &iph->saddr, 16);
@@ -493,14 +522,17 @@ static __always_inline int handle_ipv6(struct xdp_md *ctx, void *data, void *dat
         __u32 local_slot = hash % cfg->maglev_size;
         if (pick_backend(cfg->maglev_offset, cfg->maglev_size, local_slot, &backend_id) < 0) {
             bump_stats(RIVORA_STATS_GLOBAL, 0, 1);
+            bump_drop(sid, RIVORA_DROP_NO_BACKEND);
             return XDP_DROP; /* no healthy backend within probe window */
         }
         bpf_map_update_elem(&connection_affinity_map6, &ck, &backend_id, BPF_ANY);
     }
 
     struct backend_info6 *be = bpf_map_lookup_elem(&backend_map6, &backend_id);
-    if (!be)
+    if (!be) {
+        bump_drop(sid, RIVORA_UNSERVED);
         return XDP_PASS;
+    }
 
     __u32 pkt_len = (__u32)(data_end - data);
     bump_stats(RIVORA_STATS_GLOBAL, pkt_len, 0);

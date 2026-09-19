@@ -162,6 +162,24 @@ struct lb_stats {
 };
 _Static_assert(sizeof(struct lb_stats) == 24, "lb_stats ABI");
 
+/* Why a packet for a matched VIP did not reach a backend, counted per service
+ * (indexed by service_id) in drop_stats_map so an operator can tell a SYN flood
+ * apart from a VIP with no healthy backends, and see which VIP it is. Both
+ * drop sites run after the VIP lookup, so the service is always known. Mirrors
+ * bpfmaps.Drop* on the Go side; append new reasons at the end and bump
+ * RIVORA_DROP_REASONS together with struct drop_stats and its Go mirror. */
+#define RIVORA_DROP_RATE_LIMITED 0 /* XDP_DROP: SYN over the per-source rate limit */
+#define RIVORA_DROP_NO_BACKEND   1 /* XDP_DROP: no healthy backend in the probe window */
+#define RIVORA_UNSERVED          2 /* XDP_PASS, not a drop: VIP matched but can't be
+                                    * served (no service config / backend entry), so
+                                    * the packet bypasses the load balancer */
+#define RIVORA_DROP_REASONS      3
+
+struct drop_stats {
+    __u64 by_reason[RIVORA_DROP_REASONS];
+};
+_Static_assert(sizeof(struct drop_stats) == 24, "drop_stats ABI");
+
 /* rl_config_map is a single-entry array: an opt-in on/off switch plus the
  * per-source-IP SYN token-bucket's rate/burst, written once at startup by
  * internal/dataplane. rate_per_sec/burst are already pre-divided by

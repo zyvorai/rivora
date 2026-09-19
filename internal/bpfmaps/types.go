@@ -17,6 +17,7 @@ const (
 	MapNATReverse         = "nat_reverse_map"
 	MapIfaceMAC           = "iface_mac_map"
 	MapStats              = "stats_map"
+	MapDropStats          = "drop_stats_map"
 	MapRateLimitConfig    = "rl_config_map"
 	MapRateLimitBuckets   = "rl_buckets_map"
 
@@ -79,6 +80,22 @@ type BackendInfo struct {
 	Addr uint32
 	Port uint16
 	Mac  [6]byte
+}
+
+// Per-service drop/bypass reasons, the indices into DropStats.ByReason. Mirror
+// RIVORA_DROP_* / RIVORA_UNSERVED in bpf/rivora_common.h; append new reasons at
+// the end and bump DropReasons with the C struct.
+const (
+	DropRateLimited = 0 // XDP_DROP: SYN over the per-source rate limit
+	DropNoBackend   = 1 // XDP_DROP: no healthy backend within the probe window
+	Unserved        = 2 // XDP_PASS, not a drop: VIP matched but couldn't be served
+	DropReasons     = 3
+)
+
+// DropStats — struct drop_stats. 24 bytes. drop_stats_map is a PERCPU_ARRAY
+// indexed by service_id; read as a per-CPU slice and summed.
+type DropStats struct {
+	ByReason [DropReasons]uint64
 }
 
 // ConnKey — struct conn_key. 16 bytes.

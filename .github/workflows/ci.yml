@@ -223,3 +223,5 @@ jobs:
       run: sudo bash scripts/selftest-restart.sh
     - name: Restart reconciliation selftest (stale VIPs, shifted IDs, veth/netns)
       run: sudo bash scripts/selftest-adopt.sh
+    - name: Drop-reason counters selftest (rate limit, no backend, unserved, veth/netns)
+      run: sudo bash scripts/selftest-drops.sh

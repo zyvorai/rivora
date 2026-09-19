@@ -377,6 +377,9 @@ func main() {
 	selfSigned := os.Getenv("RIVORA_TLS_SELF_SIGNED") != ""
 
 	apiServer := api.New(plane, apiKey)
+	if bgpSpeaker != nil {
+		apiServer.RegisterBGP(bgpSpeaker)
+	}
 
 	// metricsSrv is deliberately separate from the (loopback-only, optionally
 	// TLS'd/authenticated) API server above: rivorad runs hostNetwork, so
