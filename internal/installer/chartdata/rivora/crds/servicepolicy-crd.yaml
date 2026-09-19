@@ -105,3 +105,16 @@ spec:
                         type: integer
                         minimum: 1
                         maximum: 1000
+                bgp:
+                  type: object
+                  description: How this Service's VIP is advertised over BGP (needs rivorad's BGP speaker).
+                  properties:
+                    communities:
+                      type: array
+                      items:
+                        type: string
+                        pattern: '^(no-export|no-advertise|no-export-subconfed|[0-9]{1,5}:[0-9]{1,5})$'
+                      description: >-
+                        Communities added to the route advertised for this Service's VIPs, on
+                        top of the speaker's own ("65000:100", or no-export, no-advertise,
+                        no-export-subconfed).

@@ -8,6 +8,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"reflect"
 	"strconv"
@@ -89,6 +90,9 @@ type VIP struct {
 	// follows the node-wide rateLimit; set, it replaces that limit for this VIP,
 	// whether or not the node-wide one is enabled.
 	RateLimit VIPRateLimit `yaml:"rateLimit,omitempty"`
+	// BGPCommunities are added to the BGP route advertised for this VIP (see BGP.Communities),
+	// for example to tag an anycast VIP for a different upstream policy.
+	BGPCommunities []string `yaml:"bgpCommunities,omitempty"`
 }
 
 // VIPRateLimit is a per-source-IP token bucket on one VIP's new TCP connections
@@ -311,6 +315,28 @@ type BGP struct {
 	// routerId stays the BGP identifier and IPv4 next-hop (always IPv4).
 	IPv6NextHop string    `yaml:"ipv6NextHop,omitempty"`
 	Peers       []BGPPeer `yaml:"peers"`
+
+	// Communities are attached to every route this speaker originates: "65000:100" style
+	// (both halves 0-65535) or the well-known names no-export, no-advertise and
+	// no-export-subconfed. A VIP's own bgpCommunities are added to these for that VIP's route.
+	Communities []string `yaml:"communities,omitempty"`
+	// LocalPref sets the LOCAL_PREF attribute on originated routes. It is only carried to iBGP
+	// peers (peers in this speaker's own AS); an eBGP peer never receives it. Unset sends none.
+	LocalPref *uint32 `yaml:"localPref,omitempty"`
+	// Aggregates advertise a covering prefix (say a /24 of VIPs) while at least one VIP inside it
+	// has a healthy backend, and withdraw it when none does.
+	Aggregates []BGPAggregate `yaml:"aggregates,omitempty"`
+}
+
+// BGPAggregate is a prefix advertised in place of, or alongside, the /32 (/128) host routes of the
+// VIPs it covers.
+type BGPAggregate struct {
+	Prefix string `yaml:"prefix"`
+	// SuppressSpecifics stops the covered VIPs' host routes being advertised while this aggregate
+	// is. Off, the aggregate is advertised in addition to them.
+	SuppressSpecifics bool `yaml:"suppressSpecifics,omitempty"`
+	// Communities are attached to the aggregate route (on top of the global ones).
+	Communities []string `yaml:"communities,omitempty"`
 }
 
 type BGPPeer struct {
@@ -320,6 +346,102 @@ type BGPPeer struct {
 	// for sub-second down detection, instead of relying solely on BGP's
 	// own (much slower) hold-timer expiry.
 	BFD bool `yaml:"bfd,omitempty"`
+
+	// Password enables TCP MD5 authentication (RFC 2385) on the session; the peer must be
+	// configured with the same one. PasswordFile reads it from a file instead (a mounted Secret),
+	// so it need not sit in a config that gets committed or logged. Set one or neither.
+	Password     string `yaml:"password,omitempty"`
+	PasswordFile string `yaml:"passwordFile,omitempty"`
+	// Multihop is the TTL for an eBGP session to a peer more than one hop away, 2-255. Unset
+	// keeps the default, where an eBGP peer must be directly connected.
+	Multihop uint32 `yaml:"multihop,omitempty"`
+	// GracefulRestart negotiates BGP graceful restart (RFC 4724) so the peer keeps forwarding to
+	// this node's routes for RestartTime seconds if the session drops, instead of withdrawing them
+	// at once: a rivorad restart then does not black-hole its VIPs.
+	GracefulRestart *BGPGracefulRestart `yaml:"gracefulRestart,omitempty"`
+	// Nodes limits the peer to the named nodes (by -node-name / hostname). Unset applies it
+	// everywhere, so one shared config can give each node its own top-of-rack peer.
+	Nodes []string `yaml:"nodes,omitempty"`
+}
+
+// BGPGracefulRestart configures graceful restart on one peer.
+type BGPGracefulRestart struct {
+	Enabled bool `yaml:"enabled"`
+	// RestartTime is how long, in seconds, the peer should hold this node's routes while it
+	// restarts. Default 120; at most 4095 (the protocol's 12-bit field).
+	RestartTime uint32 `yaml:"restartTime,omitempty"`
+}
+
+// Well-known BGP communities (RFC 1997 and RFC 8326-era names) accepted by name.
+var wellKnownCommunities = map[string]uint32{
+	"no-export":           0xFFFFFF01,
+	"no-advertise":        0xFFFFFF02,
+	"no-export-subconfed": 0xFFFFFF03,
+}
+
+// ParseCommunities converts "asn:value" (both 0-65535) and well-known names to their 32-bit
+// values, in order. It is the single parser for every place a community is written.
+func ParseCommunities(in []string) ([]uint32, error) {
+	out := make([]uint32, 0, len(in))
+	for _, c := range in {
+		c = strings.TrimSpace(c)
+		if v, ok := wellKnownCommunities[strings.ToLower(c)]; ok {
+			out = append(out, v)
+			continue
+		}
+		a, b, ok := strings.Cut(c, ":")
+		hi, err1 := strconv.ParseUint(a, 10, 16)
+		lo, err2 := strconv.ParseUint(b, 10, 16)
+		if !ok || err1 != nil || err2 != nil {
+			return nil, fmt.Errorf("community %q: want asn:value (0-65535 each) or one of no-export, no-advertise, no-export-subconfed", c)
+		}
+		out = append(out, uint32(hi)<<16|uint32(lo))
+	}
+	return out, nil
+}
+
+// ForNode returns b with only the peers that apply to node: a peer with no Nodes applies
+// everywhere, one with Nodes only on those. With no node name known, a peer restricted to
+// particular nodes is left out rather than guessed at.
+func (b BGP) ForNode(node string) BGP {
+	out := b
+	out.Peers = nil
+	for _, p := range b.Peers {
+		if len(p.Nodes) == 0 {
+			out.Peers = append(out.Peers, p)
+			continue
+		}
+		for _, n := range p.Nodes {
+			if node != "" && n == node {
+				out.Peers = append(out.Peers, p)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// validateOptions checks a peer's optional settings. localASN is this speaker's own AS: multihop is an
+// eBGP setting, so it is refused on a peer in the same AS.
+func (p BGPPeer) validateOptions(localASN uint32) error {
+	if p.Password != "" && p.PasswordFile != "" {
+		return fmt.Errorf("set password or passwordFile, not both")
+	}
+	if len(p.Password) > 80 {
+		return fmt.Errorf("password is longer than the 80 bytes TCP MD5 allows")
+	}
+	if p.Multihop != 0 {
+		if p.Multihop < 2 || p.Multihop > 255 {
+			return fmt.Errorf("multihop %d: must be 2-255 (leave it unset for a directly connected peer)", p.Multihop)
+		}
+		if p.ASN == localASN {
+			return fmt.Errorf("multihop applies to eBGP; this peer is in the same AS (%d)", p.ASN)
+		}
+	}
+	if g := p.GracefulRestart; g != nil && g.RestartTime > 4095 {
+		return fmt.Errorf("gracefulRestart.restartTime %d: at most 4095 seconds", g.RestartTime)
+	}
+	return nil
 }
 
 // Validate checks b in isolation — reused both by Config.Validate() for
@@ -353,6 +475,20 @@ func (b BGP) Validate() error {
 		}
 		if p.ASN == 0 {
 			return fmt.Errorf("bgp peer %s: asn must be > 0", p.Address)
+		}
+		if err := p.validateOptions(b.ASN); err != nil {
+			return fmt.Errorf("bgp peer %s: %w", p.Address, err)
+		}
+	}
+	if _, err := ParseCommunities(b.Communities); err != nil {
+		return fmt.Errorf("bgp: %w", err)
+	}
+	for _, a := range b.Aggregates {
+		if _, err := netip.ParsePrefix(a.Prefix); err != nil {
+			return fmt.Errorf("bgp aggregate %q: not a valid prefix: %w", a.Prefix, err)
+		}
+		if _, err := ParseCommunities(a.Communities); err != nil {
+			return fmt.Errorf("bgp aggregate %s: %w", a.Prefix, err)
 		}
 	}
 	return nil
@@ -626,6 +762,9 @@ func (c Config) Validate() error {
 		if err := v.RateLimit.Validate(); err != nil {
 			return fmt.Errorf("vip %s:%d: %w", v.Address, v.Port, err)
 		}
+		if _, err := ParseCommunities(v.BGPCommunities); err != nil {
+			return fmt.Errorf("vip %s:%d: bgpCommunities: %w", v.Address, v.Port, err)
+		}
 		vipIsV4 := vipIP.To4() != nil
 		for _, b := range v.Backends {
 			beIP := net.ParseIP(b.Address)
@@ -756,4 +895,26 @@ func (c Config) validateTunnelSources() error {
 		}
 	}
 	return nil
+}
+
+// LoadBGP reads a YAML file whose top-level bgp: section is a BGP block (the same schema as the
+// static config's) and returns it enabled and validated. It exists so a Kubernetes deployment can
+// mount BGP settings, including peer passwords, from a Secret instead of putting them on a command
+// line.
+func LoadBGP(path string) (BGP, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return BGP{}, fmt.Errorf("read bgp config: %w", err)
+	}
+	var doc struct {
+		BGP BGP `yaml:"bgp"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return BGP{}, fmt.Errorf("parse bgp config: %w", err)
+	}
+	doc.BGP.Enabled = true
+	if err := doc.BGP.Validate(); err != nil {
+		return BGP{}, err
+	}
+	return doc.BGP, nil
 }
