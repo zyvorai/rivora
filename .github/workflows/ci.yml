@@ -219,3 +219,5 @@ jobs:
       run: sudo bash scripts/selftest-ipv6.sh
     - name: NDP speaker selftest (veth)
       run: sudo bash scripts/selftest-ndp.sh
+    - name: Restart selftest (persisted datapath, veth/netns)
+      run: sudo bash scripts/selftest-restart.sh

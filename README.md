@@ -78,8 +78,9 @@ programs and owns its own maps under `/sys/fs/bpf/rivora-lb`.
   `rivoractl drain|undrain ID` and `rivoractl weight ID N` (see the
   [runbook](website/docs/operations/runbook.md)); `rivoractl validate FILE`
   checks a static config offline, and `systemctl reload rivorad` (SIGHUP)
-  applies an edited config's VIP set live. `rivorad` and `rivora-controller`
-  take `-log-level` and `-log-format text|json`.
+  applies an edited config's VIP set live. `rivorad -persist-datapath` keeps
+  the datapath attached across restarts (no traffic gap; see the runbook).
+  `rivorad` and `rivora-controller` take `-log-level` and `-log-format text|json`.
 - **`rivora-doctor`** (`cmd/rivora-doctor`) — standalone host-readiness
   checker: bpffs mounted, kernel new enough for TCX, build tools present.
   `--json`, `--strict`, exit 0/2 — same shape as netra's doctor tool.

@@ -49,6 +49,9 @@ func main() {
 		logLevel   = flag.String("log-level", "info", "log level: debug, info, warn or error")
 		logFormat  = flag.String("log-format", "text", "log format: text or json")
 
+		persistDatapath = flag.Bool("persist-datapath", false, "pin the XDP/TCX links so the datapath keeps forwarding while rivorad is down, and hot-swap the program on the next start (no traffic gap on restart). The datapath then stays attached after rivorad exits — use -detach to remove it")
+		detach          = flag.Bool("detach", false, "remove datapath links left attached by a -persist-datapath run, then exit (maps are kept)")
+
 		kubeMode      = flag.Bool("kubernetes", false, "run the Kubernetes reconciler + ARP speaker instead of loading -config; VIPs come from Service/EndpointSlice")
 		kubeconfig    = flag.String("kubeconfig", "", "path to a kubeconfig file (default: in-cluster config, falling back to $KUBECONFIG / ~/.kube/config); only used with -kubernetes")
 		ifaceFlag     = flag.String("interface", "", "network interface to attach to (required with -kubernetes; static-YAML mode reads this from -config instead)")
@@ -87,6 +90,16 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "rivorad:", err)
 		os.Exit(2)
+	}
+
+	if *detach {
+		removed, err := loader.DetachPersisted()
+		if err != nil {
+			logger.Error("detach persisted datapath", "err", err, "removed", removed)
+			os.Exit(1)
+		}
+		logger.Info("detached persisted datapath", "links", removed)
+		return
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -175,6 +188,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer dp.Close()
+	dp.Persist = *persistDatapath
 
 	if err := dp.AttachXDP(iface); err != nil {
 		logger.Error("attach xdp", "err", err)
@@ -187,6 +201,17 @@ func main() {
 		}
 	}
 	logger.Info("attached", "interface", cfg.Interface, "vips", len(cfg.VIPs), "nat_egress", natObj != "")
+	if dp.Persist {
+		// "swapped" are links whose running program was replaced in place
+		// (no detach, no gap); anything else was attached fresh this start.
+		logger.Info("datapath persistence on: links are pinned and will keep forwarding if rivorad exits; run rivorad -detach to remove them",
+			"hot_swapped", dp.Swapped)
+		if orphans, err := dp.OrphanedLinks(); err != nil {
+			logger.Warn("could not list persisted links", "err", err)
+		} else if len(orphans) > 0 {
+			logger.Warn("persisted links from an earlier run are still attached but not managed by this config (interface or NAT mode changed?); they keep forwarding until removed with rivorad -detach", "links", orphans)
+		}
+	}
 
 	plane := dataplane.New(cfg, dp)
 	if err := plane.Apply(iface); err != nil {

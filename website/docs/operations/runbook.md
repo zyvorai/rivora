@@ -162,6 +162,47 @@ process's XDP/TCX attachment briefly detaching during the restart window
 — expect a short blip for existing full-NAT flows, not for DSR (backend
 owns the reply path) or for new connections after the daemon comes back.
 
+### Restarting without a traffic gap (opt-in)
+
+By default the XDP/TCX links belong to `rivorad`'s own file descriptors, so the
+kernel detaches them when it exits and the VIP is unowned until the new process
+has started, loaded and re-attached: on an idle test host that is a few dozen
+milliseconds of refused connections, and longer on a busy or slow node.
+
+Start `rivorad` with `-persist-datapath` to close that gap. It pins each link
+under `/sys/fs/bpf/rivora-lb/links/`, so the attached program keeps forwarding
+(against the pinned maps) while `rivorad` is down, and the next start swaps its
+own program into the existing link in place instead of detaching and
+re-attaching. The start-up log says which links were `hot_swapped`. With
+systemd, put `RIVORAD_ARGS=-persist-datapath` in `/etc/rivora/rivorad.env`.
+
+`scripts/selftest-restart.sh` measures this: it restarts `rivorad` under a
+steady stream of connections and compares a control run (the default) against a
+persisted one. On the reference host the control run drops a handful of
+connections per restart and the persisted run drops none.
+
+What you take on when you enable it:
+
+- **It keeps forwarding after `rivorad` exits.** `systemctl stop rivorad` no
+  longer takes the VIP down. To actually remove the datapath, run
+  `rivorad -detach` (it removes the pinned links and leaves the maps).
+- **Nothing is health-checking while `rivorad` is down.** Backend health is
+  frozen at its last value, so a backend that dies during the restart window
+  still receives new flows until the new process probes it.
+- **State is whatever the maps held.** The new process re-applies its config on
+  top of the pinned maps, exactly as a default restart does, and the same
+  compatibility rule holds: a `rivorad` whose BPF maps changed shape won't load
+  against maps from an older version. Read the release notes before upgrading
+  across such a change.
+- **A VIP you removed from the config while `rivorad` was down stays
+  programmed.** The maps are reused and nothing sweeps entries that are no
+  longer configured at start-up (this is true of a default restart too; a
+  persisted datapath just keeps serving it in the meantime). Removing a VIP
+  with the daemon running (edit and reload) does clean up.
+- **Changing `interface` or dropping every `mode: nat` VIP leaves the old link
+  attached.** The start-up log warns about persisted links this config no
+  longer manages; run `rivorad -detach` to clear them.
+
 A `helm upgrade`/pod restart on the DaemonSet follows the same path — one
 node at a time (`kubectl rollout status daemonset/<name>-rivorad`), never
 all nodes simultaneously, so surviving nodes keep serving each VIP
