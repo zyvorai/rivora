@@ -18,6 +18,8 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+
+	"github.com/zyvorai/rivora/internal/config"
 )
 
 const PinDir = "/sys/fs/bpf/rivora-lb"
@@ -41,6 +43,14 @@ type Datapath struct {
 	// detaching and re-attaching. Off by default because a persisted datapath
 	// keeps forwarding after rivorad exits until DetachPersisted is called.
 	Persist bool
+
+	// XDPMode is the attach mode to request (set before AttachXDP; empty means
+	// generic). XDPActive is the mode actually in use afterwards, which differs
+	// from the request only for auto, when native wasn't available: then
+	// XDPFallback holds why, for the caller to log.
+	XDPMode     config.XDPMode
+	XDPActive   config.XDPMode
+	XDPFallback error
 
 	// Swapped names the links (e.g. "xdp-eth0") whose already-attached program
 	// was replaced in place by this run rather than attached fresh — the
@@ -140,18 +150,141 @@ func (d *Datapath) AttachXDP(iface *net.Interface) error {
 	if !ok {
 		return fmt.Errorf("program rivora_xdp_ingress not found in object")
 	}
-	name := "xdp-" + iface.Name
-	return d.attachOrSwap(name, prog, func() (link.Link, error) {
-		lnk, err := link.AttachXDP(link.XDPOptions{
-			Program:   prog,
-			Interface: iface.Index,
-			Flags:     link.XDPGenericMode,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("attach xdp to %s: %w", iface.Name, err)
+	req := d.XDPMode.Effective()
+	present := map[config.XDPMode]bool{}
+	names, _ := PersistedLinks()
+	for _, m := range xdpModes {
+		for _, n := range names {
+			if n == xdpPinName(m, iface.Name) {
+				present[m] = true
+			}
 		}
-		return lnk, nil
-	})
+	}
+	plan := planXDP(d.Persist, req, present)
+
+	// Adopt a link a previous run left pinned: swap the program in place, no
+	// detach. Only a link in a mode this run wants is a candidate; and only one
+	// mode can be attached to an interface at a time, so anything else pinned
+	// for it is removed once a link is adopted.
+	for _, m := range plan.adopt {
+		old, err := link.LoadPinnedLink(filepath.Join(PinDir, linkPinSubdir, xdpPinName(m, iface.Name)), nil)
+		if err != nil {
+			continue
+		}
+		if uerr := old.Update(prog); uerr != nil {
+			// Dead (its interface was recreated) or refuses this program.
+			_ = old.Unpin()
+			_ = old.Close()
+			continue
+		}
+		d.links = append(d.links, old)
+		d.pinned = append(d.pinned, xdpPinName(m, iface.Name))
+		d.Swapped = append(d.Swapped, xdpPinName(m, iface.Name))
+		d.XDPActive = m
+		dropXDPPins(iface.Name, m)
+		return nil
+	}
+
+	// Nothing adopted: whatever is still pinned for this interface is stale, in
+	// the wrong mode, or (without Persist) not wanted. It must go before a fresh
+	// attach, or the kernel refuses with "already attached" / mode conflict.
+	dropXDPPins(iface.Name, "")
+
+	var lastErr error
+	for i, m := range plan.fresh {
+		lnk, err := link.AttachXDP(link.XDPOptions{Program: prog, Interface: iface.Index, Flags: xdpFlags(m)})
+		if err != nil {
+			lastErr = fmt.Errorf("attach xdp to %s in %s mode: %w", iface.Name, m, err)
+			if m == config.XDPNative && req == config.XDPNative {
+				lastErr = fmt.Errorf("%w (the driver for %s may not support native XDP; use xdpMode: auto to fall back to generic)", lastErr, iface.Name)
+			}
+			if i < len(plan.fresh)-1 {
+				d.XDPFallback = lastErr // auto: native failed, generic is next
+			}
+			continue
+		}
+		if d.Persist {
+			path := filepath.Join(PinDir, linkPinSubdir, xdpPinName(m, iface.Name))
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				_ = lnk.Close()
+				return fmt.Errorf("mkdir link pin dir: %w", err)
+			}
+			if err := lnk.Pin(path); err != nil {
+				_ = lnk.Close()
+				return fmt.Errorf("pin xdp link: %w", err)
+			}
+			d.pinned = append(d.pinned, xdpPinName(m, iface.Name))
+		}
+		d.links = append(d.links, lnk)
+		d.XDPActive = m
+		return nil
+	}
+	return lastErr
+}
+
+// xdpModes are the concrete attach modes (auto is a policy, not a mode).
+var xdpModes = []config.XDPMode{config.XDPNative, config.XDPGeneric}
+
+// xdpPinName names the pinned XDP link for iface in a mode. The mode is part of
+// the name because a link's mode is fixed at attach time and the kernel allows
+// only one mode per interface: a mode change must be seen as a different link,
+// not swapped into the old one.
+func xdpPinName(mode config.XDPMode, ifname string) string {
+	return "xdp-" + string(mode) + "-" + ifname
+}
+
+func xdpFlags(mode config.XDPMode) link.XDPAttachFlags {
+	if mode == config.XDPNative {
+		return link.XDPDriverMode
+	}
+	return link.XDPGenericMode
+}
+
+// dropXDPPins unpins every XDP link for ifname except keep ("" keeps none),
+// which detaches them.
+func dropXDPPins(ifname string, keep config.XDPMode) {
+	for _, m := range xdpModes {
+		if m == keep {
+			continue
+		}
+		dropPinnedLink(filepath.Join(PinDir, linkPinSubdir, xdpPinName(m, ifname)))
+	}
+}
+
+// xdpPlan is how AttachXDP should bring the link up: pinned links to try
+// adopting, in preference order, then modes to attach fresh, in preference
+// order, until one works.
+type xdpPlan struct {
+	adopt []config.XDPMode
+	fresh []config.XDPMode
+}
+
+// planXDP decides the plan without touching the kernel. present is which modes
+// currently have a pinned link for the interface. Auto tries native then
+// generic, but if only a generic link is pinned it keeps it rather than
+// retrying native on every restart: that would force a detach (a traffic gap)
+// each time just to fail the same way. Only a link in a mode the request allows
+// is ever adopted; a pinned link in another mode is not swapped into (it can't
+// change mode), which is what makes a mode change a deliberate one-off gap.
+func planXDP(persist bool, req config.XDPMode, present map[config.XDPMode]bool) xdpPlan {
+	var order []config.XDPMode
+	switch req.Effective() {
+	case config.XDPNative:
+		order = []config.XDPMode{config.XDPNative}
+	case config.XDPAuto:
+		order = []config.XDPMode{config.XDPNative, config.XDPGeneric}
+	default:
+		order = []config.XDPMode{config.XDPGeneric}
+	}
+	plan := xdpPlan{fresh: order}
+	if persist {
+		for _, m := range order {
+			if present[m] {
+				plan.adopt = append(plan.adopt, m)
+			}
+		}
+	}
+	return plan
 }
 
 // AttachTCXEgress attaches the reverse-NAT program on iface's egress path.

@@ -30,6 +30,14 @@ rivorad:
   # isn't supported in v0.2; pin the DaemonSet to matching nodes via
   # nodeSelector if needed).
   interface: ""
+  # xdpMode is how the XDP program attaches to that interface:
+  #   generic  works on any interface, but runs after the driver and forgoes most
+  #            of XDP's speed. The default, so nothing changes unless you opt in.
+  #   native   runs in the NIC driver: much faster, needs driver support, and
+  #            rivorad refuses to start (rather than run slowly) if it's missing.
+  #   auto     try native, fall back to generic with a logged warning.
+  # Check `ip -d link show <iface>`: "xdp" means native, "xdpgeneric" generic.
+  xdpMode: generic
   bpfDir: /usr/local/share/rivora/bpf
   # loadBalancerClass must match controller.loadBalancerClass — both sides
   # need to agree on which Services they manage. "" manages every
@@ -40,13 +48,30 @@ rivorad:
   # Requires CAP_NET_RAW (already granted below); disable only if something
   # else on the cluster already owns ARP/NDP for these VIPs.
   speaker: true
+  # Kubernetes Service semantics, by mode:
+  #  - sessionAffinity: ClientIP is honoured always: a client's connections all go to
+  #    one backend while the backend set is stable (the Service's timeoutSeconds is
+  #    not honoured; there is no timer).
+  #  - externalTrafficPolicy: Local is honoured ONLY with bgp.enabled=true AND
+  #    speaker=false. The L2 speaker answers ARP/NDP from one elected node whether or
+  #    not it runs the Service's pods, so honouring Local there could blackhole it; in
+  #    that case Local is treated as Cluster (with a once-per-Service warning in the
+  #    log). Cluster and Local both preserve the client address, since the NAT only
+  #    rewrites the destination.
 
   # apiKey/tls configure rivorad's local HTTP API the same way the
   # standalone systemd deployment does (see README.md#securing-the-api) —
   # wired into a Secret rather than inlined directly into the DaemonSet
   # spec. The API listens on 127.0.0.1 only, so these mostly matter if
   # something in-Pod besides rivoractl needs to reach it.
+  # apiKey is the admin bearer token; being set is what turns authentication on.
+  # It may be a comma-separated list, which is how a key is rotated with no outage:
+  # add the new key, move clients over, then remove the old one. (On the command
+  # line, escape the comma or helm splits it: --set 'rivorad.apiKey=new\,old'.)
   apiKey: ""
+  # apiReadOnlyKey may read the API but not change anything (drain, weight). It
+  # needs apiKey to be set too; rivorad refuses to start otherwise. Also a list.
+  apiReadOnlyKey: ""
   tls:
     selfSigned: false
     cert: ""

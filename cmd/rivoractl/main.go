@@ -33,7 +33,11 @@ Options:
   --vip KEY           weight: only change this VIP (addr:port:proto, e.g. 10.0.0.1:80:tcp);
                       default is every VIP that uses the backend
   --api-key KEY       Bearer token (default: $RIVORA_API_KEY)
-  --tls-insecure      Accept rivorad's self-signed cert (default: $RIVORA_TLS_INSECURE)
+  --ca-file FILE      Verify rivorad's certificate against this PEM (the certificate it was
+                      started with via RIVORA_TLS_CERT, or its CA); default: $RIVORA_CA_FILE.
+                      Implies https. Preferred over --tls-insecure.
+  --tls-insecure      Skip certificate verification (rivorad's ephemeral self-signed cert);
+                      default: $RIVORA_TLS_INSECURE. Implies https.
 
 Backend IDs come from 'rivoractl backends'. Drain and weight changes are live
 and are not persisted: they survive Kubernetes reconciles but not a rivorad
@@ -54,6 +58,8 @@ func main() {
 	vipKey := ""
 	apiKey := os.Getenv("RIVORA_API_KEY")
 	tlsInsecure := os.Getenv("RIVORA_TLS_INSECURE") != ""
+	insecureFlag := false // --tls-insecure given explicitly, as opposed to via the environment
+	caFile := os.Getenv("RIVORA_CA_FILE")
 	rest := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -78,7 +84,12 @@ func main() {
 				vipKey = args[i]
 			}
 		case "--tls-insecure":
-			tlsInsecure = true
+			tlsInsecure, insecureFlag = true, true
+		case "--ca-file":
+			i++
+			if i < len(args) {
+				caFile = args[i]
+			}
 		default:
 			rest = append(rest, args[i])
 		}
@@ -86,7 +97,23 @@ func main() {
 	if apiAddr == "" {
 		apiAddr = "127.0.0.1:9870"
 	}
-	client := apiclient.New(apiAddr, apiclient.Options{APIKey: apiKey, TLSInsecure: tlsInsecure})
+	opts := apiclient.Options{APIKey: apiKey, TLSInsecure: tlsInsecure}
+	if caFile != "" {
+		// Saying both on the command line is a contradiction (verify against this CA,
+		// and also don't verify). An insecure setting that only came from the
+		// environment is not: the CA wins, as it always does in the client.
+		if insecureFlag {
+			fmt.Fprintln(os.Stderr, "error: --ca-file and --tls-insecure contradict each other; use one")
+			os.Exit(1)
+		}
+		pool, err := apiclient.LoadCAFile(caFile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		opts.RootCAs = pool
+	}
+	client := apiclient.New(apiAddr, opts)
 
 	var err error
 	switch cmd {
