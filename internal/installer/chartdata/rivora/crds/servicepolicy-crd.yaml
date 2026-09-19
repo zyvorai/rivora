@@ -1,0 +1,127 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: servicepolicies.rivora.zyvor.dev
+spec:
+  group: rivora.zyvor.dev
+  scope: Namespaced
+  names:
+    plural: servicepolicies
+    singular: servicepolicy
+    kind: ServicePolicy
+    shortNames:
+      - rsp
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: Service
+          type: string
+          jsonPath: .spec.targetRef.name
+        - name: Probe
+          type: string
+          jsonPath: .spec.healthCheck.type
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [targetRef]
+              description: >-
+                Tunes how Rivora load-balances one Service. Settings left out
+                keep their defaults. If several policies target the same
+                Service, the oldest applies and the rest are ignored.
+              properties:
+                targetRef:
+                  type: object
+                  required: [name]
+                  properties:
+                    kind:
+                      type: string
+                      enum: [Service]
+                      default: Service
+                    name:
+                      type: string
+                      minLength: 1
+                      description: A Service in this policy's namespace.
+                healthCheck:
+                  type: object
+                  description: Replaces the default TCP-connect probe for this Service's endpoints.
+                  properties:
+                    type:
+                      type: string
+                      enum: [tcp, http]
+                      default: tcp
+                    port:
+                      type: integer
+                      minimum: 0
+                      maximum: 65535
+                      description: Probe this port instead of the endpoint's service port (0 = the service port).
+                    path:
+                      type: string
+                      description: HTTP only. Must start with "/" (default "/").
+                    host:
+                      type: string
+                      description: HTTP only. Host header (default is the endpoint address).
+                    expectStatus:
+                      type: string
+                      description: HTTP only. "200" or "200-299" (default "200-399").
+                rateLimit:
+                  type: object
+                  required: [perSourcePacketsPerSecond, burst]
+                  description: >-
+                    Per-source-address cap on new TCP connections (SYN packets)
+                    to this Service's VIPs. Replaces the node-wide limit for
+                    them. Established connections and UDP are not affected.
+                  properties:
+                    perSourcePacketsPerSecond:
+                      type: integer
+                      format: int64
+                      minimum: 1
+                    burst:
+                      type: integer
+                      format: int64
+                      minimum: 1
+                weights:
+                  type: object
+                  description: >-
+                    Each endpoint's share of new connections. An endpoint's
+                    weight is the entry for its node, else default, else 1.
+                    Weights are relative: 2 gets twice the connections of 1.
+                  properties:
+                    default:
+                      type: integer
+                      minimum: 1
+                      maximum: 1000
+                    nodes:
+                      type: object
+                      additionalProperties:
+                        type: integer
+                        minimum: 1
+                        maximum: 1000
+                bgp:
+                  type: object
+                  description: How this Service's VIP is advertised over BGP (needs rivorad's BGP speaker).
+                  properties:
+                    communities:
+                      type: array
+                      items:
+                        type: string
+                        pattern: '^(no-export|no-advertise|no-export-subconfed|[0-9]{1,5}:[0-9]{1,5})$'
+                      description: >-
+                        Communities added to the route advertised for this Service's VIPs, on
+                        top of the speaker's own ("65000:100", or no-export, no-advertise,
+                        no-export-subconfed).
+                    peers:
+                      type: array
+                      items:
+                        type: string
+                      description: >-
+                        Addresses of the BGP peers this Service's route is advertised to.
+                        Unset means every peer.

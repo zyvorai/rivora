@@ -9,10 +9,14 @@
 package k8s
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -62,4 +66,18 @@ func New(cfg *rest.Config) (*Clients, error) {
 		return nil, fmt.Errorf("build dynamic client: %w", err)
 	}
 	return &Clients{Config: cfg, Clientset: clientset, Dynamic: dyn}, nil
+}
+
+// CheckResource reports whether the API server serves gvr, by listing one object of it. Informers on a
+// resource the cluster does not serve never sync, and a reconciler that waits on them blocks forever,
+// so a caller enabling an optional, CRD-backed feature checks first and carries on without it if the
+// CRD is not installed (Helm installs a chart's CRDs only on first install, never on upgrade).
+func CheckResource(ctx context.Context, dyn dynamic.Interface, gvr schema.GroupVersionResource) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_, err := dyn.Resource(gvr).List(ctx, metav1.ListOptions{Limit: 1})
+	if err != nil {
+		return fmt.Errorf("%s is not usable: %w", gvr.String(), err)
+	}
+	return nil
 }

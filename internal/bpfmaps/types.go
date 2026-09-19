@@ -20,6 +20,9 @@ const (
 	MapDropStats          = "drop_stats_map"
 	MapRateLimitConfig    = "rl_config_map"
 	MapRateLimitBuckets   = "rl_buckets_map"
+	// MapServiceRateLimit holds one Service's own SYN limit (RLConfig, indexed by
+	// service_id); a Service with none set falls back to MapRateLimitConfig.
+	MapServiceRateLimit = "svc_rl_config_map"
 
 	// IPv6 siblings (v0.3) of the address-keyed-or-valued maps above.
 	// service_config_map, maglev_table, backend_health_map, stats_map,
@@ -32,11 +35,22 @@ const (
 	MapNATReverse6         = "nat_reverse_map6"
 	MapRateLimitBuckets6   = "rl_buckets_map6"
 
+	// MapTunnelConfig holds the outer-header source address of the tunnel modes.
+	MapTunnelConfig = "tunnel_config_map"
+
+	// Port-range VIPs live in LPM tries (see VipRangeKey), one per family.
+	MapVIPRange  = "vip_range_map"
+	MapVIPRange6 = "vip_range_map6"
+
 	ProgXDPIngress  = "rivora_xdp_ingress"
 	ProgTCNATEgress = "rivora_tc_nat_egress"
 
 	ModeDSR = 0
 	ModeNAT = 1
+	// L3 DSR: the packet is tunnelled to the backend (IP-in-IP or GRE) instead of having its
+	// MAC rewritten. Mirrors RIVORA_MODE_TUNNEL_* in bpf/rivora_common.h.
+	ModeTunnelIPIP = 2
+	ModeTunnelGRE  = 3
 
 	// backend_health_map values. Draining excludes a backend from *new*
 	// Maglev flow selection (pick_backend() in bpf/xdp_ingress.c checks
@@ -52,7 +66,11 @@ const (
 	// Map capacities compiled into bpf/xdp_ingress.c — mirrored here so Go
 	// code (the ID allocators) can enforce the same ceiling before ever
 	// attempting a map write that the kernel would reject.
-	MaxVIPs     = 4096 // vip_map / service_config_map max_entries
+	MaxVIPs = 4096 // vip_map / service_config_map max_entries
+	// MaxRangeBlocks is vip_range_map's max_entries. A port range is stored as aligned
+	// power-of-two blocks (at most 30 for any range), so a few thousand ranges fit.
+	MaxRangeBlocks = 16384
+
 	MaxBackends = 8192 // backend_map / backend_health_map / stats_map max_entries
 
 	StatsGlobalIdx = 0
@@ -66,6 +84,40 @@ type VipKey struct {
 	Pad   uint8
 }
 
+// TunnelConfig — struct tunnel_config. 20 bytes. Src4 is in the same in-memory order as an
+// IPv4 address (see ip4ToBE32); Src6 holds the raw network-order bytes. Zero means "none".
+type TunnelConfig struct {
+	Src4 uint32
+	Src6 [16]byte
+}
+
+// VipRangeKey — struct vip_range_key. 12 bytes. The key of an LPM trie:
+// PrefixLen counts the bits of what follows that must match (48 plus the leading
+// bits of Port). Port is in network byte order, so its high bits come first.
+type VipRangeKey struct {
+	PrefixLen uint32
+	Addr      uint32
+	Proto     uint8
+	Pad       uint8
+	Port      uint16
+}
+
+// VipRangeKey6 — struct vip_range_key6. 24 bytes; PrefixLen is 144 plus port bits.
+type VipRangeKey6 struct {
+	PrefixLen uint32
+	Addr      [16]byte
+	Proto     uint8
+	Pad       uint8
+	Port      uint16
+}
+
+// Prefix lengths of a range key's fixed part (address, protocol, pad), to which a
+// block adds the leading bits of its port.
+const (
+	RangePrefixBase4 = 48
+	RangePrefixBase6 = 144
+)
+
 // ServiceConfig — struct service_config. 16 bytes.
 type ServiceConfig struct {
 	BackendCount uint32
@@ -73,8 +125,17 @@ type ServiceConfig struct {
 	MaglevSize   uint32 // must be nonzero and match the extent actually written into maglev_table
 	Mode         uint8
 	Affinity     uint8 // AffinityNone / AffinityClientIP
-	Pad          [2]uint8
+	Flags        uint8 // SvcRange
+	Pad          uint8
 }
+
+// service_config.flags. Mirrors RIVORA_SVC_* in bpf/rivora_common.h. An older pinned
+// service_config has 0 here, which is a plain single-port VIP.
+const (
+	// SvcRange marks a VIP that owns a port range: the destination port is kept as
+	// the client sent it instead of being rewritten to the backend's port.
+	SvcRange = 0x1
+)
 
 // Session affinity: what the Maglev slot is chosen from. Mirrors
 // RIVORA_AFFINITY_* in bpf/rivora_common.h. The zero value is none, so a
@@ -150,6 +211,19 @@ type RLConfig struct {
 	Burst      uint64
 	Enabled    uint8
 	Pad        [7]uint8
+}
+
+// SvcRLKey — struct svc_rl_key. 8 bytes. Only the BPF side builds it today;
+// mirrored for ABI completeness like RLBucket.
+type SvcRLKey struct {
+	ServiceID uint32
+	Saddr     uint32
+}
+
+// SvcRLKey6 — struct svc_rl_key6. 20 bytes.
+type SvcRLKey6 struct {
+	ServiceID uint32
+	Saddr     [16]byte
 }
 
 // RLBucket — struct rl_bucket. 16 bytes. Read/written per-CPU (the map is

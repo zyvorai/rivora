@@ -144,6 +144,13 @@ controller:
     fromNamespaceSelector: {}
     fromPodSelector: {}
 
+# servicePolicy makes rivorad honour ServicePolicy objects: a per-Service health
+# probe, per-source SYN rate limit and endpoint weights (see the CRD in crds/).
+# The CRD ships with this chart, so it is on by default; turning it off stops
+# rivorad watching ServicePolicy and drops the RBAC that lets it.
+servicePolicy:
+  enabled: true
+
 # gatewayApi enables the Gateway API (Gateway + TCPRoute/UDPRoute) control
 # loop on both rivorad and rivora-controller. Requires the Gateway API CRDs
 # (experimental channel) to already be installed on the cluster — this
@@ -177,6 +184,17 @@ bgp:
   #     asn: 65000
   #     bfd: true
   peers: []
+  # configSecret names an existing Secret whose bgp.yaml key holds a `bgp:` section in the static
+  # config's schema. Use it for what the fields above cannot say: per-peer password (TCP MD5),
+  # multihop, gracefulRestart and nodes, plus communities, localPref and aggregates. When set it
+  # REPLACES asn, routerId, ipv6NextHop and peers above. Keeping passwords in a Secret keeps them
+  # off the command line and out of `helm get values`. See website/docs/operations/bgp.md.
+  configSecret: ""
+  # peerResources also reads BGPPeer resources (crds/bgppeer-crd.yaml): each adds a neighbour, with
+  # password (from a Secret in this release's namespace), multihop, graceful restart and a node
+  # selector, to the peers above. It grants rivorad read access to BGPPeers, to its own Node and to
+  # Secrets in the release namespace. With it on, `peers` may be empty. Only used when enabled.
+  peerResources: true
 
 # addressPools seeds AddressPool custom resources on install, e.g.:
 #   --set addressPools[0].name=default \
