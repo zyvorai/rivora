@@ -81,6 +81,7 @@ BE_PIDS=()
 cleanup() {
     [ -n "$RIVORAD_PID" ] && kill "$RIVORAD_PID" 2>/dev/null
     for p in "${BE_PIDS[@]:-}"; do [ -n "$p" ] && ip netns exec "$NS_BE" kill "$p" 2>/dev/null; done
+    for ns in "$NS_LB" "$NS_CLIENT" "$NS_BE"; do ip netns pids "$ns" 2>/dev/null | xargs -r kill 2>/dev/null; done
     for ns in "$NS_LB" "$NS_CLIENT" "$NS_BE"; do ip netns del "$ns" 2>/dev/null; done
     ip link del "$BR" 2>/dev/null
     rm -rf "$WORK"
@@ -139,10 +140,20 @@ setup_topology() {
         in_ns "$ns" ip link add link "ecg-${role}.100" name "ecg-${role}.100.42" type vlan id 42 2>/dev/null
         in_ns "$ns" ip link set "ecg-${role}.100.42" up 2>/dev/null
         in_ns "$ns" ip addr add "10.85.0.${n}/24" dev "ecg-${role}.100.42" 2>/dev/null
+        # Three tags: 802.1ad 100, 802.1Q 42, 802.1Q 7.
+        in_ns "$ns" ip link add link "ecg-${role}.100.42" name "ecg-${role}.100.42.7" type vlan id 7 2>/dev/null
+        in_ns "$ns" ip link set "ecg-${role}.100.42.7" up 2>/dev/null
+        in_ns "$ns" ip addr add "10.86.0.${n}/24" dev "ecg-${role}.100.42.7" 2>/dev/null
     done
+    # ...and on the bridge-side end of every pair. A veth marks a packet "checksum already verified"
+    # when its receiver has rx offload on, and the bridge then carries that mark to the next hop,
+    # so leaving these on would let a corrupted checksum through unchecked.
+    if [ "$HAVE_ETHTOOL" = 1 ]; then
+        for role in lb cl be; do ethtool -K "ecg-${role}-br" tx off rx off >/dev/null 2>&1; done
+    fi
     in_ns "$NS_LB" sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
     # Replies to the client come back through the LB to be un-NATed.
-    for net in 83 84 85; do
+    for net in 83 84 85 86; do
         in_ns "$NS_BE" ip route add "10.${net}.0.2/32" via "10.${net}.0.1" 2>/dev/null
     done
     in_ns "$NS_BE" ip -6 route add fd00:83::2/128 via fd00:83::1 dev ecg-be
@@ -154,9 +165,12 @@ setup_topology() {
     in_ns "$NS_LB" ip -6 addr add fd00:83::100/128 dev ecg-lb nodad
     in_ns "$NS_LB" ip addr add 10.83.0.101/32 dev ecg-lb
     in_ns "$NS_LB" ip -6 addr add fd00:83::101/128 dev ecg-lb nodad
+    in_ns "$NS_LB" ip addr add 10.83.0.105/32 dev ecg-lb
+    in_ns "$NS_LB" ip -6 addr add fd00:83::105/128 dev ecg-lb nodad
     in_ns "$NS_LB" ip addr add 10.84.0.100/32 dev ecg-lb.42
     in_ns "$NS_LB" ip -6 addr add fd00:84::100/128 dev ecg-lb.42 nodad
     in_ns "$NS_LB" ip addr add 10.85.0.100/32 dev ecg-lb.100.42 2>/dev/null
+    in_ns "$NS_LB" ip addr add 10.86.0.100/32 dev ecg-lb.100.42.7 2>/dev/null
 
     in_ns "$NS_BE" sysctl -qw net.ipv4.conf.all.arp_ignore=1 net.ipv4.conf.all.arp_announce=2 \
         net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0
@@ -179,18 +193,21 @@ setup_topology() {
     in_ns "$NS_CLIENT" ip -6 neigh replace fd00:83::104 lladdr "$LB_MAC" dev ecg-cl nud permanent
     in_ns "$NS_CLIENT" ip neigh replace 10.84.0.103 lladdr "$LB_MAC" dev ecg-cl.42 nud permanent
 
-    tcp_server() { in_ns "$NS_BE" python3 -c "$TCP_SERVER" "$@" >/dev/null 2>&1 & BE_PIDS+=($!); }
-    udp_server() { in_ns "$NS_BE" python3 -c "$UDP_SERVER" "$@" >/dev/null 2>&1 & BE_PIDS+=($!); }
+    tcp_server() { ip netns exec "$NS_BE" python3 -c "$TCP_SERVER" "$@" >/dev/null 2>&1 & BE_PIDS+=($!); }
+    udp_server() { ip netns exec "$NS_BE" python3 -c "$UDP_SERVER" "$@" >/dev/null 2>&1 & BE_PIDS+=($!); }
     # ident addr port...: a greeting "<ident>:<port>" per connection.
-    tcp_server BE 10.83.0.11 8080 9000
-    tcp_server BE fd00:83::11 8080 9000
+    tcp_server BE 10.83.0.11 8080 9000 9001
+    tcp_server BE fd00:83::11 8080 9000 9001
     tcp_server BE 10.83.0.103 8080
     tcp_server BE fd00:83::103 8080
     tcp_server BE 10.84.0.11 8080
     tcp_server BE fd00:84::11 8080
     tcp_server BE 10.84.0.103 8080
     tcp_server BE 10.85.0.11 8080
+    tcp_server BE 10.86.0.11 8080
     udp_server 10.83.0.11 9000
+    udp_server 10.83.0.11 9001
+    udp_server fd00:83::11 9001
     udp_server 10.83.0.104 9000
     udp_server fd00:83::11 9000
     udp_server fd00:83::104 9000
@@ -344,13 +361,16 @@ setup_topology
     echo "  - {address: 10.83.0.104, port: 9000, protocol: udp, mode: dsr, backends: [{address: 10.83.0.11, port: 9000, mac: '${BE_MAC}'}]}"
     echo "  - {address: 'fd00:83::101', port: 9000, protocol: udp, mode: nat, backends: [{address: 'fd00:83::11', port: 9000}]}"
     echo "  - {address: 'fd00:83::104', port: 9000, protocol: udp, mode: dsr, backends: [{address: 'fd00:83::11', port: 9000, mac: '${BE_MAC}'}]}"
+    echo "  - {address: 10.83.0.105, port: 9100, protocol: udp, mode: nat, backends: [{address: 10.83.0.11, port: 9001}]}"
+    echo "  - {address: 'fd00:83::105', port: 9100, protocol: udp, mode: nat, backends: [{address: 'fd00:83::11', port: 9001}]}"
     echo "  - {address: 10.84.0.100, port: 8080, protocol: tcp, mode: nat, backends: [{address: 10.84.0.11, port: 8080}]}"
     echo "  - {address: 'fd00:84::100', port: 8080, protocol: tcp, mode: nat, backends: [{address: 'fd00:84::11', port: 8080}]}"
     echo "  - {address: 10.84.0.103, port: 8080, protocol: tcp, mode: dsr, backends: [{address: 10.84.0.11, port: 8080, mac: '${BE_MAC}'}]}"
     echo "  - {address: 10.85.0.100, port: 8080, protocol: tcp, mode: nat, backends: [{address: 10.85.0.11, port: 8080}]}"
+    echo "  - {address: 10.86.0.100, port: 8080, protocol: tcp, mode: nat, backends: [{address: 10.86.0.11, port: 8080}]}"
 } >"$CONFIG"
 
-in_ns "$NS_LB" bash -c "mount -t bpf bpf /sys/fs/bpf 2>/dev/null; exec '$RIVORAD' -config '$CONFIG' -bpf-dir '$BPF_DIR'" >"$LOG" 2>&1 &
+ip netns exec "$NS_LB" bash -c "mount -t bpf bpf /sys/fs/bpf 2>/dev/null; exec '$RIVORAD' -config '$CONFIG' -bpf-dir '$BPF_DIR'" >"$LOG" 2>&1 &
 RIVORAD_PID=$!
 up=0
 for _ in $(seq 1 40); do
@@ -379,10 +399,18 @@ if [ "$HAVE_ETHTOOL" = 1 ] && in_ns "$NS_LB" ethtool -k ecg-lb 2>/dev/null | gre
     expect 10.84.0.100 8080 "BE:8080" "v4 full-NAT over 802.1Q"
     expect fd00:84::100 8080 "BE:8080" "v6 full-NAT over 802.1Q"
     expect 10.84.0.103 8080 "BE:8080" "v4 DSR over 802.1Q"
+    # Generic XDP hands the program the frame with its OUTERMOST tag already removed, so a
+    # single tag never reaches it; QinQ shows it one tag and three tags show it two. The last
+    # two therefore exercise the tag skipping (one and two iterations).
     if in_ns "$NS_CLIENT" ip link show ecg-cl.100.42 >/dev/null 2>&1; then
-        expect 10.85.0.100 8080 "BE:8080" "v4 full-NAT over QinQ (802.1ad + 802.1Q)"
+        expect 10.85.0.100 8080 "BE:8080" "v4 full-NAT over QinQ (802.1ad + 802.1Q): one tag in the frame XDP sees"
     else
         skip "QinQ interfaces could not be created on this kernel"
+    fi
+    if in_ns "$NS_CLIENT" ip link show ecg-cl.100.42.7 >/dev/null 2>&1; then
+        expect 10.86.0.100 8080 "BE:8080" "v4 full-NAT over three tags: two tags in the frame XDP sees"
+    else
+        skip "triple-tagged interfaces could not be created on this kernel"
     fi
 else
     skip "cannot switch VLAN offload off here (no ethtool, or the veth refuses): tags would not be in the frame"
@@ -409,14 +437,17 @@ n=$(udp_echo 10.83.0.101 9000 200 10)
 # ---------------------------------------------------------------------------
 section "4. ICMP path-MTU discovery is delivered to the owning backend"
 # ---------------------------------------------------------------------------
-for c in "v4 10.83.0.101 nat 1000" "v4 10.83.0.104 dsr 1000" "v6 fd00:83::101 nat 1400" "v6 fd00:83::104 dsr 1400"; do
-    set -- $c; fam="$1"; vip="$2"; mode="$3"; want="$4"
+# The last two use a VIP port (9100) that is not the backend's (9001): the quoted port must be rewritten
+# too, and folded into the ICMP checksum, or the backend's kernel rejects the message.
+for c in "v4 10.83.0.101 9000 nat 1000" "v4 10.83.0.104 9000 dsr 1000" "v6 fd00:83::101 9000 nat 1400" "v6 fd00:83::104 9000 dsr 1400" \
+         "v4 10.83.0.105 9100 nat-with-port-rewrite 1000" "v6 fd00:83::105 9100 nat-with-port-rewrite 1400"; do
+    set -- $c; fam="$1"; vip="$2"; vport="$3"; mode="$4"; want="$5"
     flush_pmtu
-    icmp_error "$vip" 9000 bogus
+    icmp_error "$vip" "$vport" bogus
     got=$(backend_pmtu "$fam")
     [ "$got" = none ] && pass "$fam $mode: an ICMP error quoting a connection that does not exist is not delivered to the backend" \
         || fail "$fam $mode: a bogus ICMP error changed the backend's path MTU to $got"
-    icmp_error "$vip" 9000 real
+    icmp_error "$vip" "$vport" real
     got=$(backend_pmtu "$fam")
     [ "$got" = "$want" ] && pass "$fam $mode: the backend learned the path MTU ($got) from an ICMP sent to the VIP" \
         || fail "$fam $mode: the backend's path MTU is '$got', want $want (ICMP not delivered, or its checksum wrong)"
