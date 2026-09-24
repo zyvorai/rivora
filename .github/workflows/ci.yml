@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 20
     steps:
     - uses: actions/checkout@v4
-    - uses: actions/setup-go@v5
+    - uses: actions/setup-go@v7
       with: {go-version: '1.27.1', cache: true}
     - run: go mod tidy && git diff --exit-code go.mod go.sum
     - run: go vet ./...
@@ -46,7 +46,7 @@ jobs:
     timeout-minutes: 15
     steps:
     - uses: actions/checkout@v4
-    - uses: actions/setup-go@v5
+    - uses: actions/setup-go@v7
       with: {go-version: '1.27.1', cache: true}
     - run: go install golang.org/x/vuln/cmd/govulncheck@latest
     - name: govulncheck (fail only on unaccepted findings)
@@ -148,7 +148,7 @@ jobs:
     timeout-minutes: 30
     steps:
     - uses: actions/checkout@v4
-    - uses: actions/setup-go@v5
+    - uses: actions/setup-go@v7
       with: {go-version: '1.27.1', cache: true}
     - name: Install kind + kubectl
       run: |
@@ -221,7 +221,7 @@ jobs:
     timeout-minutes: 10
     steps:
     - uses: actions/checkout@v4
-    - uses: actions/setup-go@v5
+    - uses: actions/setup-go@v7
       with: {go-version: '1.27.1', cache: true}
     - name: Every shell script parses
       run: |
@@ -261,7 +261,7 @@ jobs:
     timeout-minutes: 60
     steps:
     - uses: actions/checkout@v4
-    - uses: actions/setup-go@v5
+    - uses: actions/setup-go@v7
       with: {go-version: '1.27.1', cache: true}
     - name: Install build deps
       # bpftool does NOT reliably work on this runner. Its kernel has no matching
