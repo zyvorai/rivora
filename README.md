@@ -428,5 +428,7 @@ website/                the documentation site (Docusaurus)
 
 ## License
 
+Commercial subscriptions and support: see [docs/SUBSCRIPTION-MODEL.md](docs/SUBSCRIPTION-MODEL.md).
+
 Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Report vulnerabilities privately: see
 [SECURITY.md](SECURITY.md).
